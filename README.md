@@ -80,14 +80,6 @@ cp -R ShadowCue.app /Applications/
 
 ---
 
-## Screenshots
-
-<p align="center">
-  <em>프롬프터가 화면에 표시되지만, 녹화에는 보이지 않습니다</em>
-</p>
-
----
-
 ## System Requirements
 
 - macOS 12.0 (Monterey) 이상
