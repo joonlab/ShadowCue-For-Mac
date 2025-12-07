@@ -1195,9 +1195,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "프롬프터 보이기/숨기기", action: #selector(togglePrompter), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "재생/일시정지", action: #selector(togglePlay), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "드래그 OFF 모드", action: #selector(toggleClickThrough), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "클릭스루 모드", action: #selector(toggleClickThrough), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "설정...", action: #selector(showSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "업데이트 확인...", action: #selector(checkForUpdates), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
@@ -1210,6 +1211,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // App menu
         let appMenu = NSMenu()
         appMenu.addItem(NSMenuItem(title: "ShadowCue 정보", action: #selector(showAbout), keyEquivalent: ""))
+        appMenu.addItem(NSMenuItem(title: "업데이트 확인...", action: #selector(checkForUpdates), keyEquivalent: "u"))
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(NSMenuItem(title: "설정...", action: #selector(showSettings), keyEquivalent: ","))
         appMenu.addItem(NSMenuItem.separator())
@@ -1268,9 +1270,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "ShadowCue for Mac"
-        alert.informativeText = "화면 녹화에 보이지 않는 스텔스 프롬프터\n\n버전 1.0\n\n단축키: Ctrl+Option+Space (재생/일시정지)"
+        alert.informativeText = "화면 녹화에 보이지 않는 스텔스 프롬프터\n\n버전 1.0\n\n단축키: Ctrl+Option+Space (재생/일시정지)\n\n제작: 준랩 | JoonLab"
         alert.alertStyle = .informational
         alert.runModal()
+    }
+
+    @objc func checkForUpdates() {
+        if let url = URL(string: "https://github.com/joonlab/ShadowCue-For-Mac/releases/latest") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
