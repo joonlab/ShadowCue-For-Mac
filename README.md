@@ -12,7 +12,13 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-macOS%2012.0+-blue?style=flat-square&logo=apple">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
-  <img src="https://img.shields.io/badge/Version-1.0-orange?style=flat-square">
+  <img src="https://img.shields.io/badge/Version-1.1-orange?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="https://github.com/joonlab/ShadowCue-For-Mac/releases/latest">
+    <img src="https://img.shields.io/badge/Download-Latest%20Release-brightgreen?style=for-the-badge&logo=github" alt="Download">
+  </a>
 </p>
 
 ---
@@ -27,16 +33,26 @@
 
 - **스텔스 모드**: 화면 녹화/공유 시 완전히 투명하게 숨겨짐
 - **항상 최상위 표시**: 풀스크린 앱 위에서도 항상 보임
+- **마크다운 지원**: 제목, 굵게, 기울임, 목록 등 마크다운 문법 렌더링
 - **자동/수동 스크롤**: 트랙패드, 스크롤바, 단축키로 자유롭게 조작
-- **글로벌 단축키**: 다른 앱에서도 프롬프터 제어 가능
+- **글로벌 단축키**: 다른 앱에서도 프롬프터 제어 가능 (커스터마이징 가능)
 - **완전 커스터마이징**: 글자 크기, 색상, 배경 투명도, 스크롤 속도
 - **클릭스루 모드**: 프롬프터 뒤의 콘텐츠 클릭 가능
+- **업데이트 확인**: 메뉴에서 새 버전 확인 가능
 
 ---
 
 ## Installation
 
-### 방법 1: 직접 빌드
+### 방법 1: Release 다운로드 (권장)
+
+1. [**최신 릴리즈 다운로드**](https://github.com/joonlab/ShadowCue-For-Mac/releases/latest)
+2. `ShadowCue-v1.1.zip` 다운로드
+3. 압축 해제
+4. `ShadowCue.app`을 **Applications** 폴더로 이동
+5. 실행
+
+### 방법 2: 직접 빌드
 
 ```bash
 # 저장소 클론
@@ -49,10 +65,6 @@ swiftc -o ShadowCue.app/Contents/MacOS/ShadowCue main.swift -framework Cocoa -fr
 # Applications 폴더로 복사
 cp -R ShadowCue.app /Applications/
 ```
-
-### 방법 2: Release 다운로드
-
-[Releases](https://github.com/joonlab/ShadowCue-For-Mac/releases) 페이지에서 최신 버전을 다운로드하세요.
 
 ---
 
@@ -78,6 +90,24 @@ cp -R ShadowCue.app /Applications/
 - **스크롤바**: 오른쪽 스크롤바 드래그 (스크롤 시 자동 표시, 3초 후 숨김)
 - **단축키**: 글로벌 단축키로 어디서든 조작
 
+### 마크다운 지원
+
+설정 창에서 마크다운 문법으로 텍스트를 입력하면 프롬프터에 렌더링됩니다:
+
+| 문법 | 설명 |
+|------|------|
+| `# 제목` | H1 제목 (가장 큼) |
+| `## 제목` | H2 제목 |
+| `### 제목` | H3 제목 |
+| `**굵게**` | 굵은 글씨 |
+| `*기울임*` | 기울임꼴 |
+| `~~취소선~~` | 취소선 |
+| `` `코드` `` | 인라인 코드 |
+| `- 항목` | 목록 |
+| `1. 항목` | 번호 목록 |
+| `> 인용` | 인용문 |
+| `---` | 구분선 |
+
 ---
 
 ## System Requirements
@@ -90,6 +120,22 @@ cp -R ShadowCue.app /Applications/
 ## How It Works
 
 ShadowCue는 macOS의 `NSWindow.sharingType = .none` 속성을 활용하여 화면 캡처 및 공유에서 윈도우를 제외합니다. 이는 macOS의 네이티브 기능을 사용하므로 추가 드라이버나 해킹 없이 안전하게 동작합니다.
+
+---
+
+## Changelog
+
+### v1.1
+- 마크다운 렌더링 지원 (제목, 굵게, 기울임, 목록, 인용, 코드 등)
+- 업데이트 확인 메뉴 추가
+- 스크롤바 자동 표시/숨김 (3초)
+- UI/UX 개선
+
+### v1.0
+- 최초 릴리즈
+- 스텔스 프롬프터 기본 기능
+- 글로벌 단축키 지원
+- 커스터마이징 설정
 
 ---
 

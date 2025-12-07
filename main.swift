@@ -537,20 +537,206 @@ class PrompterView: NSView {
         addSubview(scrollView)
     }
 
+    // MARK: - Markdown Parser
+    private func parseMarkdown(_ markdown: String) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let lines = markdown.components(separatedBy: "\n")
+
+        let baseParagraphStyle = NSMutableParagraphStyle()
+        baseParagraphStyle.lineHeightMultiple = lineHeight
+        baseParagraphStyle.alignment = .left
+
+        for (index, line) in lines.enumerated() {
+            var processedLine = line
+            var lineFont = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+            var lineColor = textColor
+            var prefix = ""
+
+            // Headers: #, ##, ###, ####, #####, ######
+            if line.hasPrefix("###### ") {
+                processedLine = String(line.dropFirst(7))
+                lineFont = NSFont.systemFont(ofSize: fontSize * 0.85, weight: .semibold)
+            } else if line.hasPrefix("##### ") {
+                processedLine = String(line.dropFirst(6))
+                lineFont = NSFont.systemFont(ofSize: fontSize * 0.9, weight: .semibold)
+            } else if line.hasPrefix("#### ") {
+                processedLine = String(line.dropFirst(5))
+                lineFont = NSFont.systemFont(ofSize: fontSize * 1.0, weight: .bold)
+            } else if line.hasPrefix("### ") {
+                processedLine = String(line.dropFirst(4))
+                lineFont = NSFont.systemFont(ofSize: fontSize * 1.15, weight: .bold)
+            } else if line.hasPrefix("## ") {
+                processedLine = String(line.dropFirst(3))
+                lineFont = NSFont.systemFont(ofSize: fontSize * 1.3, weight: .bold)
+            } else if line.hasPrefix("# ") {
+                processedLine = String(line.dropFirst(2))
+                lineFont = NSFont.systemFont(ofSize: fontSize * 1.5, weight: .bold)
+            }
+            // Unordered list: - or *
+            else if line.hasPrefix("- ") || line.hasPrefix("* ") {
+                processedLine = String(line.dropFirst(2))
+                prefix = "  •  "
+            }
+            // Numbered list: 1. 2. 3. etc
+            else if let match = line.range(of: #"^\d+\.\s"#, options: .regularExpression) {
+                let number = line[line.startIndex..<match.upperBound].dropLast()
+                processedLine = String(line[match.upperBound...])
+                prefix = "  \(number) "
+            }
+            // Blockquote: >
+            else if line.hasPrefix("> ") {
+                processedLine = String(line.dropFirst(2))
+                lineColor = textColor.withAlphaComponent(0.7)
+                prefix = "┃ "
+            }
+            // Horizontal rule: --- or ***
+            else if line == "---" || line == "***" || line == "___" {
+                processedLine = "─────────────────────"
+                lineColor = textColor.withAlphaComponent(0.5)
+            }
+
+            // Process inline formatting: **bold**, *italic*, ~~strikethrough~~, `code`
+            let attributedLine = processInlineMarkdown(processedLine, baseFont: lineFont, baseColor: lineColor)
+
+            // Add prefix if exists
+            if !prefix.isEmpty {
+                let prefixAttr = NSAttributedString(string: prefix, attributes: [
+                    .font: lineFont,
+                    .foregroundColor: lineColor,
+                    .paragraphStyle: baseParagraphStyle
+                ])
+                result.append(prefixAttr)
+            }
+
+            // Apply paragraph style to the line
+            let lineWithStyle = NSMutableAttributedString(attributedString: attributedLine)
+            lineWithStyle.addAttribute(.paragraphStyle, value: baseParagraphStyle, range: NSRange(location: 0, length: lineWithStyle.length))
+
+            result.append(lineWithStyle)
+
+            // Add newline except for last line
+            if index < lines.count - 1 {
+                result.append(NSAttributedString(string: "\n", attributes: [
+                    .font: lineFont,
+                    .foregroundColor: lineColor
+                ]))
+            }
+        }
+
+        return result
+    }
+
+    private func processInlineMarkdown(_ text: String, baseFont: NSFont, baseColor: NSColor) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        var remaining = text
+
+        while !remaining.isEmpty {
+            // Bold: **text**
+            if let boldRange = remaining.range(of: #"\*\*(.+?)\*\*"#, options: .regularExpression) {
+                // Add text before match
+                let beforeText = String(remaining[remaining.startIndex..<boldRange.lowerBound])
+                if !beforeText.isEmpty {
+                    result.append(NSAttributedString(string: beforeText, attributes: [
+                        .font: baseFont,
+                        .foregroundColor: baseColor
+                    ]))
+                }
+
+                // Extract bold content (remove ** markers)
+                let matchedText = String(remaining[boldRange])
+                let boldContent = String(matchedText.dropFirst(2).dropLast(2))
+                let boldFont = NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold)
+                result.append(NSAttributedString(string: boldContent, attributes: [
+                    .font: boldFont,
+                    .foregroundColor: baseColor
+                ]))
+
+                remaining = String(remaining[boldRange.upperBound...])
+                continue
+            }
+
+            // Italic: *text*
+            if let italicRange = remaining.range(of: #"\*(.+?)\*"#, options: .regularExpression) {
+                let beforeText = String(remaining[remaining.startIndex..<italicRange.lowerBound])
+                if !beforeText.isEmpty {
+                    result.append(NSAttributedString(string: beforeText, attributes: [
+                        .font: baseFont,
+                        .foregroundColor: baseColor
+                    ]))
+                }
+
+                let matchedText = String(remaining[italicRange])
+                let italicContent = String(matchedText.dropFirst(1).dropLast(1))
+                let italicFont = NSFont(descriptor: baseFont.fontDescriptor.withSymbolicTraits(.italic), size: baseFont.pointSize) ?? baseFont
+                result.append(NSAttributedString(string: italicContent, attributes: [
+                    .font: italicFont,
+                    .foregroundColor: baseColor
+                ]))
+
+                remaining = String(remaining[italicRange.upperBound...])
+                continue
+            }
+
+            // Strikethrough: ~~text~~
+            if let strikeRange = remaining.range(of: #"~~(.+?)~~"#, options: .regularExpression) {
+                let beforeText = String(remaining[remaining.startIndex..<strikeRange.lowerBound])
+                if !beforeText.isEmpty {
+                    result.append(NSAttributedString(string: beforeText, attributes: [
+                        .font: baseFont,
+                        .foregroundColor: baseColor
+                    ]))
+                }
+
+                let matchedText = String(remaining[strikeRange])
+                let strikeContent = String(matchedText.dropFirst(2).dropLast(2))
+                result.append(NSAttributedString(string: strikeContent, attributes: [
+                    .font: baseFont,
+                    .foregroundColor: baseColor,
+                    .strikethroughStyle: NSUnderlineStyle.single.rawValue
+                ]))
+
+                remaining = String(remaining[strikeRange.upperBound...])
+                continue
+            }
+
+            // Inline code: `code`
+            if let codeRange = remaining.range(of: #"`(.+?)`"#, options: .regularExpression) {
+                let beforeText = String(remaining[remaining.startIndex..<codeRange.lowerBound])
+                if !beforeText.isEmpty {
+                    result.append(NSAttributedString(string: beforeText, attributes: [
+                        .font: baseFont,
+                        .foregroundColor: baseColor
+                    ]))
+                }
+
+                let matchedText = String(remaining[codeRange])
+                let codeContent = String(matchedText.dropFirst(1).dropLast(1))
+                let codeFont = NSFont.monospacedSystemFont(ofSize: baseFont.pointSize * 0.9, weight: .regular)
+                result.append(NSAttributedString(string: codeContent, attributes: [
+                    .font: codeFont,
+                    .foregroundColor: baseColor,
+                    .backgroundColor: baseColor.withAlphaComponent(0.15)
+                ]))
+
+                remaining = String(remaining[codeRange.upperBound...])
+                continue
+            }
+
+            // No more matches, add remaining text
+            result.append(NSAttributedString(string: remaining, attributes: [
+                .font: baseFont,
+                .foregroundColor: baseColor
+            ]))
+            break
+        }
+
+        return result
+    }
+
     private func updateTextContent() {
         guard let textView = textView, let scrollView = scrollView else { return }
 
-        let paragraphStyle = NSMutableParagraphStyle()
-        paragraphStyle.lineHeightMultiple = lineHeight
-        paragraphStyle.alignment = .center
-
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
-            .foregroundColor: textColor,
-            .paragraphStyle: paragraphStyle
-        ]
-
-        let attributedString = NSAttributedString(string: text, attributes: attributes)
+        let attributedString = parseMarkdown(text)
         textView.textStorage?.setAttributedString(attributedString)
 
         // Force layout and calculate height
@@ -1014,16 +1200,28 @@ class PrompterWindowController: NSWindowController {
         prompterView = PrompterView(frame: window.contentView!.bounds)
         prompterView.autoresizingMask = [.width, .height]
         prompterView.text = """
-ShadowCue for Mac
+# ShadowCue for Mac
 
-이 텍스트는 화면 녹화나 화면 공유에 보이지 않습니다.
+**화면 녹화에 보이지 않는** 스텔스 프롬프터
 
-설정 창에서 원하는 텍스트를 입력하세요.
+---
 
-Ctrl+Option+Space로 자동 스크롤을 시작/중지할 수 있습니다.
+## 마크다운 지원
 
-Ctrl+Option+D로 클릭스루 모드를 전환할 수 있습니다.
-(이 모드에서는 프롬프터 뒤의 내용을 클릭할 수 있습니다)
+- **굵은 글씨**는 별표 두 개로
+- *기울임*은 별표 하나로
+- ~~취소선~~은 물결표 두 개로
+- `코드`는 백틱으로
+
+---
+
+### 단축키
+
+1. Ctrl+Option+Space - 재생/일시정지
+2. Ctrl+Option+D - 클릭스루 모드
+3. Ctrl+Option+H - 숨기기/보이기
+
+> 설정 창에서 원하는 텍스트를 입력하세요.
 """
         window.contentView?.addSubview(prompterView)
     }
@@ -1270,7 +1468,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "ShadowCue for Mac"
-        alert.informativeText = "화면 녹화에 보이지 않는 스텔스 프롬프터\n\n버전 1.0\n\n단축키: Ctrl+Option+Space (재생/일시정지)\n\n제작: 준랩 | JoonLab"
+        alert.informativeText = "화면 녹화에 보이지 않는 스텔스 프롬프터\n\n버전 1.1\n\n단축키: Ctrl+Option+Space (재생/일시정지)\n\n제작: 준랩 | JoonLab"
         alert.alertStyle = .informational
         alert.runModal()
     }
