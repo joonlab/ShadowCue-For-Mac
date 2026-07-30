@@ -601,7 +601,7 @@ class PrompterView: NSView {
             }
 
             // Process inline formatting: **bold**, *italic*, ~~strikethrough~~, `code`
-            let attributedLine = processInlineMarkdown(processedLine, baseFont: lineFont, baseColor: lineColor)
+            let attributedLine = Self.processInlineMarkdown(processedLine, baseFont: lineFont, baseColor: lineColor)
 
             // Add prefix if exists
             if !prefix.isEmpty {
@@ -631,112 +631,106 @@ class PrompterView: NSView {
         return result
     }
 
-    private func processInlineMarkdown(_ text: String, baseFont: NSFont, baseColor: NSColor) -> NSAttributedString {
+    /// 인스턴스 상태를 쓰지 않는 순수 함수라 static 으로 둔다(--selftest 에서 직접 검사하기 위해).
+    static func processInlineMarkdown(_ text: String, baseFont: NSFont, baseColor: NSColor) -> NSAttributedString {
         let result = NSMutableAttributedString()
         var remaining = text
 
+        // 예전 구현은 "종류 우선순위"(굵게 -> 기울임 -> 취소선 -> 코드)로 훑고 매치 앞부분을
+        // 평문으로 붙여버려서, 앞에 있던 다른 강조가 통째로 유실됐다.
+        //   "*기울임* 그리고 **굵게**" -> 기울임이 별표째 평문으로 출력
+        // 그래서 **위치가 가장 앞선 매치**를 고른다. 시작 위치가 같으면 더 긴 매치를 우선해
+        // `**`가 `*`에게 잘리지 않게 한다(기존 우선순위가 우연히 지켜주던 규칙을 명시화).
         while !remaining.isEmpty {
-            // Bold: **text**
-            if let boldRange = remaining.range(of: #"\*\*(.+?)\*\*"#, options: .regularExpression) {
-                // Add text before match
-                let beforeText = String(remaining[remaining.startIndex..<boldRange.lowerBound])
-                if !beforeText.isEmpty {
-                    result.append(NSAttributedString(string: beforeText, attributes: [
-                        .font: baseFont,
-                        .foregroundColor: baseColor
-                    ]))
+            var best: (kind: InlineKind, range: Range<String.Index>)?
+            for candidate in Self.inlinePatterns {
+                guard let range = remaining.range(of: candidate.pattern, options: .regularExpression) else { continue }
+                guard let current = best else { best = (candidate.kind, range); continue }
+                let isEarlier = range.lowerBound < current.range.lowerBound
+                let isLongerAtSamePosition = range.lowerBound == current.range.lowerBound
+                    && range.upperBound > current.range.upperBound
+                if isEarlier || isLongerAtSamePosition {
+                    best = (candidate.kind, range)
                 }
-
-                // Extract bold content (remove ** markers)
-                let matchedText = String(remaining[boldRange])
-                let boldContent = String(matchedText.dropFirst(2).dropLast(2))
-                let boldFont = NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold)
-                result.append(NSAttributedString(string: boldContent, attributes: [
-                    .font: boldFont,
-                    .foregroundColor: baseColor
-                ]))
-
-                remaining = String(remaining[boldRange.upperBound...])
-                continue
             }
 
-            // Italic: *text*
-            if let italicRange = remaining.range(of: #"\*(.+?)\*"#, options: .regularExpression) {
-                let beforeText = String(remaining[remaining.startIndex..<italicRange.lowerBound])
-                if !beforeText.isEmpty {
-                    result.append(NSAttributedString(string: beforeText, attributes: [
-                        .font: baseFont,
-                        .foregroundColor: baseColor
-                    ]))
-                }
+            guard let match = best else { break }
 
-                let matchedText = String(remaining[italicRange])
-                let italicContent = String(matchedText.dropFirst(1).dropLast(1))
-                let italicFont = NSFont(descriptor: baseFont.fontDescriptor.withSymbolicTraits(.italic), size: baseFont.pointSize) ?? baseFont
-                result.append(NSAttributedString(string: italicContent, attributes: [
-                    .font: italicFont,
-                    .foregroundColor: baseColor
-                ]))
-
-                remaining = String(remaining[italicRange.upperBound...])
-                continue
-            }
-
-            // Strikethrough: ~~text~~
-            if let strikeRange = remaining.range(of: #"~~(.+?)~~"#, options: .regularExpression) {
-                let beforeText = String(remaining[remaining.startIndex..<strikeRange.lowerBound])
-                if !beforeText.isEmpty {
-                    result.append(NSAttributedString(string: beforeText, attributes: [
-                        .font: baseFont,
-                        .foregroundColor: baseColor
-                    ]))
-                }
-
-                let matchedText = String(remaining[strikeRange])
-                let strikeContent = String(matchedText.dropFirst(2).dropLast(2))
-                result.append(NSAttributedString(string: strikeContent, attributes: [
+            let beforeText = String(remaining[remaining.startIndex..<match.range.lowerBound])
+            if !beforeText.isEmpty {
+                result.append(NSAttributedString(string: beforeText, attributes: [
                     .font: baseFont,
-                    .foregroundColor: baseColor,
-                    .strikethroughStyle: NSUnderlineStyle.single.rawValue
+                    .foregroundColor: baseColor
                 ]))
-
-                remaining = String(remaining[strikeRange.upperBound...])
-                continue
             }
 
-            // Inline code: `code`
-            if let codeRange = remaining.range(of: #"`(.+?)`"#, options: .regularExpression) {
-                let beforeText = String(remaining[remaining.startIndex..<codeRange.lowerBound])
-                if !beforeText.isEmpty {
-                    result.append(NSAttributedString(string: beforeText, attributes: [
-                        .font: baseFont,
-                        .foregroundColor: baseColor
-                    ]))
-                }
+            let matchedText = String(remaining[match.range])
+            let delimiter = match.kind.delimiterLength
+            let content = String(matchedText.dropFirst(delimiter).dropLast(delimiter))
+            result.append(match.kind.attributedString(content, baseFont: baseFont, baseColor: baseColor))
 
-                let matchedText = String(remaining[codeRange])
-                let codeContent = String(matchedText.dropFirst(1).dropLast(1))
-                let codeFont = NSFont.monospacedSystemFont(ofSize: baseFont.pointSize * 0.9, weight: .regular)
-                result.append(NSAttributedString(string: codeContent, attributes: [
-                    .font: codeFont,
-                    .foregroundColor: baseColor,
-                    .backgroundColor: baseColor.withAlphaComponent(0.15)
-                ]))
+            remaining = String(remaining[match.range.upperBound...])
+        }
 
-                remaining = String(remaining[codeRange.upperBound...])
-                continue
-            }
-
-            // No more matches, add remaining text
+        // 남은 평문
+        if !remaining.isEmpty {
             result.append(NSAttributedString(string: remaining, attributes: [
                 .font: baseFont,
                 .foregroundColor: baseColor
             ]))
-            break
         }
 
         return result
     }
+
+    enum InlineKind {
+        case code, bold, strike, italic
+
+        var delimiterLength: Int {
+            switch self {
+            case .code, .italic: return 1
+            case .bold, .strike: return 2
+            }
+        }
+
+        func attributedString(_ content: String, baseFont: NSFont, baseColor: NSColor) -> NSAttributedString {
+            switch self {
+            case .code:
+                let font = NSFont.monospacedSystemFont(ofSize: baseFont.pointSize * 0.9, weight: .regular)
+                return NSAttributedString(string: content, attributes: [
+                    .font: font,
+                    .foregroundColor: baseColor,
+                    .backgroundColor: baseColor.withAlphaComponent(0.15)
+                ])
+            case .bold:
+                return NSAttributedString(string: content, attributes: [
+                    .font: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .bold),
+                    .foregroundColor: baseColor
+                ])
+            case .strike:
+                return NSAttributedString(string: content, attributes: [
+                    .font: baseFont,
+                    .foregroundColor: baseColor,
+                    .strikethroughStyle: NSUnderlineStyle.single.rawValue
+                ])
+            case .italic:
+                let font = NSFont(descriptor: baseFont.fontDescriptor.withSymbolicTraits(.italic),
+                                  size: baseFont.pointSize) ?? baseFont
+                return NSAttributedString(string: content, attributes: [
+                    .font: font,
+                    .foregroundColor: baseColor
+                ])
+            }
+        }
+    }
+
+    /// 코드 스팬을 먼저 두어 동률일 때 백틱 안의 별표가 보호되게 한다.
+    private static let inlinePatterns: [(kind: InlineKind, pattern: String)] = [
+        (.code,   #"`(.+?)`"#),
+        (.bold,   #"\*\*(.+?)\*\*"#),
+        (.strike, #"~~(.+?)~~"#),
+        (.italic, #"\*(.+?)\*"#),
+    ]
 
     private func updateTextContent() {
         guard let textView = textView, let scrollView = scrollView else { return }
@@ -1187,6 +1181,7 @@ class SettingsWindowController: NSWindowController {
 class PrompterWindowController: NSWindowController {
     var prompterView: PrompterView!
     var scrollTimer: Timer?
+    private var lastTick: CFTimeInterval = 0
     var isPlaying = false
     var scrollSpeed: CGFloat = 50  // pixels per second
     var isClickThrough = false
@@ -1301,23 +1296,53 @@ class PrompterWindowController: NSWindowController {
         }
     }
 
+    /// 자동 스크롤이 도달할 수 있는 최대 오프셋.
+    /// **PrompterView.scrollOffset setter 의 클램프 식과 반드시 문자 그대로 같아야 한다.**
+    /// 예전 코드는 여기에 +100 을 더해 정지 조건이 수학적으로 도달 불가였고,
+    /// 그래서 대본 끝에 닿아도 타이머가 멈추지 않았다(되감으면 저절로 다시 흘러내려감).
+    private var maxScrollOffset: CGFloat {
+        max(0, prompterView.calculateTotalHeight() - prompterView.bounds.height)
+    }
+
     func togglePlay() {
         isPlaying.toggle()
-
         if isPlaying {
-            scrollTimer = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { [weak self] _ in
-                guard let self = self else { return }
-                self.prompterView.scrollOffset += self.scrollSpeed / 60.0
-
-                let maxScroll = self.prompterView.calculateTotalHeight() - self.prompterView.bounds.height + 100
-                if self.prompterView.scrollOffset > maxScroll {
-                    self.prompterView.scrollOffset = maxScroll
-                    self.isPlaying = false
-                    self.scrollTimer?.invalidate()
-                }
-            }
+            startScrolling()
         } else {
-            scrollTimer?.invalidate()
+            stopScrolling()
+        }
+    }
+
+    private func startScrolling() {
+        stopScrolling()
+        lastTick = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.scrollStep()
+        }
+        // .common 이어야 창 드래그·슬라이더 드래그·메뉴 트래킹 중에도 계속 흐른다.
+        // 기본 .default 모드만 쓰면 그 동안 스크롤이 통째로 멈춘다.
+        RunLoop.main.add(timer, forMode: .common)
+        scrollTimer = timer
+    }
+
+    private func stopScrolling() {
+        scrollTimer?.invalidate()
+        scrollTimer = nil
+    }
+
+    private func scrollStep() {
+        let now = CACurrentMediaTime()
+        // 슬립에서 깨어난 직후 등 dt 가 클 때 대본이 순간이동하지 않도록 상한을 둔다.
+        let dt = min(now - lastTick, 0.25)
+        lastTick = now
+
+        let limit = maxScrollOffset
+        prompterView.scrollOffset += scrollSpeed * CGFloat(dt)
+
+        if prompterView.scrollOffset >= limit - 0.5 {
+            prompterView.scrollOffset = limit
+            stopScrolling()
+            isPlaying = false
         }
     }
 
@@ -1571,7 +1596,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - Self Test (인라인 마크다운 골든 검사)
+
+/// `ShadowCue --selftest` 로 실행하면 창을 띄우지 않고 파서 결과만 덤프하고 종료한다.
+/// 인라인 강조는 눈으로 보기 전에는 회귀를 알아채기 어려워, 렌더 결과를 텍스트로 고정해 둔다.
+func runInlineMarkdownSelfTest() {
+    let font = NSFont.systemFont(ofSize: 32, weight: .medium)
+    let cases = [
+        "*기울임* 그리고 **굵게**",
+        "`코드` 뒤에 ~~취소선~~",
+        "`a**b**c`",
+        "**A** 안에 `코드` 있는 **B**",
+        "**굵게** 그리고 *기울임*",
+        "~~취소선~~ 먼저 **굵게** 나중",
+        "**굵은 글씨**는 별표 두 개로",
+        "*기울임*은 별표 하나로",
+        "~~취소선~~은 물결표 두 개로",
+        "`코드`는 백틱으로",
+        "강조 없는 평범한 줄",
+        "**굵게**만",
+    ]
+    for source in cases {
+        let attributed = PrompterView.processInlineMarkdown(source, baseFont: font, baseColor: .white)
+        var parts: [String] = []
+        attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attrs, range, _ in
+            let piece = (attributed.string as NSString).substring(with: range)
+            var kind = "PLAIN"
+            if attrs[.strikethroughStyle] != nil {
+                kind = "STRIKE"
+            } else if let f = attrs[.font] as? NSFont {
+                if f.fontDescriptor.symbolicTraits.contains(.italic) { kind = "ITALIC" }
+                else if f.fontDescriptor.symbolicTraits.contains(.monoSpace) { kind = "CODE" }
+                else if f.fontDescriptor.symbolicTraits.contains(.bold) { kind = "BOLD" }
+            }
+            parts.append("[\(kind)]\"\(piece)\"")
+        }
+        print("IN : \(source)")
+        print("OUT: \(parts.joined(separator: " "))")
+    }
+}
+
 // MARK: - Main
+if CommandLine.arguments.contains("--selftest") {
+    runInlineMarkdownSelfTest()
+    exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
