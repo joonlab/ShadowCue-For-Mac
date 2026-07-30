@@ -1887,8 +1887,13 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
     /// 저장된 설정을 화면에 적용한다.
     /// 순서가 중요하다 — 대본 텍스트 대입이 전체 재파싱을 유발하므로 **가장 마지막**이다.
     func applyLoadedSettings(_ settings: Settings) {
+        Self.debugFrame("before-apply", window?.frame ?? .zero)
         if let frame = Self.resolvedWindowFrame(from: settings.windowFrame) {
+            Self.debugFrame("stored", frame)
             window?.setFrame(frame, display: false)
+            Self.debugFrame("after-setFrame", window?.frame ?? .zero)
+        } else {
+            Self.debugFrame("stored-rejected", .zero)
         }
         backgroundColor = settings.backgroundColor.nsColor
         backgroundOpacity = CGFloat(settings.backgroundOpacity)
@@ -1919,10 +1924,20 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 
     private func saveWindowFrame() {
         guard let frame = window?.frame else { return }
+        Self.debugFrame("save", frame)
         SettingsStore.shared.update {
             $0.windowFrame = [Double(frame.origin.x), Double(frame.origin.y),
                               Double(frame.width), Double(frame.height)]
         }
+    }
+
+    /// SHADOWCUE_DEBUG_FRAME=1 일 때만 창 프레임 변화를 표준출력에 찍는다(진단용).
+    static func debugFrame(_ label: String, _ frame: NSRect) {
+        guard ProcessInfo.processInfo.environment["SHADOWCUE_DEBUG_FRAME"] == "1" else { return }
+        // stdout 은 파이프에서 버퍼링되어 실행 중에는 안 보인다 -> 버퍼 없는 stderr 로.
+        let line = "[frame] \(label): \(Int(frame.origin.x)),\(Int(frame.origin.y)) "
+            + "\(Int(frame.width))x\(Int(frame.height))\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     private func setupPrompterView() {
@@ -2187,8 +2202,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         prompterController.applyLoadedSettings(SettingsStore.shared.settings)
         // 대본은 전체 재파싱을 유발하므로 마지막에.
         prompterController.loadActiveScript()
+        PrompterWindowController.debugFrame("after-script", prompterController.window?.frame ?? .zero)
 
         prompterController.showWindow(nil)
+        PrompterWindowController.debugFrame("after-showWindow", prompterController.window?.frame ?? .zero)
 
         // Setup global hotkeys
         setupHotkeys()
