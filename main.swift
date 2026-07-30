@@ -231,6 +231,9 @@ class HotkeyManager {
 
 // MARK: - Hotkey Recorder Field
 class HotkeyRecorderField: NSTextField {
+    /// 단축키 녹화 중에는 설정창의 편집 단축키 폴백(⌘C/⌘V 등)이 끼어들면 안 된다.
+    static var isRecordingActive = false
+
     var hotkeyAction: HotkeyAction?
     var statusLabel: NSTextField?
     var onHotkeyChanged: ((UInt32, UInt32) -> Bool)?
@@ -271,6 +274,7 @@ class HotkeyRecorderField: NSTextField {
         guard !isRecording else { return }
 
         isRecording = true
+        HotkeyRecorderField.isRecordingActive = true
         stringValue = "키 입력 대기중..."
         layer?.borderColor = NSColor.systemBlue.cgColor
         layer?.borderWidth = 2
@@ -317,6 +321,7 @@ class HotkeyRecorderField: NSTextField {
         guard isRecording else { return }
 
         isRecording = false
+        HotkeyRecorderField.isRecordingActive = false
         layer?.borderColor = NSColor.separatorColor.cgColor
         layer?.borderWidth = 1
         backgroundColor = NSColor.controlBackgroundColor
@@ -843,6 +848,7 @@ class SettingsWindowController: NSWindowController {
     var speedSlider: NSSlider?
     var speedValueLabel: NSTextField?
     var prompterTextView: FineUndoTextView?  // 텍스트 입력창 참조
+    private var editKeyMonitor: Any?
 
     convenience init(prompterController: PrompterWindowController) {
         let window = NSWindow(
@@ -1067,6 +1073,39 @@ class SettingsWindowController: NSWindowController {
         if let docView = scrollView.documentView {
             docView.scroll(NSPoint(x: 0, y: docView.bounds.height))
         }
+
+        installEditKeyFallback()
+    }
+
+    /// `.accessory` 앱은 메뉴바를 띄우지 않으므로 Edit 메뉴의 키 등가물(⌘C/⌘V/⌘X/⌘A/⌘Z)이
+    /// 동작하지 않을 수 있다. 대본을 붙여넣는 창에서 붙여넣기가 안 되면 앱이 무용지물이므로
+    /// 설정창이 키 윈도우일 때만 도는 로컬 폴백을 둔다. 메뉴 경로가 살아 있어도 결과는 같다.
+    private func installEditKeyFallback() {
+        editKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self,
+                  let window = self.window, window.isKeyWindow,
+                  !HotkeyRecorderField.isRecordingActive else { return event }
+
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags == .command || flags == [.command, .shift] else { return event }
+
+            let shift = flags.contains(.shift)
+            let selector: Selector?
+            switch event.charactersIgnoringModifiers?.lowercased() ?? "" {
+            case "c": selector = #selector(NSText.copy(_:))
+            case "v": selector = #selector(NSText.paste(_:))
+            case "x": selector = #selector(NSText.cut(_:))
+            case "a": selector = #selector(NSText.selectAll(_:))
+            case "z": selector = shift ? Selector(("redo:")) : Selector(("undo:"))
+            default:  selector = nil
+            }
+            guard let sel = selector else { return event }
+            return NSApp.sendAction(sel, to: nil, from: nil) ? nil : event
+        }
+    }
+
+    deinit {
+        if let monitor = editKeyMonitor { NSEvent.removeMonitor(monitor) }
     }
 
     private func handleHotkeyChange(action: HotkeyAction, keyCode: UInt32, modifiers: UInt32) -> Bool {
@@ -1168,7 +1207,10 @@ class PrompterWindowController: NSWindowController {
         // KEY: This makes the window invisible to screen recording/sharing
         window.sharingType = .none
 
-        window.title = "ShadowCue"
+        // 스텔스: 창 제목을 비운다. 화면에는 어차피 안 보이지만(titleVisibility = .hidden),
+        // CGWindowListCopyWindowInfo / SCShareableContent 가 title 과 bounds 를 그대로 노출한다.
+        window.title = ""
+        window.setAccessibilityLabel("프롬프터")
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
@@ -1327,6 +1369,8 @@ class PrompterWindowController: NSWindowController {
         if settingsController == nil {
             settingsController = SettingsWindowController(prompterController: self)
         }
+        // .accessory 앱은 자동 활성화되지 않으므로 명시적으로 올려야 키 입력을 받는다.
+        NSApp.activate(ignoringOtherApps: true)
         settingsController?.showWindow(nil)
         settingsController?.window?.makeKeyAndOrderFront(nil)
     }
@@ -1336,8 +1380,12 @@ class PrompterWindowController: NSWindowController {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var prompterController: PrompterWindowController!
     var statusItem: NSStatusItem?
+    private var stealthObserver: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 스텔스 가드를 창 생성보다 먼저 건다.
+        installStealthGuard()
+
         // Create prompter window
         prompterController = PrompterWindowController()
         prompterController.showWindow(nil)
@@ -1350,6 +1398,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup main menu
         setupMainMenu()
+    }
+
+    /// 이 앱이 만드는 **모든** 창을 화면 캡처에서 제외한다.
+    ///
+    /// 창 생성부에서 sharingType 을 거는 것만으로는 부족하다 — 시스템 컬러 패널, NSAlert,
+    /// 폰트 패널처럼 우리가 직접 만들지 않는 보조 창이 기본값 `.readOnly` 로 뜨기 때문이다.
+    /// `didUpdateNotification` 은 창별로 오므로 O(1) 로 처리한다.
+    ///
+    /// 한계: NSOpenPanel/NSSavePanel 은 별도 프로세스가 그리므로 여기서 강제할 수 없다.
+    /// 상태바 아이템도 메뉴바 소속이라 캡처에 남는다(조작 수단이므로 의도된 노출).
+    private func installStealthGuard() {
+        NSColorPanel.shared.sharingType = .none
+        NSFontPanel.shared.sharingType = .none
+
+        stealthObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didUpdateNotification, object: nil, queue: .main
+        ) { note in
+            guard let window = note.object as? NSWindow else { return }
+            if window.sharingType != .none {
+                window.sharingType = .none
+            }
+        }
     }
 
     private func setupHotkeys() {
@@ -1468,9 +1538,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "ShadowCue for Mac"
-        alert.informativeText = "화면 녹화에 보이지 않는 스텔스 프롬프터\n\n버전 1.1\n\n단축키: Ctrl+Option+Space (재생/일시정지)\n\n제작: 준랩 | JoonLab"
+        // 단축키 문구는 하드코딩하지 않고 현재 설정에서 만든다(기본값을 바꿔도 어긋나지 않도록).
+        let playKey = HotkeyManager.shared.hotkeyConfigs[.togglePlay]?.displayString ?? "-"
+        alert.informativeText = """
+        화면 녹화에 보이지 않는 스텔스 프롬프터
+
+        버전 \(Self.appVersion)
+
+        재생/일시정지: \(playKey)
+
+        제작: 준랩 | JoonLab
+        """
         alert.alertStyle = .informational
+        // 스텔스: NSAlert 창은 기본 .readOnly 라 그대로 녹화된다.
+        alert.window.sharingType = .none
         alert.runModal()
+    }
+
+    /// Info.plist 를 단일 출처로 삼는다(코드에 버전을 두 번 적지 않기 위해).
+    static var appVersion: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "개발 빌드"
     }
 
     @objc func checkForUpdates() {
@@ -1488,6 +1575,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
-app.activate(ignoringOtherApps: true)
+// 스텔스: 반드시 .accessory 여야 한다.
+// 메뉴바는 NSWindow.sharingType 보호를 받지 않으므로, .regular 이면 앱이 최전면이 되는 순간
+// 녹화 영상에 "ShadowCue" 앱 이름과 메뉴가 그대로 찍힌다(창 픽셀만 가리고 이름으로 자백하는 꼴).
+// Info.plist 의 LSUIElement 도 true 여야 하며, 둘 중 하나만 바꾸면 나머지가 되돌린다.
+app.setActivationPolicy(.accessory)
 app.run()
