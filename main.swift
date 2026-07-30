@@ -45,6 +45,14 @@ enum HotkeyAction: Int, CaseIterable {
         }
     }
 
+    /// 기본 수정자. 한 곳에서만 정의해 초기화·기본값 표시가 어긋나지 않게 한다.
+    static let defaultModifiers = UInt32(optionKey | controlKey)
+
+    /// README·데모 대본·정보창에 같은 단축키를 세 번 하드코딩하지 않기 위한 표시 문자열.
+    var defaultDisplayString: String {
+        HotkeyConfig(keyCode: defaultKeyCode, modifiers: HotkeyAction.defaultModifiers).displayString
+    }
+
     var defaultKeyCode: UInt32 {
         switch self {
         case .togglePlay: return UInt32(kVK_Space)
@@ -201,6 +209,142 @@ final class SettingsStore {
     private func writeNow() {
         guard let data = try? JSONEncoder().encode(settings) else { return }
         defaults.set(data, forKey: storageKey)
+    }
+}
+
+// MARK: - Script Storage
+
+struct ScriptMeta: Codable, Equatable {
+    var id: String
+    var title: String
+    var createdAt: Date
+    var updatedAt: Date
+    var lastScrollOffset: Double = 0
+}
+
+struct ScriptLibrary: Codable, Equatable {
+    var version: Int = 1
+    var scripts: [ScriptMeta] = []
+}
+
+/// 대본은 설정이 아니라 **문서**다. 그래서 UserDefaults 가 아니라 파일로 둔다.
+/// (성능 문제가 아니다 — `defaults delete` 한 번에 강의 대본이 함께 증발하면 안 되고,
+///  Finder·Obsidian·git 으로 직접 열어보고 백업할 수 있어야 한다)
+///
+/// ~/Library/Application Support/ShadowCue/
+///   ├── library.json        대본 목록(제목·수정시각·마지막 위치)
+///   └── scripts/<uuid>.md   본문 (+ <uuid>.md.bak 직전 세대 1개)
+///
+/// UI 는 아직 단일 대본이지만 스토리지는 처음부터 N개를 표현한다 — 나중에 라이브러리를
+/// 붙일 때 마이그레이션이 필요 없도록.
+enum ScriptStore {
+    static let demoScript = """
+# ShadowCue for Mac
+
+**화면 녹화에 보이지 않는** 스텔스 프롬프터
+
+---
+
+## 마크다운 지원
+
+- **굵은 글씨**는 별표 두 개로
+- *기울임*은 별표 하나로
+- ~~취소선~~은 물결표 두 개로
+- `코드`는 백틱으로
+
+---
+
+### 단축키
+
+1. \(HotkeyAction.togglePlay.defaultDisplayString) - 재생/일시정지
+2. \(HotkeyAction.toggleClickThrough.defaultDisplayString) - 클릭스루 모드
+3. \(HotkeyAction.toggleVisibility.defaultDisplayString) - 숨기기/보이기
+
+> 설정 창에서 원하는 텍스트를 입력하세요. 입력하면 바로 반영됩니다.
+"""
+
+    static var baseURL: URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return root.appendingPathComponent("ShadowCue", isDirectory: true)
+    }
+    static var scriptsURL: URL { baseURL.appendingPathComponent("scripts", isDirectory: true) }
+    static var libraryURL: URL { baseURL.appendingPathComponent("library.json") }
+
+    static func prepare() {
+        try? FileManager.default.createDirectory(at: scriptsURL, withIntermediateDirectories: true)
+    }
+
+    static func url(for id: String) -> URL {
+        scriptsURL.appendingPathComponent("\(id).md")
+    }
+
+    static func exists(id: String) -> Bool {
+        FileManager.default.fileExists(atPath: url(for: id).path)
+    }
+
+    static func read(id: String) -> String? {
+        try? String(contentsOf: url(for: id), encoding: .utf8)
+    }
+
+    /// 원자적으로 쓰고 직전 세대를 .bak 으로 한 개 남긴다.
+    @discardableResult
+    static func write(id: String, text: String) -> Bool {
+        prepare()
+        let target = url(for: id)
+        if FileManager.default.fileExists(atPath: target.path) {
+            let backup = target.appendingPathExtension("bak")
+            try? FileManager.default.removeItem(at: backup)
+            try? FileManager.default.copyItem(at: target, to: backup)
+        }
+        do {
+            try text.write(to: target, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    static func loadLibrary() -> ScriptLibrary {
+        guard let data = try? Data(contentsOf: libraryURL),
+              let library = try? JSONDecoder().decode(ScriptLibrary.self, from: data) else {
+            return ScriptLibrary()
+        }
+        return library
+    }
+
+    static func saveLibrary(_ library: ScriptLibrary) {
+        prepare()
+        guard let data = try? JSONEncoder().encode(library) else { return }
+        try? data.write(to: libraryURL, options: .atomic)
+    }
+
+    static func touch(id: String, title: String? = nil) {
+        var library = loadLibrary()
+        if let index = library.scripts.firstIndex(where: { $0.id == id }) {
+            library.scripts[index].updatedAt = Date()
+            if let title { library.scripts[index].title = title }
+        } else {
+            library.scripts.append(ScriptMeta(id: id, title: title ?? "기본 대본",
+                                              createdAt: Date(), updatedAt: Date()))
+        }
+        saveLibrary(library)
+    }
+
+    /// 활성 대본을 보장한다. 없으면 데모 대본으로 새로 만든다.
+    ///
+    /// 최초 실행 판별은 **문자열이 비었는지가 아니라 파일 존재 여부로** 한다.
+    /// (사용자가 대본을 통째로 지운 것도 정상 상태이며, 그 빈 상태가 보존돼야 한다)
+    static func ensureActiveScript() -> (id: String, text: String) {
+        prepare()
+        let storedID = SettingsStore.shared.settings.activeScriptID
+        if let id = storedID, exists(id: id) {
+            return (id, read(id: id) ?? "")
+        }
+        let id = storedID ?? UUID().uuidString
+        write(id: id, text: demoScript)
+        touch(id: id, title: "기본 대본")
+        SettingsStore.shared.update { $0.activeScriptID = id }
+        return (id, demoScript)
     }
 }
 
@@ -608,12 +752,14 @@ class PrompterView: NSView {
     private var cachedTotalHeight: CGFloat = 0
     private var scrollerHideTimer: Timer?
 
-    var text: String = "" {
-        didSet {
-            guard text != oldValue else { return }
-            // 새 대본은 맨 위에서 시작하는 것이 옳다.
-            updateTextContent(preserveScroll: false)
-        }
+    /// 스크롤 정책(맨 위로 갈지 읽던 자리를 지킬지)은 호출자가 정한다.
+    /// 새 대본을 여는 것과, 보고 있는 대본을 편집하는 것은 다르게 다뤄야 한다.
+    private(set) var text: String = ""
+
+    func setText(_ newValue: String, preserveScroll: Bool) {
+        guard newValue != text else { return }
+        text = newValue
+        updateTextContent(preserveScroll: preserveScroll)
     }
 
     var textColor: NSColor = .white {
@@ -1014,13 +1160,14 @@ class FineUndoTextView: NSTextView {
 }
 
 // MARK: - Settings Window Controller
-class SettingsWindowController: NSWindowController, NSWindowDelegate {
+class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
     var prompterController: PrompterWindowController?
     var hotkeyRecorders: [HotkeyAction: HotkeyRecorderField] = [:]
     var speedSlider: NSSlider?
     var speedValueLabel: NSTextField?
     var prompterTextView: FineUndoTextView?  // 텍스트 입력창 참조
     private var editKeyMonitor: Any?
+    private var livePreviewWorkItem: DispatchWorkItem?
 
     convenience init(prompterController: PrompterWindowController) {
         let window = NSWindow(
@@ -1092,6 +1239,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         textView.font = NSFont.systemFont(ofSize: 14)
         textView.allowsUndo = true
         textView.autoresizingMask = [.width, .height]
+        textView.delegate = self   // 실시간 반영
         textScrollView.documentView = textView
         textScrollView.hasVerticalScroller = true
         textScrollView.borderType = .bezelBorder
@@ -1105,10 +1253,17 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         yOffset -= 115
 
         // Apply text button
-        let applyTextButton = NSButton(title: "텍스트 적용", target: self, action: #selector(applyText(_:)))
+        // 타이핑하면 자동 반영되므로 이 버튼은 "지금 즉시 파일에 확정"이라는 의미로 남긴다.
+        let applyTextButton = NSButton(title: "지금 저장", target: self, action: #selector(applyText(_:)))
         applyTextButton.frame = NSRect(x: leftMargin, y: yOffset, width: 100, height: 28)
         applyTextButton.bezelStyle = .rounded
         contentView.addSubview(applyTextButton)
+
+        let autoApplyHint = NSTextField(labelWithString: "입력하면 자동으로 반영·저장됩니다")
+        autoApplyHint.font = NSFont.systemFont(ofSize: 11)
+        autoApplyHint.textColor = .secondaryLabelColor
+        autoApplyHint.frame = NSRect(x: leftMargin + 110, y: yOffset + 4, width: 260, height: 18)
+        contentView.addSubview(autoApplyHint)
         yOffset -= 45
 
         // === Appearance Section ===
@@ -1317,8 +1472,31 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func applyText(_ sender: NSButton) {
-        guard let textView = prompterTextView else { return }
-        prompterController?.prompterView.text = textView.string
+        guard let textView = prompterTextView, let controller = prompterController else { return }
+        controller.updateScript(textView.string, immediate: true)
+        if !controller.flushScript() {
+            // 조용히 삼키면 사용자는 저장된 줄 안다.
+            let alert = NSAlert()
+            alert.messageText = "대본을 저장하지 못했습니다"
+            alert.informativeText = "화면에는 반영됐지만 파일 쓰기에 실패했습니다.\n\n\(ScriptStore.baseURL.path)"
+            alert.alertStyle = .warning
+            alert.window.sharingType = .none
+            alert.runModal()
+        }
+    }
+
+    // MARK: NSTextViewDelegate — 실시간 반영
+
+    func textDidChange(_ notification: Notification) {
+        guard let textView = prompterTextView, notification.object as? NSTextView === textView else { return }
+        // 화면 반영은 0.3초, 파일 쓰기는 updateScript 안에서 다시 1.5초로 묶인다.
+        livePreviewWorkItem?.cancel()
+        let snapshot = textView.string
+        let work = DispatchWorkItem { [weak self] in
+            self?.prompterController?.updateScript(snapshot)
+        }
+        livePreviewWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
     @objc func fontSizeChanged(_ sender: NSSlider) {
@@ -1492,31 +1670,51 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 
         prompterView = PrompterView(frame: window.contentView!.bounds)
         prompterView.autoresizingMask = [.width, .height]
-        prompterView.text = """
-# ShadowCue for Mac
-
-**화면 녹화에 보이지 않는** 스텔스 프롬프터
-
----
-
-## 마크다운 지원
-
-- **굵은 글씨**는 별표 두 개로
-- *기울임*은 별표 하나로
-- ~~취소선~~은 물결표 두 개로
-- `코드`는 백틱으로
-
----
-
-### 단축키
-
-1. Ctrl+Option+Space - 재생/일시정지
-2. Ctrl+Option+D - 클릭스루 모드
-3. Ctrl+Option+H - 숨기기/보이기
-
-> 설정 창에서 원하는 텍스트를 입력하세요.
-"""
+        // 대본은 AppDelegate 가 ScriptStore 에서 읽어 마지막에 넣는다(재파싱이 한 번만 일어나도록).
         window.contentView?.addSubview(prompterView)
+    }
+
+    // MARK: 대본
+
+    private(set) var activeScriptID: String?
+    private var scriptWriteWorkItem: DispatchWorkItem?
+
+    /// 저장된 대본을 불러와 화면에 올린다. 없으면 데모 대본을 만들어 준다.
+    func loadActiveScript() {
+        let script = ScriptStore.ensureActiveScript()
+        activeScriptID = script.id
+        prompterView.setText(script.text, preserveScroll: false)
+    }
+
+    /// 화면에는 즉시 반영하고, 파일 쓰기만 묶는다.
+    /// (134KB 대본을 무디바운스로 쓰면 타이핑 3초에 수십 MB 를 쓰게 된다)
+    func updateScript(_ text: String, immediate: Bool = false) {
+        // 편집 중에는 읽던 자리를 지킨다(타이핑할 때마다 맨 위로 튀면 못 쓴다).
+        prompterView.setText(text, preserveScroll: true)
+        scriptWriteWorkItem?.cancel()
+        guard let id = activeScriptID else { return }
+        let work = DispatchWorkItem {
+            ScriptStore.write(id: id, text: text)
+            ScriptStore.touch(id: id)
+        }
+        scriptWriteWorkItem = work
+        if immediate {
+            work.perform()
+            scriptWriteWorkItem = nil
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        }
+    }
+
+    /// 종료·비활성 시점에 대기 중인 대본 쓰기를 확정한다.
+    @discardableResult
+    func flushScript() -> Bool {
+        guard let id = activeScriptID else { return true }
+        scriptWriteWorkItem?.cancel()
+        scriptWriteWorkItem = nil
+        let ok = ScriptStore.write(id: id, text: prompterView.text)
+        if ok { ScriptStore.touch(id: id) }
+        return ok
     }
 
     private func setupScrollWheel() {
@@ -1676,6 +1874,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 저장된 설정 복원. NSScreen 을 만지므로 반드시 여기(앱 기동 완료 후)에서 한다.
         prompterController.applyLoadedSettings(SettingsStore.shared.settings)
+        // 대본은 전체 재파싱을 유발하므로 마지막에.
+        prompterController.loadActiveScript()
 
         prompterController.showWindow(nil)
 
@@ -1696,13 +1896,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func installSaveTriggers() {
         resignObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willResignActiveNotification, object: nil, queue: .main
-        ) { _ in
+        ) { [weak self] _ in
             SettingsStore.shared.flushNow()
+            self?.prompterController?.flushScript()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         SettingsStore.shared.flushNow()
+        prompterController?.flushScript()
     }
 
     /// 이 앱이 만드는 **모든** 창을 화면 캡처에서 제외한다.
