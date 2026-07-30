@@ -32,6 +32,10 @@ enum HotkeyAction: Int, CaseIterable {
     case toggleClickThrough = 5
     case speedUp = 6
     case speedDown = 7
+    // ⚠️ 새 액션을 추가할 때는 rawValue 가 곧 hotkey ID 이므로 **4곳을 함께** 고쳐야 한다:
+    //    이 enum / HotkeyManager 의 콜백 프로퍼티 / 이벤트 핸들러 switch / AppDelegate 배선.
+    //    하나만 빠지면 등록은 되는데 아무 일도 안 일어나 원인을 찾기 어렵다.
+    case scrollToTop = 8
 
     var name: String {
         switch self {
@@ -39,9 +43,10 @@ enum HotkeyAction: Int, CaseIterable {
         case .scrollUp: return "위로 스크롤"
         case .scrollDown: return "아래로 스크롤"
         case .toggleVisibility: return "숨기기/보이기"
-        case .toggleClickThrough: return "드래그 OFF 모드"
+        case .toggleClickThrough: return "클릭 통과"
         case .speedUp: return "속도 증가"
         case .speedDown: return "속도 감소"
+        case .scrollToTop: return "처음으로"
         }
     }
 
@@ -66,6 +71,7 @@ enum HotkeyAction: Int, CaseIterable {
         case .toggleClickThrough: return UInt32(kVK_ANSI_D)
         case .speedUp: return UInt32(kVK_ANSI_Period)
         case .speedDown: return UInt32(kVK_ANSI_Comma)
+        case .scrollToTop: return UInt32(kVK_ANSI_R)
         }
     }
 }
@@ -322,6 +328,19 @@ enum ScriptStore {
         try? data.write(to: libraryURL, options: .atomic)
     }
 
+    /// 어디까지 읽었는지 기억한다(재실행 후 이어읽기).
+    static func saveScrollOffset(id: String, offset: Double) {
+        var library = loadLibrary()
+        guard let index = library.scripts.firstIndex(where: { $0.id == id }) else { return }
+        guard abs(library.scripts[index].lastScrollOffset - offset) > 1 else { return }
+        library.scripts[index].lastScrollOffset = offset
+        saveLibrary(library)
+    }
+
+    static func scrollOffset(id: String) -> Double {
+        loadLibrary().scripts.first(where: { $0.id == id })?.lastScrollOffset ?? 0
+    }
+
     static func touch(id: String, title: String? = nil) {
         var library = loadLibrary()
         if let index = library.scripts.firstIndex(where: { $0.id == id }) {
@@ -370,6 +389,7 @@ class HotkeyManager {
     var onToggleClickThrough: (() -> Void)?
     var onSpeedUp: (() -> Void)?
     var onSpeedDown: (() -> Void)?
+    var onScrollToTop: (() -> Void)?
 
     /// 부팅 시 등록에 실패한 액션(다른 앱이 이미 그 조합을 잡고 있는 경우 등).
     private(set) var failedActions: Set<HotkeyAction> = []
@@ -423,6 +443,7 @@ class HotkeyManager {
                     case 5: HotkeyManager.shared.onToggleClickThrough?()
                     case 6: HotkeyManager.shared.onSpeedUp?()
                     case 7: HotkeyManager.shared.onSpeedDown?()
+                    case 8: HotkeyManager.shared.onScrollToTop?()
                     default: break
                     }
                 }
@@ -781,12 +802,176 @@ class PrompterWindow: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
+// MARK: - Prompter Overlay (읽기 보조 레이어)
+
+/// 대본 위에 얹히는 비대화형 레이어. 시선 밴드·상하 페이드·진행률·남은 시간·상태 뱃지·토스트를 그린다.
+///
+/// `hitTest` 가 항상 nil 이라 마우스·트랙패드 이벤트를 하나도 가로채지 않는다
+/// (프롬프터 스크롤은 그대로 동작해야 한다).
+/// draw(_:) 대신 CALayer 로 구성해, 자동 스크롤 60fps 중에는 진행률 레이어의 frame 만 바뀌게 한다.
+final class PrompterOverlayView: NSView {
+    private let topFade = CAGradientLayer()
+    private let bottomFade = CAGradientLayer()
+    private let bandLayer = CALayer()
+    private let progressTrack = CALayer()
+    private let progressFill = CALayer()
+
+    private let hudLabel = NSTextField(labelWithString: "")
+    private let badgeLabel = NSTextField(labelWithString: "")
+    private let toastLabel = NSTextField(labelWithString: "")
+    private var toastHideWork: DispatchWorkItem?
+
+    /// 화면 높이에서 시선 밴드가 놓이는 위치(0=맨 위, 1=맨 아래).
+    private let bandPosition: CGFloat = 0.38
+    private let fadeHeight: CGFloat = 64
+
+    var accentColor: NSColor = .white { didSet { applyColors() } }
+
+    var showsFocusBand = true {
+        didSet { bandLayer.isHidden = !showsFocusBand }
+    }
+
+    var progress: Double = 0 {
+        didSet { layoutProgress() }
+    }
+
+    /// 재생 중 남은 시간(초). nil 이면 숨긴다.
+    var remainingSeconds: Double? {
+        didSet { updateHUD() }
+    }
+
+    var badgeText: String? {
+        didSet {
+            badgeLabel.stringValue = badgeText ?? ""
+            badgeLabel.isHidden = (badgeText ?? "").isEmpty
+            needsLayout = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    private func setup() {
+        wantsLayer = true
+        layer?.masksToBounds = true
+
+        for gradient in [topFade, bottomFade] {
+            gradient.isHidden = false
+            layer?.addSublayer(gradient)
+        }
+        layer?.addSublayer(bandLayer)
+        progressTrack.addSublayer(progressFill)
+        layer?.addSublayer(progressTrack)
+
+        for label in [hudLabel, badgeLabel, toastLabel] {
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            label.alignment = .center
+            label.wantsLayer = true
+            label.layer?.cornerRadius = 4
+            label.isHidden = true
+            addSubview(label)
+        }
+        toastLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        toastLabel.alignment = .center
+
+        applyColors()
+    }
+
+    private func applyColors() {
+        let base = accentColor
+        bandLayer.backgroundColor = base.withAlphaComponent(0.16).cgColor
+        progressTrack.backgroundColor = base.withAlphaComponent(0.12).cgColor
+        progressFill.backgroundColor = base.withAlphaComponent(0.55).cgColor
+
+        // 위아래를 살짝 눌러 시선이 중앙 밴드에 머물게 한다.
+        let clear = NSColor.black.withAlphaComponent(0).cgColor
+        let dim = NSColor.black.withAlphaComponent(0.45).cgColor
+        topFade.colors = [dim, clear]
+        bottomFade.colors = [clear, dim]
+
+        for label in [hudLabel, badgeLabel] {
+            label.textColor = base.withAlphaComponent(0.85)
+            label.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.35).cgColor
+        }
+        toastLabel.textColor = base
+        toastLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+    }
+
+    /// 이 레이어는 절대 이벤트를 먹지 않는다.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        let width = bounds.width
+        let height = bounds.height
+
+        topFade.frame = NSRect(x: 0, y: height - fadeHeight, width: width, height: fadeHeight)
+        topFade.startPoint = CGPoint(x: 0.5, y: 1)
+        topFade.endPoint = CGPoint(x: 0.5, y: 0)
+        bottomFade.frame = NSRect(x: 0, y: 0, width: width, height: fadeHeight)
+        bottomFade.startPoint = CGPoint(x: 0.5, y: 1)
+        bottomFade.endPoint = CGPoint(x: 0.5, y: 0)
+
+        let bandY = height * (1 - bandPosition)
+        bandLayer.frame = NSRect(x: 0, y: bandY - 1, width: width, height: 2)
+
+        progressTrack.frame = NSRect(x: 0, y: 0, width: width, height: 2)
+        layoutProgress()
+
+        hudLabel.frame = NSRect(x: width - 96, y: height - 26, width: 88, height: 18)
+        badgeLabel.frame = NSRect(x: 8, y: height - 26, width: 132, height: 18)
+        toastLabel.frame = NSRect(x: (width - 200) / 2, y: 18, width: 200, height: 24)
+    }
+
+    private func layoutProgress() {
+        let clamped = max(0, min(1, progress))
+        progressFill.frame = NSRect(x: 0, y: 0, width: bounds.width * CGFloat(clamped), height: 2)
+    }
+
+    private func updateHUD() {
+        guard let seconds = remainingSeconds, seconds.isFinite, seconds > 0 else {
+            hudLabel.isHidden = true
+            return
+        }
+        let total = Int(seconds.rounded())
+        hudLabel.stringValue = String(format: "남음 %d:%02d", total / 60, total % 60)
+        hudLabel.isHidden = false
+    }
+
+    /// 설정 창을 닫아 둔 상태에서 단축키로 속도를 바꿔도 바뀐 걸 알 수 있게 한다.
+    func showToast(_ message: String) {
+        toastLabel.stringValue = message
+        toastLabel.isHidden = false
+        toastLabel.alphaValue = 1
+        toastHideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                self.toastLabel.animator().alphaValue = 0
+            } completionHandler: {
+                self.toastLabel.isHidden = true
+            }
+        }
+        toastHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: work)
+    }
+}
+
 // MARK: - Prompter View (Optimized with NSTextView)
 class PrompterView: NSView {
     private var scrollView: NSScrollView!
     private var textView: NSTextView!
     private var cachedTotalHeight: CGFloat = 0
     private var scrollerHideTimer: Timer?
+    let overlay = PrompterOverlayView()
 
     /// 스크롤 정책(맨 위로 갈지 읽던 자리를 지킬지)은 호출자가 정한다.
     /// 새 대본을 여는 것과, 보고 있는 대본을 편집하는 것은 다르게 다뤄야 한다.
@@ -802,6 +987,7 @@ class PrompterView: NSView {
         didSet {
             guard textColor != oldValue else { return }
             updateTextContent()
+            overlay.accentColor = textColor
             if let rgba = RGBA(textColor) {
                 SettingsStore.shared.update { $0.textColor = rgba }
             }
@@ -828,7 +1014,19 @@ class PrompterView: NSView {
             let clampedOffset = min(max(0, newValue), maxY)
             clipView.setBoundsOrigin(NSPoint(x: 0, y: clampedOffset))
             scrollView.reflectScrolledClipView(clipView)
+            overlay.progress = maxY > 0 ? Double(clampedOffset / maxY) : 0
         }
+    }
+
+    /// 자동 스크롤이 도달할 수 있는 최대 오프셋. 컨트롤러의 정지 판정과 같은 식을 쓴다.
+    var maxScrollOffset: CGFloat {
+        max(0, cachedTotalHeight - bounds.height)
+    }
+
+    /// 한 번에 몇 픽셀 움직일지. 고정 50px 은 48pt 글자에서 한 줄도 못 넘기고
+    /// 16pt 에서는 두 줄이 넘어가 버린다. 글자 크기에 비례시킨다.
+    var lineScrollStep: CGFloat {
+        max(24, fontSize * lineHeight * 2)
     }
 
     /// didSet 이 없으면 값을 복원해도 화면에 반영되지 않는다(설정 저장을 붙이면서 드러난 누락).
@@ -883,6 +1081,12 @@ class PrompterView: NSView {
 
         scrollView.documentView = textView
         addSubview(scrollView)
+
+        // 읽기 보조 레이어는 스크롤뷰의 형제로 위에 얹는다(이벤트는 통과시킨다).
+        overlay.frame = bounds
+        overlay.autoresizingMask = [.width, .height]
+        overlay.accentColor = textColor
+        addSubview(overlay)
     }
 
     // MARK: - Markdown Parser
@@ -1102,13 +1306,14 @@ class PrompterView: NSView {
         }
 
         let clipView = scrollView.contentView
+        let newMax = max(0, cachedTotalHeight - bounds.height)
         if preserveScroll {
-            let newMax = max(0, cachedTotalHeight - bounds.height)
             clipView.setBoundsOrigin(NSPoint(x: 0, y: min(previousRatio * newMax, newMax)))
         } else {
             clipView.setBoundsOrigin(.zero)
         }
         scrollView.reflectScrolledClipView(clipView)
+        overlay.progress = newMax > 0 ? Double(clipView.bounds.origin.y / newMax) : 0
     }
 
     func calculateTotalHeight() -> CGFloat {
@@ -1664,6 +1869,12 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 
         window.minSize = NSSize(width: 240, height: 140)
 
+        // 닫기 버튼을 숨긴다. 이 창은 캡처에 안 보이므로, 실수로 닫으면 사용자는
+        // "앱이 사라졌다"고 느낀다. 숨김(⌃⌥H)으로만 치우게 한다.
+        // (styleMask 의 .closable 을 빼면 타이틀바 레이아웃이 달라져 버튼만 감춘다)
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.isReleasedWhenClosed = false
+
         self.init(window: window)
 
         window.delegate = self   // NSWindowController 가 자동으로 잡아주지 않는다
@@ -1733,6 +1944,18 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         let script = ScriptStore.ensureActiveScript()
         activeScriptID = script.id
         prompterView.setText(script.text, preserveScroll: false)
+
+        // 이어읽기: 텍스트 레이아웃이 끝난 뒤에 적용해야 클램프에 걸리지 않는다.
+        let saved = ScriptStore.scrollOffset(id: script.id)
+        if saved > 1 {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.prompterView.scrollOffset = CGFloat(saved)
+                if self.prompterView.scrollOffset > 1 {
+                    self.prompterView.overlay.showToast("읽던 위치에서 계속")
+                }
+            }
+        }
     }
 
     /// 화면에는 즉시 반영하고, 파일 쓰기만 묶는다.
@@ -1763,6 +1986,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         scriptWriteWorkItem = nil
         let ok = ScriptStore.write(id: id, text: prompterView.text)
         if ok { ScriptStore.touch(id: id) }
+        ScriptStore.saveScrollOffset(id: id, offset: Double(prompterView.scrollOffset))
         return ok
     }
 
@@ -1804,16 +2028,29 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
     /// 예전 코드는 여기에 +100 을 더해 정지 조건이 수학적으로 도달 불가였고,
     /// 그래서 대본 끝에 닿아도 타이머가 멈추지 않았다(되감으면 저절로 다시 흘러내려감).
     private var maxScrollOffset: CGFloat {
-        max(0, prompterView.calculateTotalHeight() - prompterView.bounds.height)
+        prompterView.maxScrollOffset
     }
 
     func togglePlay() {
         isPlaying.toggle()
         if isPlaying {
             startScrolling()
+            prompterView.overlay.showToast("▶︎ 재생")
         } else {
             stopScrolling()
+            prompterView.overlay.remainingSeconds = nil
+            prompterView.overlay.showToast("⏸ 일시정지")
         }
+    }
+
+    /// 남은 분량을 현재 속도로 나눈 값. 자동 스크롤이 균일 속도이므로 정확하다.
+    private func updateRemainingTime() {
+        let remaining = maxScrollOffset - prompterView.scrollOffset
+        guard isPlaying, scrollSpeed > 0, remaining > 0 else {
+            prompterView.overlay.remainingSeconds = nil
+            return
+        }
+        prompterView.overlay.remainingSeconds = Double(remaining / scrollSpeed)
     }
 
     private func startScrolling() {
@@ -1846,16 +2083,28 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
             prompterView.scrollOffset = limit
             stopScrolling()
             isPlaying = false
+            prompterView.overlay.remainingSeconds = nil
+            prompterView.overlay.showToast("대본 끝")
+        } else {
+            updateRemainingTime()
         }
     }
 
     func scrollUp() {
-        prompterView.scrollOffset -= 50
+        prompterView.scrollOffset -= prompterView.lineScrollStep
         prompterView.scrollOffset = max(0, prompterView.scrollOffset)
+        prompterView.showScrollerTemporarily()
     }
 
     func scrollDown() {
-        prompterView.scrollOffset += 50
+        prompterView.scrollOffset += prompterView.lineScrollStep
+        prompterView.showScrollerTemporarily()
+    }
+
+    /// 재촬영할 때 매번 위로 끌어올리는 수고를 없앤다.
+    func scrollToTop() {
+        prompterView.scrollOffset = 0
+        prompterView.overlay.showToast("처음으로")
     }
 
     func toggleVisibility() {
@@ -1871,16 +2120,27 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         isClickThrough.toggle()
         window?.ignoresMouseEvents = isClickThrough
         // 배경 변화는 isClickThrough 의 didSet -> applyWindowChrome() 이 처리한다.
+
+        // 클릭스루가 켜지면 창을 클릭할 수도, 휠로 스크롤할 수도 없다.
+        // 탈출 수단이 단축키 하나뿐이므로 상태를 **상시** 보여 준다.
+        let key = HotkeyManager.shared.hotkeyConfigs[.toggleClickThrough]?.displayString ?? ""
+        prompterView.overlay.badgeText = isClickThrough ? "클릭 통과 중 · \(key) 로 해제" : nil
+        prompterView.overlay.showToast(isClickThrough ? "클릭 통과 ON" : "클릭 통과 OFF")
     }
 
     func speedUp() {
         scrollSpeed = min(200, scrollSpeed + 20)
         settingsController?.updateSpeedDisplay(scrollSpeed)
+        // 설정 창을 닫아 둔 상태에서도 바뀐 걸 알 수 있어야 한다(예전엔 알 방법이 없었다).
+        prompterView.overlay.showToast("속도 \(Int(scrollSpeed))")
+        updateRemainingTime()
     }
 
     func speedDown() {
         scrollSpeed = max(10, scrollSpeed - 20)
         settingsController?.updateSpeedDisplay(scrollSpeed)
+        prompterView.overlay.showToast("속도 \(Int(scrollSpeed))")
+        updateRemainingTime()
     }
 
     /// 배경색·투명도·클릭스루를 한 곳에서 계산한다.
@@ -2011,6 +2271,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.prompterController.speedDown()
         }
 
+        hotkeyManager.onScrollToTop = { [weak self] in
+            self?.prompterController.scrollToTop()
+        }
+
         hotkeyManager.registerHotkeys()
     }
 
@@ -2022,6 +2286,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "프롬프터 보이기/숨기기", action: #selector(togglePrompter), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "재생/일시정지", action: #selector(togglePlay), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "클릭스루 모드", action: #selector(toggleClickThrough), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "처음으로", action: #selector(scrollToTop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "설정...", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "업데이트 확인...", action: #selector(checkForUpdates), keyEquivalent: ""))
@@ -2106,6 +2371,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggleClickThrough() {
         prompterController.toggleClickThrough()
+    }
+
+    @objc func scrollToTop() {
+        prompterController.scrollToTop()
     }
 
     @objc func showSettings() {
