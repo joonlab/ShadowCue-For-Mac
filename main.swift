@@ -55,7 +55,11 @@ enum HotkeyAction: Int, CaseIterable {
 
     var defaultKeyCode: UInt32 {
         switch self {
-        case .togglePlay: return UInt32(kVK_Space)
+        // ⌃⌥Space 를 쓰면 안 된다 — 한국어 로케일 macOS 의 **공장 기본값**이
+        // "입력 메뉴에서 다음 소스 선택"(symbolic hotkey id 61, [32, 49, 786432])으로
+        // 이 조합을 이미 켜 둔 채 출고된다. 그 맥에서는 재생 대신 한/영만 전환된다.
+        // (en 로케일과 재매핑한 맥에서는 재현되지 않아 발견이 늦었다)
+        case .togglePlay: return UInt32(kVK_Return)
         case .scrollUp: return UInt32(kVK_UpArrow)
         case .scrollDown: return UInt32(kVK_DownArrow)
         case .toggleVisibility: return UInt32(kVK_ANSI_H)
@@ -367,12 +371,38 @@ class HotkeyManager {
     var onSpeedUp: (() -> Void)?
     var onSpeedDown: (() -> Void)?
 
+    /// 부팅 시 등록에 실패한 액션(다른 앱이 이미 그 조합을 잡고 있는 경우 등).
+    private(set) var failedActions: Set<HotkeyAction> = []
+
     init() {
         // Set default hotkey configurations
-        let defaultModifiers = UInt32(optionKey | controlKey)
         for action in HotkeyAction.allCases {
-            hotkeyConfigs[action] = HotkeyConfig(keyCode: action.defaultKeyCode, modifiers: defaultModifiers)
+            hotkeyConfigs[action] = HotkeyConfig(keyCode: action.defaultKeyCode,
+                                                 modifiers: HotkeyAction.defaultModifiers)
         }
+        applyStoredHotkeys(SettingsStore.shared.settings.hotkeys)
+    }
+
+    /// 저장된 단축키를 적용한다. 신뢰할 수 없는 입력이므로 정규화한다:
+    /// 모르는 액션 폐기 -> 수정자 없는 것 폐기 -> 중복 폐기 -> 누락은 기본값 유지.
+    func applyStoredHotkeys(_ records: [HotkeyRecord]) {
+        var seen = Set<String>()
+        for record in records {
+            guard let action = HotkeyAction(rawValue: record.action) else { continue }
+            guard record.modifiers != 0 else { continue }
+            let signature = "\(record.keyCode)-\(record.modifiers)"
+            guard !seen.contains(signature) else { continue }
+            seen.insert(signature)
+            hotkeyConfigs[action] = HotkeyConfig(keyCode: record.keyCode, modifiers: record.modifiers)
+        }
+    }
+
+    func persist() {
+        let records = HotkeyAction.allCases.compactMap { action -> HotkeyRecord? in
+            guard let config = hotkeyConfigs[action] else { return nil }
+            return HotkeyRecord(action: action.rawValue, keyCode: config.keyCode, modifiers: config.modifiers)
+        }
+        SettingsStore.shared.update { $0.hotkeys = records }
     }
 
     func registerHotkeys() {
@@ -402,11 +432,13 @@ class HotkeyManager {
             InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, &eventHandler)
         }
 
-        // Register all hotkeys
+        // Register all hotkeys — 실패를 버리지 않고 모아 둔다(사용자에게 알려야 하므로).
+        failedActions.removeAll()
         for action in HotkeyAction.allCases {
-            if let config = hotkeyConfigs[action] {
-                registerHotkey(id: UInt32(action.rawValue), keyCode: config.keyCode, modifiers: config.modifiers)
-            }
+            guard let config = hotkeyConfigs[action] else { continue }
+            let ok = registerHotkey(id: UInt32(action.rawValue),
+                                    keyCode: config.keyCode, modifiers: config.modifiers)
+            if !ok { failedActions.insert(action) }
         }
     }
 
@@ -440,7 +472,11 @@ class HotkeyManager {
         let config = HotkeyConfig(keyCode: keyCode, modifiers: modifiers)
         hotkeyConfigs[action] = config
 
-        return registerHotkey(id: UInt32(action.rawValue), keyCode: keyCode, modifiers: modifiers)
+        let ok = registerHotkey(id: UInt32(action.rawValue), keyCode: keyCode, modifiers: modifiers)
+        if ok { failedActions.remove(action) } else { failedActions.insert(action) }
+        persist()
+        SettingsStore.shared.flushNow()   // 단축키는 바꾸는 즉시 확정한다
+        return ok
     }
 
     // Convert keyCode to readable string
@@ -1450,13 +1486,15 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
             }
         }
 
-        // Try to register the hotkey (will fail if system-wide duplicate)
+        // 주의: RegisterEventHotKey 는 시스템/타앱이 이미 점유한 조합에도 noErr 을 돌려준다
+        // (⌘Space·⌘Tab 등으로 실측). 즉 여기서 false 가 되는 경우는 사실상 앱 내부 중복뿐이며,
+        // 시스템 충돌은 이 반환값으로 알 수 없다.
         let success = HotkeyManager.shared.updateHotkey(action: action, keyCode: keyCode, modifiers: modifiers)
         return success
     }
 
     @objc func resetHotkeys(_ sender: NSButton) {
-        let defaultModifiers = UInt32(optionKey | controlKey)
+        let defaultModifiers = HotkeyAction.defaultModifiers
 
         for action in HotkeyAction.allCases {
             let defaultConfig = HotkeyConfig(keyCode: action.defaultKeyCode, modifiers: defaultModifiers)
@@ -1468,6 +1506,17 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
                 recorder.statusLabel?.stringValue = "✓ 초기화됨"
                 recorder.statusLabel?.textColor = .systemGreen
             }
+        }
+        HotkeyManager.shared.persist()
+        SettingsStore.shared.flushNow()
+        (NSApp.delegate as? AppDelegate)?.refreshHotkeyFailureIndicator()
+    }
+
+    /// 부팅 시 등록에 실패한 단축키를 해당 행에 표시한다(현재는 앱 내부 중복이 주 원인).
+    func showRegistrationFailures() {
+        for action in HotkeyManager.shared.failedActions {
+            hotkeyRecorders[action]?.statusLabel?.stringValue = "✗ 다른 앱이 사용 중"
+            hotkeyRecorders[action]?.statusLabel?.textColor = .systemRed
         }
     }
 
@@ -1855,6 +1904,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         settingsController?.showWindow(nil)
         settingsController?.window?.makeKeyAndOrderFront(nil)
+        settingsController?.showRegistrationFailures()
     }
 }
 
@@ -1864,6 +1914,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     private var stealthObserver: Any?
     private var resignObserver: Any?
+    private var hotkeyFailureMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 스텔스 가드를 창 생성보다 먼저 건다.
@@ -1978,6 +2029,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         statusItem?.menu = menu
+        hotkeyFailureMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        hotkeyFailureMenuItem?.isEnabled = false
+        refreshHotkeyFailureIndicator()
+    }
+
+    /// 단축키가 안 먹는 이유를 사용자가 알 수 있게 한다.
+    /// 예전에는 등록 실패를 그냥 버려서, 아무 반응 없는 앱처럼 보였다.
+    func refreshHotkeyFailureIndicator() {
+        let failures = HotkeyManager.shared.failedActions
+        statusItem?.button?.title = failures.isEmpty ? "☷" : "☷⚠"
+
+        guard let menu = statusItem?.menu, let item = hotkeyFailureMenuItem else { return }
+        let index = menu.index(of: item)
+        if failures.isEmpty {
+            if index >= 0 { menu.removeItem(item) }
+        } else {
+            item.title = "⚠ 단축키 \(failures.count)개 등록 실패 — 설정에서 변경"
+            if index < 0 { menu.insertItem(item, at: 0) }
+        }
     }
 
     private func setupMainMenu() {
@@ -2188,6 +2258,10 @@ func runPersistenceSelfTest() -> Bool {
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     runInlineMarkdownSelfTest()
+    print("")
+    for action in HotkeyAction.allCases {
+        print("HOTKEY \(action.name): \(action.defaultDisplayString)")
+    }
     print("")
     let ok = runPersistenceSelfTest()
     exit(ok ? 0 : 1)
