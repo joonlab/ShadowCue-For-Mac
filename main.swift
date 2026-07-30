@@ -58,6 +58,152 @@ enum HotkeyAction: Int, CaseIterable {
     }
 }
 
+// MARK: - Persistence
+
+/// NSColor 를 저장 가능한 sRGB 성분으로 바꾼다.
+///
+/// `NSColor.redComponent` 를 바로 부르면 안 된다 — 기본값인 `.white`/`.black` 은
+/// `_NSTaggedPointerColor` 라서 성분 접근이 NSException 을 던지고 **프로세스가 즉사**한다.
+/// 반드시 `usingColorSpace(.sRGB)` 를 거친다(패턴 색 등 변환 불가한 색은 nil).
+///
+/// NSKeyedArchiver 를 쓰지 않는 이유: 색 하나에 수 KB 인 데다, `.labelColor` 같은 다이내믹 색이
+/// 다이내믹한 채로 복원돼 **다크모드 전환 시 촬영 중에 글자색이 바뀐다**.
+struct RGBA: Codable, Equatable {
+    var r: Double
+    var g: Double
+    var b: Double
+    var a: Double
+
+    init(r: Double, g: Double, b: Double, a: Double) {
+        self.r = r; self.g = g; self.b = b; self.a = a
+    }
+
+    init?(_ color: NSColor) {
+        guard let converted = color.usingColorSpace(.sRGB) else { return nil }
+        self.init(r: Double(converted.redComponent),
+                  g: Double(converted.greenComponent),
+                  b: Double(converted.blueComponent),
+                  a: Double(converted.alphaComponent))
+    }
+
+    var nsColor: NSColor {
+        NSColor(srgbRed: CGFloat(r), green: CGFloat(g), blue: CGFloat(b), alpha: CGFloat(a))
+    }
+
+    static let white = RGBA(r: 1, g: 1, b: 1, a: 1)
+    static let black = RGBA(r: 0, g: 0, b: 0, a: 1)
+}
+
+/// 단축키는 딕셔너리가 아니라 배열로 저장한다.
+/// `[HotkeyAction: Config]` 를 JSON 으로 넣으면 Int 키가 평면 교대 배열로 인코딩돼 읽기 어렵다.
+struct HotkeyRecord: Codable, Equatable {
+    var action: Int
+    var keyCode: UInt32
+    var modifiers: UInt32
+}
+
+struct Settings: Codable, Equatable {
+    var schema: Int = 1
+    var fontSize: Double = 32
+    var lineHeight: Double = 1.5
+    var textColor: RGBA = .white
+    var backgroundColor: RGBA = .black
+    var backgroundOpacity: Double = 0.7
+    var scrollSpeed: Double = 50
+    var windowFrame: [Double]?
+    var hotkeys: [HotkeyRecord] = []
+    var activeScriptID: String?
+
+    init() {}
+
+    /// **전방호환 디코더 — 자동 합성에 맡기면 안 된다.**
+    /// 합성된 `init(from:)` 은 프로퍼티 기본값을 쓰지 않아서, 다음 버전에서 필드를 하나만 추가해도
+    /// 기존 사용자의 블롭이 `keyNotFound` 로 **통째로** 디코드 실패한다(= 설정 전체 초기화).
+    /// 필드마다 개별 폴백을 두어 모르는/깨진 값만 버린다.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = Settings()
+
+        func value<T: Decodable>(_ key: CodingKeys, _ defaultValue: T) -> T {
+            ((try? container.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? defaultValue
+        }
+
+        schema            = value(.schema, fallback.schema)
+        fontSize          = value(.fontSize, fallback.fontSize)
+        lineHeight        = value(.lineHeight, fallback.lineHeight)
+        textColor         = value(.textColor, fallback.textColor)
+        backgroundColor   = value(.backgroundColor, fallback.backgroundColor)
+        backgroundOpacity = value(.backgroundOpacity, fallback.backgroundOpacity)
+        scrollSpeed       = value(.scrollSpeed, fallback.scrollSpeed)
+        windowFrame       = value(.windowFrame, fallback.windowFrame)
+        hotkeys           = value(.hotkeys, fallback.hotkeys)
+        activeScriptID    = value(.activeScriptID, fallback.activeScriptID)
+    }
+}
+
+final class SettingsStore {
+    static let shared = SettingsStore()
+
+    /// 번들 밖 임시 바이너리(`swiftc -o /tmp/x`)는 bundleIdentifier 가 nil 이라 기본 도메인이
+    /// 엉뚱한 곳이 된다. 도메인을 고정해야 "저장이 안 된다"는 오진을 피한다.
+    /// (SHADOWCUE_DEFAULTS_SUITE 는 셀프테스트가 실제 환경설정을 건드리지 않게 하는 훅)
+    private let defaults: UserDefaults = {
+        let suite = ProcessInfo.processInfo.environment["SHADOWCUE_DEFAULTS_SUITE"] ?? "com.shadowcue.mac"
+        return UserDefaults(suiteName: suite) ?? .standard
+    }()
+    private let storageKey = "settings.v1"
+    private var pendingSave: DispatchWorkItem?
+
+    private(set) var isFirstLaunch = false
+
+    var settings: Settings {
+        didSet {
+            // 이 Equatable 가드 덕분에 복원 시 didSet 이 같은 값을 되써도 재저장이 안 일어난다.
+            guard settings != oldValue else { return }
+            scheduleSave()
+        }
+    }
+
+    private init() {
+        // `register(defaults:)` 는 쓰지 않는다 — 등록한 키가 object(forKey:) 에 잡혀
+        // 최초 실행 판별이 깨진다.
+        if let data = defaults.data(forKey: storageKey),
+           let decoded = try? JSONDecoder().decode(Settings.self, from: data) {
+            settings = decoded
+        } else {
+            settings = Settings()
+            isFirstLaunch = true
+        }
+    }
+
+    func update(_ mutate: (inout Settings) -> Void) {
+        var copy = settings
+        mutate(&copy)
+        settings = copy
+    }
+
+    /// 슬라이더 드래그마다 디스크에 쓰지 않도록 묶는다.
+    /// Timer 가 아니라 DispatchWorkItem 인 이유: 드래그 중에는 런루프가 `.eventTracking` 이라
+    /// 기본 모드 Timer 가 아예 돌지 않는다.
+    private func scheduleSave() {
+        pendingSave?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.writeNow() }
+        pendingSave = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
+    }
+
+    func flushNow() {
+        pendingSave?.cancel()
+        pendingSave = nil
+        writeNow()
+    }
+
+    private func writeNow() {
+        guard let data = try? JSONEncoder().encode(settings) else { return }
+        defaults.set(data, forKey: storageKey)
+    }
+}
+
 // MARK: - Global Hotkey Manager
 class HotkeyManager {
     static let shared = HotkeyManager()
@@ -464,19 +610,27 @@ class PrompterView: NSView {
 
     var text: String = "" {
         didSet {
-            updateTextContent()
+            guard text != oldValue else { return }
+            // 새 대본은 맨 위에서 시작하는 것이 옳다.
+            updateTextContent(preserveScroll: false)
         }
     }
 
     var textColor: NSColor = .white {
         didSet {
+            guard textColor != oldValue else { return }
             updateTextContent()
+            if let rgba = RGBA(textColor) {
+                SettingsStore.shared.update { $0.textColor = rgba }
+            }
         }
     }
 
     var fontSize: CGFloat = 32 {
         didSet {
+            guard fontSize != oldValue else { return }
             updateTextContent()
+            SettingsStore.shared.update { $0.fontSize = Double(fontSize) }
         }
     }
 
@@ -495,7 +649,14 @@ class PrompterView: NSView {
         }
     }
 
-    var lineHeight: CGFloat = 1.5
+    /// didSet 이 없으면 값을 복원해도 화면에 반영되지 않는다(설정 저장을 붙이면서 드러난 누락).
+    var lineHeight: CGFloat = 1.5 {
+        didSet {
+            guard lineHeight != oldValue else { return }
+            updateTextContent()
+            SettingsStore.shared.update { $0.lineHeight = Double(lineHeight) }
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -732,8 +893,16 @@ class PrompterView: NSView {
         (.italic, #"\*(.+?)\*"#),
     ]
 
-    private func updateTextContent() {
+    /// - Parameter preserveScroll: 읽던 위치를 비율로 유지할지. 새 대본을 넣을 때만 false.
+    ///
+    /// 예전에는 무조건 맨 위로 되돌렸는데, 이 메서드는 글자 크기·색·창 크기 변경에서도
+    /// 호출되고 NSSlider 는 기본이 연속(isContinuous) 이라 슬라이더를 한 번 끄는 동안
+    /// 수십 번 리셋됐다. 낭독 중이면 읽던 자리를 통째로 잃는다.
+    private func updateTextContent(preserveScroll: Bool = true) {
         guard let textView = textView, let scrollView = scrollView else { return }
+
+        let previousMax = max(0, cachedTotalHeight - bounds.height)
+        let previousRatio = previousMax > 0 ? scrollOffset / previousMax : 0
 
         let attributedString = parseMarkdown(text)
         textView.textStorage?.setAttributedString(attributedString)
@@ -750,9 +919,13 @@ class PrompterView: NSView {
             textView.frame.size.height = max(cachedTotalHeight, bounds.height)
         }
 
-        // Scroll to top after content update
         let clipView = scrollView.contentView
-        clipView.setBoundsOrigin(NSPoint(x: 0, y: 0))
+        if preserveScroll {
+            let newMax = max(0, cachedTotalHeight - bounds.height)
+            clipView.setBoundsOrigin(NSPoint(x: 0, y: min(previousRatio * newMax, newMax)))
+        } else {
+            clipView.setBoundsOrigin(.zero)
+        }
         scrollView.reflectScrolledClipView(clipView)
     }
 
@@ -789,11 +962,16 @@ class PrompterView: NSView {
     }
 
     override func setFrameSize(_ newSize: NSSize) {
+        // 폭이 안 바뀌면 줄바꿈이 그대로라 재파싱·재레이아웃이 불필요하다.
+        // (실측상 비용의 대부분은 정규식이 아니라 setAttributedString + ensureLayout 이다)
+        let widthChanged = abs(newSize.width - frame.width) > 0.5
         super.setFrameSize(newSize)
-        if let textView = textView {
-            textView.textContainer?.containerSize = NSSize(width: newSize.width - 40, height: CGFloat.greatestFiniteMagnitude)
-            textView.frame.size.width = newSize.width
-            updateTextContent()
+        guard let textView = textView else { return }
+        textView.frame.size.width = newSize.width
+        if widthChanged {
+            textView.textContainer?.containerSize = NSSize(width: newSize.width - 40,
+                                                           height: CGFloat.greatestFiniteMagnitude)
+            updateTextContent(preserveScroll: true)
         }
     }
 }
@@ -836,7 +1014,7 @@ class FineUndoTextView: NSTextView {
 }
 
 // MARK: - Settings Window Controller
-class SettingsWindowController: NSWindowController {
+class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var prompterController: PrompterWindowController?
     var hotkeyRecorders: [HotkeyAction: HotkeyRecorderField] = [:]
     var speedSlider: NSSlider?
@@ -859,8 +1037,14 @@ class SettingsWindowController: NSWindowController {
 
         self.init(window: window)
         self.prompterController = prompterController
+        window.delegate = self
 
         setupUI()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        // 설정을 만지고 창을 닫는 건 작업 확정이다. 디바운스를 기다리지 않고 기록한다.
+        SettingsStore.shared.flushNow()
     }
 
     private func setupUI() {
@@ -1146,8 +1330,8 @@ class SettingsWindowController: NSWindowController {
     }
 
     @objc func opacityChanged(_ sender: NSSlider) {
+        // 화면 반영과 저장은 backgroundOpacity 의 didSet 이 함께 처리한다.
         prompterController?.backgroundOpacity = CGFloat(sender.doubleValue)
-        prompterController?.updateBackgroundColor()
 
         if let label = window?.contentView?.viewWithTag(2) as? NSTextField {
             label.stringValue = "\(Int(sender.doubleValue * 100))%"
@@ -1168,7 +1352,6 @@ class SettingsWindowController: NSWindowController {
 
     @objc func bgColorChanged(_ sender: NSColorWell) {
         prompterController?.backgroundColor = sender.color
-        prompterController?.updateBackgroundColor()
     }
 
     func updateSpeedDisplay(_ speed: CGFloat) {
@@ -1178,15 +1361,42 @@ class SettingsWindowController: NSWindowController {
 }
 
 // MARK: - Prompter Window Controller
-class PrompterWindowController: NSWindowController {
+class PrompterWindowController: NSWindowController, NSWindowDelegate {
     var prompterView: PrompterView!
     var scrollTimer: Timer?
     private var lastTick: CFTimeInterval = 0
     var isPlaying = false
-    var scrollSpeed: CGFloat = 50  // pixels per second
-    var isClickThrough = false
-    var backgroundColor: NSColor = .black
-    var backgroundOpacity: CGFloat = 0.7
+
+    var scrollSpeed: CGFloat = 50 {  // pixels per second
+        didSet {
+            guard scrollSpeed != oldValue else { return }
+            SettingsStore.shared.update { $0.scrollSpeed = Double(scrollSpeed) }
+        }
+    }
+
+    /// 복원하지 않는다 — 상태 뱃지가 없는 상태로 복원하면 "창은 보이는데 클릭이 안 먹는"
+    /// 유령 상태가 되어 사용자가 원인을 찾지 못한다.
+    var isClickThrough = false {
+        didSet { applyWindowChrome() }
+    }
+
+    var backgroundColor: NSColor = .black {
+        didSet {
+            guard backgroundColor != oldValue else { return }
+            applyWindowChrome()
+            if let rgba = RGBA(backgroundColor) {
+                SettingsStore.shared.update { $0.backgroundColor = rgba }
+            }
+        }
+    }
+
+    var backgroundOpacity: CGFloat = 0.7 {
+        didSet {
+            guard backgroundOpacity != oldValue else { return }
+            applyWindowChrome()
+            SettingsStore.shared.update { $0.backgroundOpacity = Double(backgroundOpacity) }
+        }
+    }
 
     var settingsController: SettingsWindowController?
 
@@ -1225,10 +1435,56 @@ class PrompterWindowController: NSWindowController {
         window.isOpaque = false
         window.backgroundColor = NSColor.black.withAlphaComponent(0.7)
 
+        window.minSize = NSSize(width: 240, height: 140)
+
         self.init(window: window)
 
+        window.delegate = self   // NSWindowController 가 자동으로 잡아주지 않는다
         setupPrompterView()
         setupScrollWheel()
+    }
+
+    // MARK: 설정 복원
+
+    /// 저장된 설정을 화면에 적용한다.
+    /// 순서가 중요하다 — 대본 텍스트 대입이 전체 재파싱을 유발하므로 **가장 마지막**이다.
+    func applyLoadedSettings(_ settings: Settings) {
+        if let frame = Self.resolvedWindowFrame(from: settings.windowFrame) {
+            window?.setFrame(frame, display: false)
+        }
+        backgroundColor = settings.backgroundColor.nsColor
+        backgroundOpacity = CGFloat(settings.backgroundOpacity)
+        applyWindowChrome()
+
+        prompterView.fontSize = CGFloat(settings.fontSize)
+        prompterView.lineHeight = CGFloat(settings.lineHeight)
+        prompterView.textColor = settings.textColor.nsColor
+        scrollSpeed = CGFloat(settings.scrollSpeed)
+    }
+
+    /// 저장된 창 위치가 지금도 쓸 수 있는지 검증한다.
+    ///
+    /// 외부 모니터에 창을 두고 케이블을 뽑은 채 재실행하면 화면 밖으로 복원되는데,
+    /// 이 앱은 캡처에 안 보이는 창이라 사용자에게는 "앱이 안 켜졌다"로 보인다.
+    /// **반드시 applicationDidFinishLaunching 이후에 호출할 것** — 그 전에는 NSScreen.screens 가
+    /// 비어 있어 멀쩡한 위치까지 버려진다.
+    static func resolvedWindowFrame(from stored: [Double]?) -> NSRect? {
+        guard let values = stored, values.count == 4, values.allSatisfy({ $0.isFinite }) else { return nil }
+        let rect = NSRect(x: values[0], y: values[1], width: values[2], height: values[3])
+        guard rect.width >= 200, rect.height >= 120 else { return nil }
+        let visibleEnough = NSScreen.screens.contains { screen in
+            let overlap = screen.visibleFrame.intersection(rect)
+            return overlap.width >= 120 && overlap.height >= 60
+        }
+        return visibleEnough ? rect : nil
+    }
+
+    private func saveWindowFrame() {
+        guard let frame = window?.frame else { return }
+        SettingsStore.shared.update {
+            $0.windowFrame = [Double(frame.origin.x), Double(frame.origin.y),
+                              Double(frame.width), Double(frame.height)]
+        }
     }
 
     private func setupPrompterView() {
@@ -1367,13 +1623,7 @@ class PrompterWindowController: NSWindowController {
     func toggleClickThrough() {
         isClickThrough.toggle()
         window?.ignoresMouseEvents = isClickThrough
-
-        // Visual feedback
-        if isClickThrough {
-            window?.backgroundColor = backgroundColor.withAlphaComponent(backgroundOpacity * 0.5)
-        } else {
-            window?.backgroundColor = backgroundColor.withAlphaComponent(backgroundOpacity)
-        }
+        // 배경 변화는 isClickThrough 의 didSet -> applyWindowChrome() 이 처리한다.
     }
 
     func speedUp() {
@@ -1386,9 +1636,18 @@ class PrompterWindowController: NSWindowController {
         settingsController?.updateSpeedDisplay(scrollSpeed)
     }
 
-    func updateBackgroundColor() {
-        window?.backgroundColor = backgroundColor.withAlphaComponent(backgroundOpacity)
+    /// 배경색·투명도·클릭스루를 한 곳에서 계산한다.
+    /// 예전에는 두 경로가 나뉘어 있어, 클릭스루 ON 상태에서 투명도를 만지면
+    /// "입력이 통과 중"이라는 유일한 시각 신호(어두워짐)가 사라졌다.
+    func applyWindowChrome() {
+        let alpha = isClickThrough ? backgroundOpacity * 0.5 : backgroundOpacity
+        window?.backgroundColor = backgroundColor.withAlphaComponent(alpha)
     }
+
+    // MARK: NSWindowDelegate
+
+    func windowDidMove(_ notification: Notification) { saveWindowFrame() }
+    func windowDidResize(_ notification: Notification) { saveWindowFrame() }
 
     func showSettings() {
         if settingsController == nil {
@@ -1406,6 +1665,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var prompterController: PrompterWindowController!
     var statusItem: NSStatusItem?
     private var stealthObserver: Any?
+    private var resignObserver: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 스텔스 가드를 창 생성보다 먼저 건다.
@@ -1413,6 +1673,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create prompter window
         prompterController = PrompterWindowController()
+
+        // 저장된 설정 복원. NSScreen 을 만지므로 반드시 여기(앱 기동 완료 후)에서 한다.
+        prompterController.applyLoadedSettings(SettingsStore.shared.settings)
+
         prompterController.showWindow(nil)
 
         // Setup global hotkeys
@@ -1423,6 +1687,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup main menu
         setupMainMenu()
+
+        installSaveTriggers()
+    }
+
+    /// 디바운스된 저장이 유실되지 않도록 확정 시점마다 즉시 기록한다.
+    /// 특히 `willResignActive` — 촬영 직전 OBS/Zoom 으로 전환하는 순간이 사실상 "작업 확정"이다.
+    private func installSaveTriggers() {
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { _ in
+            SettingsStore.shared.flushNow()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        SettingsStore.shared.flushNow()
     }
 
     /// 이 앱이 만드는 **모든** 창을 화면 캡처에서 제외한다.
@@ -1636,10 +1916,79 @@ func runInlineMarkdownSelfTest() {
     }
 }
 
+/// 영속성의 두 가지 치명적 전제를 검사한다.
+/// 1) 기본 색(.white/.black)에서 성분 접근이 크래시하지 않을 것
+/// 2) 필드가 빠지거나 타입이 깨진 옛 블롭이 **통째로** 실패하지 않을 것
+func runPersistenceSelfTest() -> Bool {
+    var pass = true
+    func check(_ label: String, _ condition: Bool) {
+        print("\(condition ? "PASS" : "FAIL") \(label)")
+        if !condition { pass = false }
+    }
+
+    // (1) 기본 색 — 예전 방식(redComponent 직접 접근)이면 여기서 프로세스가 죽는다.
+    let white = RGBA(NSColor.white)
+    let black = RGBA(NSColor.black)
+    check("RGBA(.white) 변환", white != nil && white!.r == 1 && white!.a == 1)
+    check("RGBA(.black) 변환", black != nil && black!.r == 0)
+    check("RGBA 왕복", RGBA(NSColor.white)?.nsColor.usingColorSpace(.sRGB)?.redComponent == 1)
+
+    // (2) 전방호환 — 필드 2개짜리 구버전 블롭
+    let legacy = #"{"schema":1,"fontSize":48}"#.data(using: .utf8)!
+    if let decoded = try? JSONDecoder().decode(Settings.self, from: legacy) {
+        check("구버전 블롭 디코드 성공", true)
+        check("있는 필드 유지 (fontSize=48)", decoded.fontSize == 48)
+        check("없는 필드 기본값 (scrollSpeed=50)", decoded.scrollSpeed == 50)
+        check("없는 필드 기본값 (textColor=white)", decoded.textColor == .white)
+        check("없는 옵셔널 nil (windowFrame)", decoded.windowFrame == nil)
+    } else {
+        check("구버전 블롭 디코드 성공", false)
+    }
+
+    // (3) 타입이 깨진 값은 그 필드만 버린다
+    let corrupt = #"{"fontSize":"엄청큼","scrollSpeed":120}"#.data(using: .utf8)!
+    if let decoded = try? JSONDecoder().decode(Settings.self, from: corrupt) {
+        check("깨진 필드만 폴백 (fontSize=32)", decoded.fontSize == 32)
+        check("멀쩡한 필드는 유지 (scrollSpeed=120)", decoded.scrollSpeed == 120)
+    } else {
+        check("깨진 블롭에서도 디코드 성공", false)
+    }
+
+    // (4) 전체 왕복
+    var original = Settings()
+    original.fontSize = 44
+    original.windowFrame = [10, 20, 800, 600]
+    original.hotkeys = [HotkeyRecord(action: 1, keyCode: 36, modifiers: 4096)]
+    if let data = try? JSONEncoder().encode(original),
+       let back = try? JSONDecoder().decode(Settings.self, from: data) {
+        check("전체 왕복 동일", back == original)
+    } else {
+        check("전체 왕복 동일", false)
+    }
+
+    // (5) 실제 UserDefaults 왕복 — SHADOWCUE_DEFAULTS_SUITE 가 지정된 경우에만.
+    //     (지정 안 하면 사용자의 실제 환경설정을 건드리게 되므로 건너뛴다)
+    if ProcessInfo.processInfo.environment["SHADOWCUE_DEFAULTS_SUITE"] != nil {
+        let store = SettingsStore.shared
+        check("최초 실행으로 인식", store.isFirstLaunch)
+        store.update { $0.fontSize = 61; $0.scrollSpeed = 137 }
+        store.flushNow()
+        check("디스크 기록됨", UserDefaults(suiteName: ProcessInfo.processInfo.environment["SHADOWCUE_DEFAULTS_SUITE"]!)?
+            .data(forKey: "settings.v1") != nil)
+        // 같은 값 재대입은 재저장을 유발하지 않아야 한다(Equatable 가드)
+        let before = store.settings
+        store.update { $0.fontSize = 61 }
+        check("같은 값 재대입은 무시", store.settings == before)
+    }
+    return pass
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     runInlineMarkdownSelfTest()
-    exit(0)
+    print("")
+    let ok = runPersistenceSelfTest()
+    exit(ok ? 0 : 1)
 }
 
 let app = NSApplication.shared
