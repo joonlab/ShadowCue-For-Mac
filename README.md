@@ -11,8 +11,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-macOS%2012.0+-blue?style=flat-square&logo=apple">
+  <img src="https://img.shields.io/badge/Arch-Universal%20(arm64%20%2B%20x86__64)-lightgrey?style=flat-square">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
-  <img src="https://img.shields.io/badge/Version-1.1-orange?style=flat-square">
+  <img src="https://img.shields.io/badge/Version-1.2-orange?style=flat-square">
 </p>
 
 <p align="center">
@@ -31,12 +32,14 @@
 
 ### Key Features
 
-- **스텔스 모드**: 화면 녹화/공유 시 완전히 투명하게 숨겨짐
+- **스텔스 모드**: 화면 녹화/공유에서 창이 제외됨 (메뉴바에도 앱 이름이 뜨지 않음)
+- **작업 상태 유지**: 대본·색상·글자 크기·속도·창 위치·단축키가 다음 실행에도 그대로 — 촬영 준비를 다시 하지 않아도 됨
+- **대본 자동 저장**: 타이핑하면 바로 반영되고 파일로 보관됨 (Finder·git 으로 열람/백업 가능)
 - **항상 최상위 표시**: 풀스크린 앱 위에서도 항상 보임
 - **마크다운 지원**: 제목, 굵게, 기울임, 목록 등 마크다운 문법 렌더링
 - **자동/수동 스크롤**: 트랙패드, 스크롤바, 단축키로 자유롭게 조작
 - **글로벌 단축키**: 다른 앱에서도 프롬프터 제어 가능 (커스터마이징 가능)
-- **완전 커스터마이징**: 글자 크기, 색상, 배경 투명도, 스크롤 속도
+- **완전 커스터마이징**: 글자 크기, 색상, 배경 투명도, 스크롤 속도, 행간
 - **클릭스루 모드**: 프롬프터 뒤의 콘텐츠 클릭 가능
 - **업데이트 확인**: 메뉴에서 새 버전 확인 가능
 
@@ -47,24 +50,33 @@
 ### 방법 1: Release 다운로드 (권장)
 
 1. [**최신 릴리즈 다운로드**](https://github.com/joonlab/ShadowCue-For-Mac/releases/latest)
-2. `ShadowCue-v1.1.zip` 다운로드
-3. 압축 해제
-4. `ShadowCue.app`을 **Applications** 폴더로 이동
+2. 최신 zip 다운로드 후 압축 해제
+3. `ShadowCue.app`을 **Applications** 폴더로 이동
+4. **격리 속성 제거** — 이 앱은 Apple 공증(notarization)을 받지 않았습니다:
+   ```bash
+   xattr -cr /Applications/ShadowCue.app
+   ```
 5. 실행
 
-### 방법 2: 직접 빌드
+> ⚠️ 4번을 건너뛰면 *"손상되었기 때문에 열 수 없습니다"* 가 나오고 **'그래도 열기' 선택지가 없습니다.**
+> 악성 코드라서가 아니라, 개발자 서명·공증이 없는 앱에 macOS 가 붙이는 격리 표시 때문입니다.
+> 소스가 전부 이 저장소의 `main.swift` 한 파일에 있으니 직접 확인하고 빌드하셔도 됩니다.
+
+### 방법 2: 직접 빌드 (권장 — 격리 문제가 없습니다)
 
 ```bash
-# 저장소 클론
 git clone https://github.com/joonlab/ShadowCue-For-Mac.git
 cd ShadowCue-For-Mac
 
-# 빌드
-swiftc -o ShadowCue.app/Contents/MacOS/ShadowCue main.swift -framework Cocoa -framework Carbon
+./build.sh            # build/ 에 universal 빌드 + 셀프테스트
+./build.sh --install  # ShadowCue.app 번들까지 갱신
 
-# Applications 폴더로 복사
 cp -R ShadowCue.app /Applications/
 ```
+
+`build.sh` 는 아키텍처와 최소 OS 버전을 명시해 빌드합니다. `-target` 없이 `swiftc` 를 직접 쓰면
+**빌드한 맥의 아키텍처·OS 버전이 그대로 박혀서** 다른 맥에서 실행되지 않습니다(v1.1 이 이 문제로
+arm64·macOS 26 전용으로 배포됐습니다).
 
 ---
 
@@ -74,7 +86,7 @@ cp -R ShadowCue.app /Applications/
 
 | 단축키 | 기능 |
 |--------|------|
-| `Ctrl + Option + Space` | 자동 스크롤 재생/일시정지 |
+| `Ctrl + Option + Return` | 자동 스크롤 재생/일시정지 |
 | `Ctrl + Option + ↑` | 위로 스크롤 |
 | `Ctrl + Option + ↓` | 아래로 스크롤 |
 | `Ctrl + Option + H` | 프롬프터 숨기기/보이기 |
@@ -82,7 +94,14 @@ cp -R ShadowCue.app /Applications/
 | `Ctrl + Option + .` | 스크롤 속도 증가 |
 | `Ctrl + Option + ,` | 스크롤 속도 감소 |
 
-> 모든 단축키는 설정에서 커스터마이징 가능합니다.
+> 모든 단축키는 설정에서 커스터마이징 가능하며, 바꾼 값은 다음 실행에도 유지됩니다.
+
+> **v1.2 에서 재생 단축키가 `Ctrl+Option+Space` → `Ctrl+Option+Return` 으로 바뀌었습니다.**
+> 한국어 환경의 macOS 는 "입력 메뉴에서 다음 소스 선택"(한/영 전환)에 `Ctrl+Option+Space` 를
+> **기본으로 켜 둔 채 출고**되어, 재생이 안 되고 입력기만 바뀌는 문제가 있었습니다.
+
+단축키가 안 먹으면 메뉴바 아이콘이 `☷⚠` 로 바뀌고, 설정 창의 해당 항목이 빨갛게 표시됩니다.
+다른 앱이 그 조합을 이미 쓰고 있다는 뜻이니 설정에서 다른 조합으로 바꾸세요.
 
 ### 스크롤 조작
 
@@ -113,17 +132,66 @@ cp -R ShadowCue.app /Applications/
 ## System Requirements
 
 - macOS 12.0 (Monterey) 이상
-- Apple Silicon 또는 Intel Mac
+- Apple Silicon 및 Intel Mac (universal 바이너리)
+
+확인 방법:
+
+```bash
+lipo -archs /Applications/ShadowCue.app/Contents/MacOS/ShadowCue   # x86_64 arm64
+vtool -show-build /Applications/ShadowCue.app/Contents/MacOS/ShadowCue | grep minos
+```
 
 ---
 
 ## How It Works
 
-ShadowCue는 macOS의 `NSWindow.sharingType = .none` 속성을 활용하여 화면 캡처 및 공유에서 윈도우를 제외합니다. 이는 macOS의 네이티브 기능을 사용하므로 추가 드라이버나 해킹 없이 안전하게 동작합니다.
+ShadowCue는 macOS의 `NSWindow.sharingType = .none` 속성으로 화면 캡처·공유에서 창을 제외합니다.
+추가 드라이버나 시스템 개조 없이 OS 기본 기능만 씁니다. 앱은 메뉴바 전용(`LSUIElement`)으로 동작해
+**녹화 화면의 메뉴바에도 앱 이름이 남지 않습니다.**
+
+### ⚠️ 중요한 촬영 전에는 반드시 테스트 녹화로 확인하세요
+
+이 은닉은 Apple 이 "화면 캡처 방지"를 위해 **보증하는 기능이 아닙니다.** Apple 개발자 지원은
+공개적으로 *"there are no public APIs for preventing screen capture"* 라고 밝히고 있고,
+이 동작을 버그로 접수한 사례도 있습니다. 즉 **OS 업데이트로 바뀔 수 있습니다.**
+
+작성 시점(macOS 26.4)에는 `screencapture`·ScreenCaptureKit 기반 녹화 모두에서 은닉이 확인됐지만,
+중요한 촬영 전에는 1분만 투자해 직접 확인하시길 권합니다:
+
+1. 프롬프터를 띄우고 대본을 보이게 한다
+2. `⌘⇧5` 또는 `screencapture -v ~/Desktop/test.mov` 로 10초 녹화
+3. 녹화 파일을 재생해 **프롬프터와 메뉴바에 ShadowCue 가 없는지** 확인
+4. 실제 사용할 도구(Zoom 화면 공유, OBS 등)로도 같은 확인
+
+파일 열기/저장 대화상자는 별도 프로세스가 그리므로 은닉되지 않습니다. 촬영 중에는 열지 마세요.
 
 ---
 
 ## Changelog
+
+### v1.2
+
+**"촬영 준비를 매번 다시 하지 않아도 되게" 만든 판**
+
+- **설정·대본 영속화** — 대본, 글자 크기, 색상, 배경 투명도, 스크롤 속도, 행간, 창 위치,
+  커스텀 단축키가 다음 실행에도 유지됩니다. 이전에는 앱을 끄면 전부 초기화됐습니다.
+- **대본 파일 저장** — `~/Library/Application Support/ShadowCue/scripts/` 에 마크다운으로
+  보관되고 직전 세대 백업(`.bak`)도 남습니다. 타이핑하면 0.3초 뒤 프롬프터에 자동 반영됩니다.
+- **스텔스 강화** — 메뉴바에 앱 이름이 노출되던 문제를 해결했습니다(`.accessory` 전환).
+  컬러 패널·알림창 등 보조 창도 캡처에서 제외되고, 창 제목도 남기지 않습니다.
+- **기본 재생 단축키 변경** (`⌃⌥Space` → `⌃⌥Return`) — 한국어 macOS 기본 단축키(한/영 전환)와
+  충돌해 재생이 안 되던 문제.
+- **자동 스크롤 수정** — 대본 끝에 도달하면 이제 실제로 멈춥니다(이전에는 정지 조건이
+  수학적으로 도달 불가여서 되감으면 저절로 다시 흘러내려갔습니다). 창·슬라이더를 드래그하는
+  동안에도 스크롤이 끊기지 않고, 프레임 누락도 보정합니다.
+- **읽던 위치 유지** — 글자 크기를 바꾸거나 창 크기를 조절해도 맨 위로 튀지 않습니다.
+- **마크다운 수정** — 한 줄에 여러 강조가 섞이면 앞쪽 강조가 사라지던 문제
+  (`*기울임* 그리고 **굵게**`, 백틱 안의 별표 등).
+- **단축키 실패 표시** — 다른 앱이 조합을 점유하면 메뉴바 `☷⚠` 와 설정 창 빨간 표시로 알립니다.
+- **universal 바이너리 + 유효한 서명** — v1.1 은 arm64·macOS 26 전용으로 빌드되어 README 의
+  "macOS 12 이상, Intel 지원" 표기와 달랐고, 서명 검증이 실패해 *"손상되었기 때문에 열 수 없습니다"* 가
+  떴습니다. 이제 arm64+x86_64 / macOS 12+ 로 빌드되고 `codesign -v` 를 통과합니다.
+- 클릭스루 상태에서 투명도를 조절해도 "입력 통과 중" 표시가 유지됩니다.
 
 ### v1.1
 - 마크다운 렌더링 지원 (제목, 굵게, 기울임, 목록, 인용, 코드 등)
