@@ -45,6 +45,8 @@ enum HotkeyAction: Int, CaseIterable {
     case pasteClipboard = 11
     case cheatSheet = 12
     case showLibrary = 13
+    case nextInBoard = 14
+    case previousInBoard = 15
 
     var name: String {
         switch self {
@@ -61,6 +63,8 @@ enum HotkeyAction: Int, CaseIterable {
         case .pasteClipboard: return "클립보드를 대본으로"
         case .cheatSheet: return "단축키 보기"
         case .showLibrary: return "대본 라이브러리"
+        case .nextInBoard: return "보드 다음 대본"
+        case .previousInBoard: return "보드 이전 대본"
         }
     }
 
@@ -93,6 +97,11 @@ enum HotkeyAction: Int, CaseIterable {
         // L = Library. 남아 있는 글자 중 니모닉이 가장 분명하고, 한국어 macOS 의
         // 공장 기본 단축키와도 겹치지 않는다.
         case .showLibrary: return UInt32(kVK_ANSI_L)
+        // 축을 갈랐다: **위아래는 지금 대본 안에서의 스크롤, 좌우는 대본 사이의 이동.**
+        // 손이 화살표 위에 있으면 둘 다 눈을 안 보고 누를 수 있다.
+        // (`[`/`]` 는 한 대본 안 섹션 점프라 이미 임자가 있다)
+        case .nextInBoard: return UInt32(kVK_RightArrow)
+        case .previousInBoard: return UInt32(kVK_LeftArrow)
         }
     }
 }
@@ -174,6 +183,11 @@ struct Settings: Codable, Equatable {
     /// 라이브러리에서 대본을 골라 보는 것과 그 대본을 프롬프터에 올리는 것은 다른 행동이다.
     var libraryLastSelectedID: String?
 
+    /// 지금 촬영 중인 보드. `⌃⌥←`/`⌃⌥→` 가 이 보드 안에서 대본을 넘긴다.
+    /// **`activeScriptID` 와 별개로 유지된다** — 폴더 트리에서 잠깐 다른 대본을 올려 봐도
+    /// 촬영 묶음은 그대로 남아 있어야 한다.
+    var activeBoardID: String?
+
     init() {}
 
     /// **전방호환 디코더 — 자동 합성에 맡기면 안 된다.**
@@ -210,6 +224,7 @@ struct Settings: Codable, Equatable {
         librarySidebarWidth      = value(.librarySidebarWidth, fallback.librarySidebarWidth)
         libraryExpandedFolderIDs = value(.libraryExpandedFolderIDs, fallback.libraryExpandedFolderIDs)
         libraryLastSelectedID    = value(.libraryLastSelectedID, fallback.libraryLastSelectedID)
+        activeBoardID            = value(.activeBoardID, fallback.activeBoardID)
     }
 }
 
@@ -1365,6 +1380,8 @@ class HotkeyManager {
     var onPasteClipboard: (() -> Void)?
     var onCheatSheet: (() -> Void)?
     var onShowLibrary: (() -> Void)?
+    var onNextInBoard: (() -> Void)?
+    var onPreviousInBoard: (() -> Void)?
 
     /// 부팅 시 등록에 실패한 액션(다른 앱이 이미 그 조합을 잡고 있는 경우 등).
     private(set) var failedActions: Set<HotkeyAction> = []
@@ -1390,6 +1407,8 @@ class HotkeyManager {
         case .pasteClipboard: return onPasteClipboard
         case .cheatSheet: return onCheatSheet
         case .showLibrary: return onShowLibrary
+        case .nextInBoard: return onNextInBoard
+        case .previousInBoard: return onPreviousInBoard
         }
     }
 
@@ -3691,7 +3710,7 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
             : SettingsStore.shared.settings.libraryExpandedFolderIDs
         let selected = selectedNodeIDs()
 
-        roots = LibraryTree.build(from: ScriptStore.loadLibrary())
+        roots = LibraryTree.buildSections(from: ScriptStore.loadLibrary())
         outlineView.reloadData()
 
         var byID: [String: LibraryNode] = [:]
@@ -3700,6 +3719,11 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         }
         index(roots)
 
+        // 머리 행은 **항상 펼친다.** 저장된 펼침 목록에서 읽지 않는 이유가 있다 —
+        // v1.3 이 남긴 목록에는 머리 행 id 가 있을 수 없으므로, 그걸 근거로 삼으면
+        // 업그레이드 첫 실행에 사이드바가 통째로 접혀 **빈 창**으로 보인다.
+        // (접기 자체를 `shouldCollapseItem` 에서 막으므로 상태를 저장할 필요도 없다)
+        for node in roots where node.isSection { outlineView.expandItem(node) }
         for id in expanded {
             if let node = byID[id] { outlineView.expandItem(node) }
         }
@@ -3710,14 +3734,17 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         updateWarningBar()
     }
 
-    /// **화면에 지금 펼쳐져 있는** 폴더. 아웃라인이 비어 있으면 빈 배열이다(설정값이 아니다) —
+    /// **화면에 지금 펼쳐져 있는** 폴더·보드. 아웃라인이 비어 있으면 빈 배열이다(설정값이 아니다) —
     /// 호출부가 그 차이를 알고 써야 한다.
+    ///
+    /// 머리 행은 담지 않는다(항상 펼쳐져 있고 접을 수도 없다). 설정 키 이름이 `...FolderIDs`
+    /// 인 채로 보드까지 담는 건, 키를 바꾸면 v1.3 사용자의 펼침 상태가 통째로 버려지기 때문이다.
     private func expandedFolderIDs() -> [String] {
         guard outlineView != nil else { return [] }
         var result: [String] = []
         for row in 0..<outlineView.numberOfRows {
             if let node = outlineView.item(atRow: row) as? LibraryNode,
-               node.isFolder, outlineView.isItemExpanded(node) {
+               node.isExpandable, !node.isSection, outlineView.isItemExpanded(node) {
                 result.append(node.id)
             }
         }
@@ -3754,33 +3781,76 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
     }
 
     func outlineView(_ ov: NSOutlineView, isItemExpandable item: Any) -> Bool {
-        (item as? LibraryNode)?.isFolder ?? false
+        (item as? LibraryNode)?.isExpandable ?? false
     }
 
     // MARK: NSOutlineViewDelegate
 
+    /// 머리 행(`보드`/`대본`)은 목록이 아니라 **구분선**이다. 고를 수 없어야 선택 로직이
+    /// "고른 게 대본이 아니다" 를 매번 걸러내지 않는다.
+    func outlineView(_ ov: NSOutlineView, isGroupItem item: Any) -> Bool {
+        (item as? LibraryNode)?.isSection ?? false
+    }
+
+    func outlineView(_ ov: NSOutlineView, shouldSelectItem item: Any) -> Bool {
+        !((item as? LibraryNode)?.isSection ?? false)
+    }
+
+    /// 머리 행은 접을 수 없다. 접히면 사이드바가 통째로 빈 창이 되는데, 그 상태에서
+    /// 다시 펼칠 표면이 얇은 머리 행 하나뿐이라 복구가 어렵다.
+    func outlineView(_ ov: NSOutlineView, shouldCollapseItem item: Any) -> Bool {
+        !((item as? LibraryNode)?.isSection ?? false)
+    }
+
     func outlineView(_ ov: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let node = item as? LibraryNode else { return nil }
+
+        // 머리 행 — 아이콘도 이름 변경도 없다.
+        if node.isSection {
+            let cell = NSTableCellView()
+            let label = NSTextField(labelWithString: node.title)
+            label.frame = NSRect(x: 2, y: 1, width: 400, height: 18)
+            label.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            label.textColor = .secondaryLabelColor
+            label.autoresizingMask = [.width]
+            cell.addSubview(label)
+            cell.textField = label
+            return cell
+        }
 
         let cell = NSTableCellView()
         let image = NSImageView(frame: NSRect(x: 2, y: 2, width: 16, height: 16))
         image.imageScaling = .scaleProportionallyDown
-        let symbol = node.isFolder ? "folder" : "doc.plaintext"
+        let symbol: String
+        switch node.kind {
+        case .folder:     symbol = "folder"
+        case .board:      symbol = "film.stack"       // 촬영 묶음 — 폴더와 눈으로 갈려야 한다
+        case .boardEntry: symbol = "doc.plaintext"
+        default:          symbol = "doc.plaintext"
+        }
         image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        image.contentTintColor = node.isFolder ? .secondaryLabelColor : .tertiaryLabelColor
+            // film.stack 은 macOS 13+ 다. 12 에서는 nil 이 오므로 폴백을 둔다.
+            ?? NSImage(systemSymbolName: node.isBoard ? "rectangle.stack" : "doc.plaintext",
+                       accessibilityDescription: nil)
+        image.contentTintColor = node.isExpandable ? .secondaryLabelColor : .tertiaryLabelColor
         cell.addSubview(image)
         cell.imageView = image
 
-        let isActive = !node.isFolder && node.id == prompterController?.activeScriptID
-        let label = NSTextField(labelWithString: (isActive ? "● " : "") + node.title)
+        // ⚠️ **`scriptID` 로 비교한다.** 보드 자리의 `id` 는 "<boardID>/<scriptID>" 라
+        // `node.id` 로 비교하면 보드 안에서는 활성 표시가 영영 안 붙는다.
+        let isActive = node.scriptID != nil && node.scriptID == prompterController?.activeScriptID
+        // 보드 자리는 촬영 순서가 곧 정보다. 몇 번째인지 숫자로 보여 준다.
+        let ordinal = node.isBoardEntry ? "\(ov.childIndex(forItem: node) + 1). " : ""
+        let label = NSTextField(labelWithString: (isActive ? "● " : "") + ordinal + node.title)
         label.frame = NSRect(x: 22, y: 1, width: 400, height: 18)
         label.lineBreakMode = .byTruncatingTail
         label.autoresizingMask = [.width]
         // 지금 카메라에 나가는 대본을 구분하는 유일한 신호다.
         label.font = isActive ? NSFont.boldSystemFont(ofSize: 13) : NSFont.systemFont(ofSize: 13)
         // 이름 변경이 어떤 항목인지 알아야 하는데, 편집이 끝나는 시점엔 클릭한 행이 이미 없을 수 있다.
-        // 그래서 뷰 자체에 id 를 실어 둔다.
-        label.identifier = NSUserInterfaceItemIdentifier(node.id)
+        // 그래서 뷰 자체에 id 를 실어 둔다. **행 id 가 아니라 고칠 대상의 id** 다
+        // (보드 자리의 행 id 는 합성 문자열이라 어떤 목록에서도 못 찾는다).
+        label.identifier = NSUserInterfaceItemIdentifier(node.scriptID ?? node.id)
         label.delegate = self
         label.isEditable = false          // 이름 변경 명령을 받았을 때만 켠다
         cell.addSubview(label)
@@ -3796,11 +3866,14 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         let selected = outlineView.selectedRowIndexes.compactMap {
             outlineView.item(atRow: $0) as? LibraryNode
         }
-        guard selected.count == 1, let node = selected.first, !node.isFolder else {
+        // 보드 자리를 골라도 편집기에는 그 대본이 뜬다 — 같은 문서이므로.
+        guard selected.count == 1, let node = selected.first, let scriptID = node.scriptID else {
             showEditor(for: nil)
             return
         }
-        showEditor(for: node.id)
+        showEditor(for: scriptID)
+        // 복원용 선택은 **행 id** 로 저장한다. 보드 자리에서 고른 걸 다음에 열었을 때
+        // 폴더 트리 쪽 행이 대신 잡히면 사용자가 보던 자리가 아니다.
         SettingsStore.shared.update { $0.libraryLastSelectedID = node.id }
     }
 
@@ -3889,10 +3962,107 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
     static let nodePasteboardType = NSPasteboard.PasteboardType("com.shadowcue.library-node")
 
     func outlineView(_ ov: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
-        guard let node = item as? LibraryNode, !ScriptStore.isWriteBlocked else { return nil }
+        guard let node = item as? LibraryNode, !node.isSection,
+              !ScriptStore.isWriteBlocked else { return nil }
         let entry = NSPasteboardItem()
         entry.setString(node.id, forType: Self.nodePasteboardType)
         return entry
+    }
+
+    /// 끌고 있는 것이 무엇이냐에 따라 **놓을 수 있는 곳이 완전히 다르다.**
+    /// 종류가 섞이면 판정할 수 없으므로 한 번에 한 종류만 받는다.
+    private enum DragKind: Hashable {
+        case folderOrScript
+        case boardEntry(boardID: String)
+        case board
+    }
+
+    private func dragKind(_ node: LibraryNode) -> DragKind? {
+        if node.isSection { return nil }
+        if node.isBoard { return .board }
+        if case .boardEntry(let boardID, _) = node.kind { return .boardEntry(boardID: boardID) }
+        return .folderOrScript
+    }
+
+    /// 드롭이 실제로 할 일. **validate 와 accept 가 같은 함수를 본다** —
+    /// 그래야 "드롭 표시는 떴는데 놓으면 아무 일도 없다" 가 구조적으로 안 생긴다.
+    private enum DropPlan {
+        case scriptTree(parent: String?, index: Int)       // 폴더 트리 안 이동(기존 동작)
+        case addToBoard(boardID: String, index: Int?)      // 대본 → 보드
+        case reorderInBoard(boardID: String, index: Int?)  // 보드 안 순서
+        case reorderBoards(index: Int?)                    // 보드끼리 순서
+        case reject
+    }
+
+    private func sectionNode(_ section: LibraryNode.Section) -> LibraryNode? {
+        roots.first {
+            if case .section(let s) = $0.kind { return s == section }
+            return false
+        }
+    }
+
+    /// 드롭 좌표를 "컨테이너 + 그 안 인덱스" 로 정규화한다.
+    ///
+    /// 자식을 가질 수 없는 항목 위에 놓은 경우 **그 항목의 컨테이너로 재조준**한다.
+    /// 거부하는 것보다 낫다 — 대본 위에 떨어뜨린 사용자의 의도는 대개 그 대본이 있는 폴더다
+    /// (v1.3 부터의 규칙이고, 보드 자리에도 같은 이유로 그대로 적용한다).
+    private func retargetedDrop(dragged: [LibraryNode], item: Any?, childIndex: Int)
+        -> (destination: LibraryNode?, index: Int) {
+        let onItem = childIndex == NSOutlineViewDropOnItemIndex
+        guard let target = item as? LibraryNode else {
+            // 최상위(두 머리 행 사이)에는 아무것도 놓을 수 없다. 끌고 있는 것에 맞는 머리로 보낸다.
+            let kind = dragged.compactMap { dragKind($0) }.first
+            let section: LibraryNode.Section = (kind == .board) ? .boards : .scripts
+            return (sectionNode(section), childIndex)
+        }
+        if onItem, !target.isExpandable {
+            return (target.parent, NSOutlineViewDropOnItemIndex)
+        }
+        // 보드를 보드 위에 놓는 것도 의미가 없다(보드는 보드를 담지 않는다).
+        if onItem, target.isBoard, dragged.contains(where: { dragKind($0) == .board }) {
+            return (target.parent, NSOutlineViewDropOnItemIndex)
+        }
+        return (target, childIndex)
+    }
+
+    private func dropPlan(dragged: [LibraryNode], destination: LibraryNode?, index: Int) -> DropPlan {
+        guard !dragged.isEmpty, !ScriptStore.isWriteBlocked else { return .reject }
+        let kinds = dragged.map { dragKind($0) }
+        guard !kinds.contains(where: { $0 == nil }),
+              Set(kinds.compactMap { $0 }).count == 1,
+              let kind = kinds.first ?? nil else { return .reject }
+
+        let onItem = index == NSOutlineViewDropOnItemIndex
+        let slot: Int? = onItem ? nil : index
+
+        switch kind {
+        case .board:
+            // 보드는 보드 머리 아래 한 줄에서만 움직인다.
+            guard let destination, case .section(.boards) = destination.kind else { return .reject }
+            return .reorderBoards(index: slot)
+
+        case .boardEntry(let boardID):
+            // ★ **다른 보드로도, 폴더 트리로도 옮기지 않는다.** 보드 자리는 참조라
+            //   "옮길" 대상이 아니다 — 다른 보드에 넣고 싶으면 그 보드에 추가하면 된다.
+            guard let destination, destination.boardID == boardID else { return .reject }
+            return .reorderInBoard(boardID: boardID, index: slot)
+
+        case .folderOrScript:
+            // 보드/보드 머리 위 → 보드에 담기(대본만).
+            if let destination, let boardID = destination.boardID {
+                guard dragged.allSatisfy({ !$0.isFolder }) else { return .reject }   // 폴더는 못 담는다
+                return .addToBoard(boardID: boardID, index: slot)
+            }
+            if let destination, case .section(.boards) = destination.kind { return .reject }
+
+            // 폴더 트리 — 자기 자신이나 자손 안으로 넣으면 트리가 끊겨
+            // **대본이 통째로 사라진 것처럼 보인다.**
+            for node in dragged where node.isFolder {
+                if isDescendant(destination, of: node) { return .reject }
+            }
+            let parent = (destination?.isSection ?? true) ? nil : destination?.id
+            return .scriptTree(parent: parent, index: index)
+        }
     }
 
     private func draggedNodes(from info: NSDraggingInfo) -> [LibraryNode] {
@@ -3920,19 +4090,13 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         let dragged = draggedNodes(from: info)
         guard !dragged.isEmpty else { return [] }
 
-        // 대본 "위에" 떨어뜨리는 건 의미가 없다(대본은 자식을 가질 수 없다).
-        // 거부하는 대신 그 대본이 있는 폴더로 재조준한다 — 사용자 의도는 대개 그쪽이다.
-        if let target = item as? LibraryNode, !target.isFolder, index == NSOutlineViewDropOnItemIndex {
-            ov.setDropItem(target.parent, dropChildIndex: NSOutlineViewDropOnItemIndex)
-            return .move
+        let (destination, slot) = retargetedDrop(dragged: dragged, item: item, childIndex: index)
+        if case .reject = dropPlan(dragged: dragged, destination: destination, index: slot) {
+            return []
         }
-
-        // 폴더를 자기 자신이나 자손 안으로 넣으면 트리가 끊겨 **대본이 통째로 사라진 것처럼 보인다.**
-        // 저장 계층의 moveFolder 도 거부하지만, 여기서 막아야 드롭 표시가 안 뜬다.
-        if let target = item as? LibraryNode {
-            for node in dragged where node.isFolder {
-                if isDescendant(target, of: node) { return [] }
-            }
+        // 재조준한 좌표를 AppKit 에 돌려줘야 acceptDrop 이 **같은 좌표**를 받는다.
+        if destination !== (item as? LibraryNode) || slot != index {
+            ov.setDropItem(destination, dropChildIndex: slot)
         }
         return .move
     }
@@ -3941,30 +4105,73 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
                      item: Any?, childIndex index: Int) -> Bool {
         let dragged = draggedNodes(from: info)
         guard !dragged.isEmpty else { return false }
-        let destination = (item as? LibraryNode)?.id      // nil = 최상위
+        // validateDrop 이 이미 재조준했으므로 여기서는 받은 좌표를 그대로 믿는다.
+        let plan = dropPlan(dragged: dragged, destination: item as? LibraryNode, index: index)
 
         flushPendingEdits()
-        // 여러 개를 끌었으면 **화면에 보이던 순서대로** 처리해야 최종 배치가 눈과 일치한다.
-        var cursor = index
         var moved = false
-        for node in dragged {
-            let ok = node.isFolder
-                ? ScriptStore.moveFolder(id: node.id, toParent: destination,
-                                         at: index == NSOutlineViewDropOnItemIndex ? nil : cursor)
-                : ScriptStore.moveScript(id: node.id, toFolder: destination,
-                                         at: index == NSOutlineViewDropOnItemIndex ? nil : cursor)
-            if ok {
-                moved = true
-                if index != NSOutlineViewDropOnItemIndex { cursor += 1 }
+
+        switch plan {
+        case .reject:
+            return false
+
+        case .scriptTree(let parent, let index):
+            // 여러 개를 끌었으면 **화면에 보이던 순서대로** 처리해야 최종 배치가 눈과 일치한다.
+            var cursor = index
+            for node in dragged {
+                let ok = node.isFolder
+                    ? ScriptStore.moveFolder(id: node.id, toParent: parent,
+                                             at: index == NSOutlineViewDropOnItemIndex ? nil : cursor)
+                    : ScriptStore.moveScript(id: node.id, toFolder: parent,
+                                             at: index == NSOutlineViewDropOnItemIndex ? nil : cursor)
+                if ok {
+                    moved = true
+                    if index != NSOutlineViewDropOnItemIndex { cursor += 1 }
+                }
+            }
+
+        case .addToBoard(let boardID, let index):
+            var cursor = index
+            for node in dragged {
+                guard let scriptID = node.scriptID else { continue }
+                // 이미 그 보드에 있으면 조용히 건너뛴다(중복 금지 — addScript 가 false 를 돌려준다).
+                if ScriptStore.addScript(scriptID, toBoard: boardID, at: cursor) {
+                    moved = true
+                    if cursor != nil { cursor! += 1 }
+                }
+            }
+
+        case .reorderInBoard(let boardID, let index):
+            var cursor = index
+            for node in dragged {
+                guard let scriptID = node.scriptID else { continue }
+                if ScriptStore.moveScriptInBoard(scriptID, boardID: boardID, at: cursor) {
+                    moved = true
+                    if cursor != nil { cursor! += 1 }
+                }
+            }
+
+        case .reorderBoards(let index):
+            var cursor = index
+            for node in dragged {
+                if ScriptStore.moveBoard(id: node.id, at: cursor) {
+                    moved = true
+                    if cursor != nil { cursor! += 1 }
+                }
             }
         }
+
         guard moved else { return false }
         refreshTree()
         // 옮긴 항목을 다시 고른다 — 안 그러면 사용자가 방금 옮긴 게 어디 갔는지 눈으로 찾아야 한다.
-        let ids = Set(dragged.map(\.id))
+        // 대본을 보드에 담은 경우엔 **보드 쪽 새 자리**를 고른다(방금 한 일의 결과가 거기 있다).
+        var wanted = Set(dragged.map(\.id))
+        if case .addToBoard(let boardID, _) = plan {
+            wanted = Set(dragged.compactMap { $0.scriptID }.map { "\(boardID)/\($0)" })
+        }
         var rows: [Int] = []
         for row in 0..<outlineView.numberOfRows {
-            if let node = outlineView.item(atRow: row) as? LibraryNode, ids.contains(node.id) {
+            if let node = outlineView.item(atRow: row) as? LibraryNode, wanted.contains(node.id) {
                 rows.append(row)
             }
         }
@@ -3989,8 +4196,14 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         }
         let target = currentTargetNode()
 
-        // 새로 만들 위치: 폴더를 눌렀으면 그 안, 대본을 눌렀으면 그 대본이 있는 폴더, 빈 곳이면 최상위.
-        let destination: String? = target.flatMap { $0.isFolder ? $0.id : $0.parent?.id }
+        // 새로 만들 위치: 폴더를 눌렀으면 그 안, 대본을 눌렀으면 그 대본이 있는 폴더,
+        // 그 밖(빈 곳·머리 행·보드 쪽 어디든)이면 대본 트리 최상위.
+        let destination: String? = {
+            guard let target else { return nil }
+            if target.isFolder { return target.id }
+            guard case .script = target.kind else { return nil }   // 보드 자리는 폴더 소속이 아니다
+            return target.parent?.isFolder == true ? target.parent?.id : nil
+        }()
 
         func add(_ title: String, _ selector: Selector, enabled: Bool = true) {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
@@ -4004,6 +4217,7 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         newItemDestination = destination
         add("새 대본", #selector(createScriptHere), enabled: writable)
         add("새 폴더", #selector(createFolderHere), enabled: writable)
+        add("새 보드", #selector(createBoardHere), enabled: writable)
 
         // ⌘Z 는 편집기의 텍스트 되돌리기가 가져가므로, 삭제 되돌리기는 메뉴에만 둔다.
         // (같은 키에 두 의미를 얹으면 어느 쪽이 동작할지 사용자가 예측할 수 없다)
@@ -4011,12 +4225,48 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
             add("삭제 취소", #selector(undoLastDelete), enabled: writable)
         }
 
-        guard let target else { return }
+        guard let target, !target.isSection else { return }
         menu.addItem(.separator())
+
+        // ── 보드 ──
+        if target.isBoard {
+            add("이름 변경", #selector(renameSelected), enabled: writable)
+            add("보드 시작", #selector(loadSelectedIntoPrompter))
+            menu.addItem(.separator())
+            add("위로", #selector(moveSelectedUp), enabled: writable)
+            add("아래로", #selector(moveSelectedDown), enabled: writable)
+            menu.addItem(.separator())
+            // 대본을 지우지 않는다는 걸 항목 이름에서부터 분명히 한다.
+            add("보드 삭제 (대본은 남습니다)", #selector(deleteSelected), enabled: writable)
+            return
+        }
+
+        // ── 보드 안의 한 자리 ──
+        if target.isBoardEntry {
+            add("프롬프터에 올리기", #selector(loadSelectedIntoPrompter))
+            menu.addItem(.separator())
+            add("위로", #selector(moveSelectedUp), enabled: writable)
+            add("아래로", #selector(moveSelectedDown), enabled: writable)
+            menu.addItem(.separator())
+            // ★ '삭제' 가 아니다. 보드에서 참조만 뺀다 — 대본은 그대로 남는다.
+            //   이 두 개를 한 항목으로 합치면 언젠가 반드시 대본이 지워진다.
+            add("보드에서 빼기", #selector(removeSelectedFromBoard), enabled: writable)
+            menu.addItem(.separator())
+            add("대본에서 보기", #selector(revealSelectedInScriptTree))
+            return
+        }
+
+        // ── 폴더·대본 (v1.3 그대로) ──
         add("이름 변경", #selector(renameSelected), enabled: writable)
         if !target.isFolder {
             add("복제", #selector(duplicateSelected), enabled: writable)
             add("프롬프터에 올리기", #selector(loadSelectedIntoPrompter))
+
+            // 보드에 추가 ▸ — '이동 ▸' 과 같은 이유다(드래그를 못 쓰는 긴 트리·트랙패드).
+            let boardItem = NSMenuItem(title: "보드에 추가", action: nil, keyEquivalent: "")
+            boardItem.submenu = buildAddToBoardMenu(for: target)
+            boardItem.isEnabled = writable
+            menu.addItem(boardItem)
         }
 
         // 이동 ▸ — 드래그를 못 쓰는 상황(긴 트리, 트랙패드)을 위한 정식 경로.
@@ -4029,6 +4279,31 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         add("Finder 에서 보기", #selector(revealSelectedInFinder), enabled: !target.isFolder)
         menu.addItem(.separator())
         add("삭제", #selector(deleteSelected), enabled: writable)
+    }
+
+    /// 대본을 담을 보드 목록. 이미 들어 있는 보드는 비활성으로 남긴다 —
+    /// 목록에서 아예 빼면 "왜 이 보드는 안 보이지" 가 되고, 그냥 두면 눌러도 아무 일이 없다.
+    private func buildAddToBoardMenu(for node: LibraryNode) -> NSMenu {
+        let menu = NSMenu()
+        let library = ScriptStore.loadLibrary()
+        let boards = library.boards.sorted { $0.sortIndex < $1.sortIndex }
+        guard !boards.isEmpty else {
+            let empty = NSMenuItem(title: "(보드 없음)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            return menu
+        }
+        for board in boards {
+            let item = NSMenuItem(title: board.name, action: #selector(addSelectedToBoard(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = board.id
+            let already = node.scriptID.map { board.scriptIDs.contains($0) } ?? true
+            item.isEnabled = !already
+            item.state = already ? .on : .off
+            menu.addItem(item)
+        }
+        return menu
     }
 
     private func buildMoveMenu(for node: LibraryNode) -> NSMenu {
@@ -4089,21 +4364,31 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         selectAndBeginRename(folder.id)
     }
 
+    @objc func createBoardHere() {
+        guard let board = ScriptStore.createBoard(name: "새 보드") else {
+            reportWriteFailure(); return
+        }
+        refreshTree()
+        selectAndBeginRename(board.id)
+    }
+
     @objc func duplicateSelected() {
-        guard let node = currentTargetNode(), !node.isFolder else { return }
+        guard let node = currentTargetNode(), let scriptID = node.scriptID else { return }
         flushPendingEdits()
-        guard let copy = ScriptStore.duplicateScript(id: node.id) else { reportWriteFailure(); return }
+        guard let copy = ScriptStore.duplicateScript(id: scriptID) else { reportWriteFailure(); return }
         refreshTree()
         selectAndBeginRename(copy)
     }
 
+    /// 보드 자리는 인라인 이름 변경을 하지 않는다 — 행에 순번(`1. `)이 붙어 있어
+    /// 그 표시가 이름으로 저장될 위험이 있고, 고칠 대상은 어차피 `대본` 트리에 있는 같은 문서다.
     @objc func renameSelected() {
-        guard let node = currentTargetNode() else { return }
+        guard let node = currentTargetNode(), !node.isBoardEntry, !node.isSection else { return }
         selectAndBeginRename(node.id)
     }
 
     @objc func moveSelected(_ sender: NSMenuItem) {
-        guard let node = currentTargetNode() else { return }
+        guard let node = currentTargetNode(), !node.isBoard, !node.isBoardEntry else { return }
         let destination = sender.representedObject as? String
         let ok = node.isFolder
             ? ScriptStore.moveFolder(id: node.id, toParent: destination)
@@ -4112,20 +4397,109 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         refreshTree()
     }
 
+    @objc func addSelectedToBoard(_ sender: NSMenuItem) {
+        guard let node = currentTargetNode(), let scriptID = node.scriptID,
+              let boardID = sender.representedObject as? String else { return }
+        guard ScriptStore.addScript(scriptID, toBoard: boardID) else { reportWriteFailure(); return }
+        refreshTree()
+    }
+
+    /// 보드 안에서 한 칸 위/아래. 드래그를 못 쓰는 상황을 위한 정식 경로이자,
+    /// 보드끼리의 순서에도 같은 두 항목을 쓴다(대상이 무엇인지로 갈린다).
+    @objc func moveSelectedUp() { stepSelectedOrder(by: -1) }
+    @objc func moveSelectedDown() { stepSelectedOrder(by: +1) }
+
+    private func stepSelectedOrder(by delta: Int) {
+        guard let node = currentTargetNode() else { return }
+        // `at:` 은 **원래 목록 기준 삽입 지점**이다(ScriptStore.adjustedIndex 주석).
+        // 그래서 아래로 한 칸은 +2, 위로 한 칸은 -1 이다. 여기서 헷갈리면 "아래로가 안 먹는다".
+        func insertionPoint(from current: Int) -> Int { delta > 0 ? current + 2 : current - 1 }
+
+        let ok: Bool
+        if node.isBoard {
+            let order = ScriptStore.loadLibrary().boards
+                .sorted { $0.sortIndex < $1.sortIndex }.map(\.id)
+            guard let current = order.firstIndex(of: node.id) else { return }
+            let target = insertionPoint(from: current)
+            guard target >= 0, target <= order.count else { return }   // 끝에서는 아무 일도 없다
+            ok = ScriptStore.moveBoard(id: node.id, at: target)
+        } else if let boardID = node.boardID, let scriptID = node.scriptID {
+            let order = ScriptStore.resolvedScriptIDs(of: boardID)
+            guard let current = order.firstIndex(of: scriptID) else { return }
+            let target = insertionPoint(from: current)
+            guard target >= 0, target <= order.count else { return }
+            ok = ScriptStore.moveScriptInBoard(scriptID, boardID: boardID, at: target)
+        } else {
+            return
+        }
+        if !ok { reportWriteFailure(); return }
+        refreshTree()
+        selectRow(withID: node.id)
+    }
+
+    /// ★ **삭제가 아니다.** 보드에서 참조만 뺀다 — 대본 파일도 색인도 그대로다.
+    @objc func removeSelectedFromBoard() {
+        guard let node = currentTargetNode(), let boardID = node.boardID,
+              let scriptID = node.scriptID else { return }
+        guard ScriptStore.removeScript(scriptID, fromBoard: boardID) else {
+            reportWriteFailure(); return
+        }
+        refreshTree()
+        showEditor(for: nil)
+    }
+
+    /// 보드 자리에서 원본 대본이 폴더 트리 어디에 있는지 보여 준다.
+    @objc func revealSelectedInScriptTree() {
+        guard let node = currentTargetNode(), let scriptID = node.scriptID else { return }
+        // 폴더가 접혀 있으면 행 자체가 없다 — 조상 폴더를 먼저 편다.
+        let library = ScriptStore.loadLibrary()
+        var chain: [String] = []
+        var cursor = library.scripts.first { $0.id == scriptID }?.folderID
+        while let current = cursor {
+            chain.append(current)
+            cursor = library.folders.first { $0.id == current }?.parentID
+        }
+        SettingsStore.shared.update {
+            $0.libraryExpandedFolderIDs = Array(Set($0.libraryExpandedFolderIDs).union(chain))
+        }
+        refreshTree()
+        selectRow(withID: scriptID)      // 폴더 트리 쪽 행의 id 는 대본 id 그대로다
+    }
+
+    private func selectRow(withID id: String) {
+        for row in 0..<outlineView.numberOfRows {
+            guard let node = outlineView.item(atRow: row) as? LibraryNode, node.id == id else { continue }
+            outlineView.selectRowIndexes([row], byExtendingSelection: false)
+            outlineView.scrollRowToVisible(row)
+            return
+        }
+    }
+
     @objc func revealSelectedInFinder() {
-        guard let node = currentTargetNode(), !node.isFolder else { return }
+        guard let node = currentTargetNode(), let scriptID = node.scriptID else { return }
         // Finder 는 별도 프로세스라 캡처에 찍힌다. 촬영 중에는 쓰면 안 된다.
-        NSWorkspace.shared.activateFileViewerSelecting([ScriptStore.url(for: node.id)])
+        NSWorkspace.shared.activateFileViewerSelecting([ScriptStore.url(for: scriptID)])
     }
 
     /// 삭제 — 이 순서가 계약이다. 어기면 유령 파일이 남거나 활성 대본이 사라진 채로 남는다.
+    ///
+    /// ⚠️ **보드 자리는 여기 오면 안 된다.** 보드 자리를 지우는 건 '보드에서 빼기'(참조만 끊음)이고,
+    /// 이 함수는 대본 파일을 휴지통으로 옮긴다. 예전 코드는 `!isFolder` 인 것을 전부 대본으로 봤는데,
+    /// 그 규칙을 보드가 있는 트리에 그대로 두면 **보드나 보드 자리를 지울 때 대본이 함께 사라진다.**
+    /// 그래서 `scriptID`(문서 정체성)와 종류를 함께 본다.
     @objc func deleteSelected() {
         let nodes = outlineView.selectedRowIndexes.compactMap {
             outlineView.item(atRow: $0) as? LibraryNode
         }
         guard !nodes.isEmpty else { return }
 
-        let scriptIDs = Set(nodes.filter { !$0.isFolder }.map(\.id))
+        // 보드 자리가 섞여 있으면 그건 삭제가 아니라 '빼기' 로 처리한다.
+        let entries = nodes.filter { $0.isBoardEntry }
+        let boards = nodes.filter { $0.isBoard }
+        let scriptIDs = Set(nodes.compactMap { node -> String? in
+            guard case .script = node.kind else { return nil }
+            return node.id
+        })
         let folders = nodes.filter { $0.isFolder }
 
         if let confirm = deleteConfirmation(scripts: scriptIDs.count, folders: folders.count),
@@ -4137,6 +4511,14 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
 
         // ② 삭제
         var bundles: [ScriptStore.DeletedBundle] = []
+        for entry in entries {
+            guard let boardID = entry.boardID, let scriptID = entry.scriptID else { continue }
+            ScriptStore.removeScript(scriptID, fromBoard: boardID)
+        }
+        for board in boards {
+            if let bundle = ScriptStore.deleteBoard(id: board.id) { bundles.append(bundle) }
+            prompterController?.boardDidDisappear(id: board.id)
+        }
         for id in scriptIDs {
             if let bundle = ScriptStore.deleteScript(id: id) { bundles.append(bundle) }
         }
@@ -4227,11 +4609,14 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         // ● 활성 표시가 붙어 있으면 벗겨 낸다(표시는 이름의 일부가 아니다).
         let cleaned = typed.hasPrefix("● ") ? String(typed.dropFirst(2)) : typed
 
+        // 조회 사슬: 폴더 → 보드 → 대본. id 는 전부 UUID 라 종류끼리 겹치지 않는다.
         let library = ScriptStore.loadLibrary()
         let isFolder = library.folders.contains { $0.id == id }
+        let isBoard = !isFolder && library.boards.contains { $0.id == id }
         let currentName = isFolder
             ? library.folders.first { $0.id == id }?.name
-            : library.scripts.first { $0.id == id }?.title
+            : (isBoard ? library.boards.first { $0.id == id }?.name
+                       : library.scripts.first { $0.id == id }?.title)
 
         // ⚠️ **바뀐 게 없으면 아무것도 하지 않는다.**
         //
@@ -4247,7 +4632,8 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
 
         let ok = isFolder
             ? ScriptStore.renameFolder(id: id, to: cleaned)
-            : ScriptStore.renameScript(id: id, to: cleaned)
+            : (isBoard ? ScriptStore.renameBoard(id: id, to: cleaned)
+                       : ScriptStore.renameScript(id: id, to: cleaned))
         refreshTree()
         if !ok { reportWriteFailure() }
         if id == editingScriptID { showEditor(for: id) }
@@ -4255,11 +4641,24 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
 
     // MARK: 액션
 
+    /// 더블클릭 · ⌘Return · 우클릭 메뉴가 모두 여기로 온다.
+    ///
+    /// 보드 쪽에서 올리면 **그 보드가 활성 보드가 된다** — 그래야 ⌃⌥→ 가 이어서 넘긴다.
+    /// 폴더 트리에서 올리면 활성 보드는 건드리지 않는다(잠깐 다른 대본을 보는 것과
+    /// 촬영 묶음을 바꾸는 건 다른 행동이다).
     @objc func loadSelectedIntoPrompter() {
-        guard let node = outlineView.item(atRow: outlineView.selectedRow) as? LibraryNode,
-              !node.isFolder else { return }
+        guard let node = currentTargetNode() else { return }
         flushPendingEdits()
-        prompterController?.switchToScript(id: node.id)
+
+        if node.isBoard {
+            prompterController?.startBoard(id: node.id)
+        } else if let boardID = node.boardID, let scriptID = node.scriptID {
+            prompterController?.startBoard(id: boardID, at: scriptID)
+        } else if let scriptID = node.scriptID {
+            prompterController?.switchToScript(id: scriptID)
+        } else {
+            return
+        }
         refreshTree()       // 활성 표시(볼드 + ●) 갱신
     }
 
@@ -4329,20 +4728,52 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         _ = (item.target as AnyObject).perform(action, with: item)
     }
 
-    /// 셀프테스트용 — 드래그 검증/수락을 창 없이 태운다.
+    /// 셀프테스트용 — 드래그 검증을 창 없이 태운다.
     /// (NSDraggingInfo 는 AppKit 이 만들어 주는 타입이라 흉내낼 수 없어, 노드 id 로 대신 받는다)
+    ///
+    /// **실제 드롭과 같은 함수를 본다**(재조준 → 판정). 여기서만 통하는 별도 규칙을 쓰면
+    /// 테스트가 통과해도 실사용에서 드롭이 안 먹을 수 있다.
     func validateDropForTest(dragging ids: [String], onto targetID: String?,
                              childIndex: Int = NSOutlineViewDropOnItemIndex) -> Bool {
-        var byID: [String: LibraryNode] = [:]
-        func index(_ nodes: [LibraryNode]) { for n in nodes { byID[n.id] = n; index(n.children) } }
-        index(roots)
-        let dragged = ids.compactMap { byID[$0] }
-        guard !dragged.isEmpty, !ScriptStore.isWriteBlocked else { return false }
-        let target = targetID.flatMap { byID[$0] }
-        for node in dragged where node.isFolder {
-            if isDescendant(target, of: node) { return false }
-        }
+        let dragged = ids.compactMap { node(withID: $0) }
+        guard !dragged.isEmpty else { return false }
+        let target = targetID.flatMap { node(withID: $0) }
+        let (destination, slot) = retargetedDrop(dragged: dragged, item: target, childIndex: childIndex)
+        if case .reject = dropPlan(dragged: dragged, destination: destination, index: slot) { return false }
         return true
+    }
+
+    /// 셀프테스트용 — 판정이 어느 갈래로 갔는지까지 본다(허용/거부만으로는
+    /// "대본을 보드에 담으려 했는데 폴더 이동으로 처리" 같은 오배선이 안 잡힌다).
+    func dropPlanLabelForTest(dragging ids: [String], onto targetID: String?,
+                              childIndex: Int = NSOutlineViewDropOnItemIndex) -> String {
+        let dragged = ids.compactMap { node(withID: $0) }
+        let target = targetID.flatMap { node(withID: $0) }
+        let (destination, slot) = retargetedDrop(dragged: dragged, item: target, childIndex: childIndex)
+        switch dropPlan(dragged: dragged, destination: destination, index: slot) {
+        case .scriptTree:      return "scriptTree"
+        case .addToBoard:      return "addToBoard"
+        case .reorderInBoard:  return "reorderInBoard"
+        case .reorderBoards:   return "reorderBoards"
+        case .reject:          return "reject"
+        }
+    }
+
+    /// 셀프테스트용 — 보드 머리 행의 노드 id.
+    func sectionIDForTest(boards: Bool) -> String? {
+        sectionNode(boards ? .boards : .scripts)?.id
+    }
+
+    private func node(withID id: String) -> LibraryNode? {
+        var found: LibraryNode?
+        func walk(_ nodes: [LibraryNode]) {
+            for n in nodes where found == nil {
+                if n.id == id { found = n; return }
+                walk(n.children)
+            }
+        }
+        walk(roots)
+        return found
     }
 
     /// 셀프테스트용 — refreshTree 안에서 refreshTree 를 다시 부르면 튕겨 나오는지 본다.
@@ -4645,6 +5076,84 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         let title = ScriptStore.loadLibrary().scripts.first { $0.id == id }?.title ?? "대본"
         prompterView.overlay.showToast(title)
         libraryController?.prompterDidSwitchScript(to: id)
+    }
+
+    // MARK: 보드 (촬영 묶음)
+
+    /// 지금 촬영 중인 보드. 라이브러리에서 보드를 시작하면 정해지고, 그 보드를 지우면 풀린다.
+    private(set) var activeBoardID: String? {
+        get { SettingsStore.shared.settings.activeBoardID }
+        set { SettingsStore.shared.update { $0.activeBoardID = newValue } }
+    }
+
+    /// 보드를 촬영 대상으로 삼고 대본 하나를 올린다.
+    /// `at` 이 nil 이면 첫 대본부터 — "보드 시작" 이 그 경로다.
+    func startBoard(id: String, at scriptID: String? = nil) {
+        let order = ScriptStore.resolvedScriptIDs(of: id)
+        guard !order.isEmpty else {
+            activeBoardID = id          // 비어 있어도 활성은 잡아 둔다(담으면 바로 이어진다)
+            prompterView.overlay.showToast("보드가 비어 있습니다")
+            return
+        }
+        activeBoardID = id
+        SettingsStore.shared.flushNow()
+        let wanted = scriptID.flatMap { order.contains($0) ? $0 : nil } ?? order[0]
+        // 이미 그 대본이 올라와 있어도 위치 안내는 띄운다 — 사용자가 방금 요청한 행동이므로
+        // 아무 반응이 없으면 "안 먹었다" 로 읽힌다.
+        if wanted == activeScriptID {
+            announceBoardPosition(of: wanted, in: order)
+        } else {
+            switchToScript(id: wanted)
+            announceBoardPosition(of: wanted, in: order)
+        }
+    }
+
+    /// 보드 안에서 한 대본 앞/뒤로. `⌃⌥←` / `⌃⌥→` 가 부른다.
+    ///
+    /// **양 끝에서 감싸지 않는다.** 마지막 대본에서 한 번 더 눌렀다고 첫 대본으로 되감기는 것이
+    /// 촬영 중에 일어날 수 있는 사고 중 가장 나쁘다 — 되돌릴 방법이 없고, 그 시점에는
+    /// 화면을 볼 수도 없다. 끝이라는 것만 알린다.
+    func stepBoard(forward: Bool) {
+        guard let boardID = activeBoardID,
+              ScriptStore.loadLibrary().boards.contains(where: { $0.id == boardID }) else {
+            prompterView.overlay.showToast("보드가 지정되지 않았습니다")
+            return
+        }
+        let order = ScriptStore.resolvedScriptIDs(of: boardID)
+        guard !order.isEmpty else {
+            prompterView.overlay.showToast("보드가 비어 있습니다")
+            return
+        }
+
+        // 폴더 트리에서 딴 대본을 올려 둔 상태라면 보드의 양 끝에서 다시 들어간다.
+        guard let current = activeScriptID.flatMap({ order.firstIndex(of: $0) }) else {
+            let entry = forward ? order[0] : order[order.count - 1]
+            switchToScript(id: entry)
+            announceBoardPosition(of: entry, in: order)
+            return
+        }
+
+        let next = current + (forward ? 1 : -1)
+        guard next >= 0, next < order.count else {
+            prompterView.overlay.showToast(forward ? "보드 마지막 대본" : "보드 첫 대본")
+            return
+        }
+        switchToScript(id: order[next])
+        announceBoardPosition(of: order[next], in: order)
+    }
+
+    /// 보드가 사라졌다. 활성이었다면 푼다 — 없는 보드를 가리킨 채로 두면
+    /// `⌃⌥→` 가 "보드가 지정되지 않았습니다" 대신 조용히 아무 일도 안 하는 것처럼 보인다.
+    func boardDidDisappear(id: String) {
+        guard activeBoardID == id else { return }
+        activeBoardID = nil
+        SettingsStore.shared.flushNow()
+    }
+
+    private func announceBoardPosition(of scriptID: String, in order: [String]) {
+        guard let index = order.firstIndex(of: scriptID) else { return }
+        let title = ScriptStore.loadLibrary().scripts.first { $0.id == scriptID }?.title ?? "대본"
+        prompterView.overlay.showToast("\(index + 1)/\(order.count) · \(title)")
     }
 
     func createNewScript() {
@@ -5043,6 +5552,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var playMenuItem: NSMenuItem?
     private var clickThroughMenuItem: NSMenuItem?
     private var scriptMenuItem: NSMenuItem?
+    private var boardMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 스텔스 가드를 창 생성보다 먼저 건다.
@@ -5213,6 +5723,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.prompterController.showLibrary()
         }
 
+        hotkeyManager.onNextInBoard = { [weak self] in
+            self?.prompterController.stepBoard(forward: true)
+        }
+
+        hotkeyManager.onPreviousInBoard = { [weak self] in
+            self?.prompterController.stepBoard(forward: false)
+        }
+
         hotkeyManager.registerHotkeys()
     }
 
@@ -5251,6 +5769,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         scriptMenuItem = NSMenuItem(title: "대본", action: nil, keyEquivalent: "")
         scriptMenuItem?.submenu = NSMenu()
         menu.addItem(scriptMenuItem!)
+
+        // 대본 서브메뉴와 같은 이유로 둔다 — 촬영 중에는 파일 열기 패널을 쓸 수 없으므로
+        // (별도 프로세스라 캡처에서 숨길 수 없다) 여기가 라이브 전환의 정식 수단이다.
+        boardMenuItem = NSMenuItem(title: "보드", action: nil, keyEquivalent: "")
+        boardMenuItem?.submenu = NSMenu()
+        menu.addItem(boardMenuItem!)
         menu.addItem(NSMenuItem(title: "클립보드를 대본으로", action: #selector(pasteClipboardAsScript), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
 
@@ -5287,7 +5811,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playMenuItem?.state = controller.isPlaying ? .on : .off
         clickThroughMenuItem?.state = controller.isClickThrough ? .on : .off
         rebuildScriptMenu()
+        rebuildBoardMenu()
     }
+
+    /// 보드 목록. 고르면 **그 보드를 촬영 대상으로 삼고 첫 대본을 올린다**
+    /// (= 라이브러리 창에서 보드를 더블클릭한 것과 같은 경로).
+    private func rebuildBoardMenu() {
+        guard let submenu = boardMenuItem?.submenu else { return }
+        submenu.removeAllItems()
+
+        let library = ScriptStore.loadLibrary()
+        let activeBoard = prompterController?.activeBoardID
+        if library.boards.isEmpty {
+            let empty = NSMenuItem(title: "(없음)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            submenu.addItem(empty)
+        }
+        for board in library.boards.sorted(by: { $0.sortIndex < $1.sortIndex }) {
+            let count = ScriptStore.resolvedScriptIDs(of: board.id, in: library).count
+            let item = NSMenuItem(title: "\(board.name)  (\(count))",
+                                  action: #selector(startBoard(_:)), keyEquivalent: "")
+            item.representedObject = board.id
+            item.state = (board.id == activeBoard) ? .on : .off
+            item.target = self
+            submenu.addItem(item)
+        }
+        submenu.addItem(NSMenuItem.separator())
+
+        // 지금 어느 방향으로 넘어가는지 단축키까지 같이 보여 준다 — 촬영 직전에
+        // 치트시트를 따로 열지 않아도 되게.
+        for action in [HotkeyAction.previousInBoard, .nextInBoard] {
+            let key = HotkeyManager.shared.hotkeyConfigs[action]?.displayString ?? "-"
+            let item = NSMenuItem(title: "\(action.name)   \(key)",
+                                  action: action == .nextInBoard
+                                      ? #selector(nextInBoard) : #selector(previousInBoard),
+                                  keyEquivalent: "")
+            item.target = self
+            item.isEnabled = activeBoard != nil
+            submenu.addItem(item)
+        }
+    }
+
+    @objc func startBoard(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        prompterController?.startBoard(id: id)
+    }
+
+    @objc func nextInBoard() { prompterController?.stepBoard(forward: true) }
+    @objc func previousInBoard() { prompterController?.stepBoard(forward: false) }
 
     /// 대본 목록을 서브메뉴로 노출한다. 촬영 중에는 파일 열기 패널을 쓸 수 없으므로
     /// (별도 프로세스라 캡처에서 숨길 수 없다) 이 경로가 라이브 전환의 정식 수단이다.
