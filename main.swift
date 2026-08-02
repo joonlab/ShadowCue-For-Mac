@@ -39,6 +39,7 @@ enum HotkeyAction: Int, CaseIterable {
     case previousSection = 9
     case nextSection = 10
     case pasteClipboard = 11
+    case cheatSheet = 12
 
     var name: String {
         switch self {
@@ -53,6 +54,7 @@ enum HotkeyAction: Int, CaseIterable {
         case .previousSection: return "이전 섹션"
         case .nextSection: return "다음 섹션"
         case .pasteClipboard: return "클립보드를 대본으로"
+        case .cheatSheet: return "단축키 보기"
         }
     }
 
@@ -81,6 +83,7 @@ enum HotkeyAction: Int, CaseIterable {
         case .previousSection: return UInt32(kVK_ANSI_LeftBracket)
         case .nextSection: return UInt32(kVK_ANSI_RightBracket)
         case .pasteClipboard: return UInt32(kVK_ANSI_V)
+        case .cheatSheet: return UInt32(kVK_ANSI_Slash)
         }
     }
 }
@@ -150,6 +153,9 @@ struct Settings: Codable, Equatable {
     // 읽기 보조
     var showFocusBand: Bool = true
     var countdownEnabled: Bool = false
+    // 유리 프롬프터(반사 리그)용 반전
+    var mirrorHorizontal: Bool = false
+    var mirrorVertical: Bool = false
 
     init() {}
 
@@ -181,6 +187,8 @@ struct Settings: Codable, Equatable {
         maxLineWidth      = value(.maxLineWidth, fallback.maxLineWidth)
         showFocusBand     = value(.showFocusBand, fallback.showFocusBand)
         countdownEnabled  = value(.countdownEnabled, fallback.countdownEnabled)
+        mirrorHorizontal  = value(.mirrorHorizontal, fallback.mirrorHorizontal)
+        mirrorVertical    = value(.mirrorVertical, fallback.mirrorVertical)
     }
 }
 
@@ -244,6 +252,32 @@ final class SettingsStore {
     private func writeNow() {
         guard let data = try? JSONEncoder().encode(settings) else { return }
         defaults.set(data, forKey: storageKey)
+    }
+
+    // MARK: 이식·초기화
+
+    /// 사람이 읽을 수 있는 형태로 내보낸다(노트북 <-> 데스크톱 이식용).
+    func exportData() -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? encoder.encode(settings)
+    }
+
+    /// 가져오기. 전방호환 디코더를 그대로 타므로 낯선/깨진 필드는 각각 기본값으로 떨어진다.
+    @discardableResult
+    func importData(_ data: Data) -> Bool {
+        guard let decoded = try? JSONDecoder().decode(Settings.self, from: data) else { return false }
+        settings = decoded
+        flushNow()
+        return true
+    }
+
+    /// 대본은 건드리지 않는다 — 설정만 되돌린다(activeScriptID 는 유지).
+    func resetAll() {
+        var fresh = Settings()
+        fresh.activeScriptID = settings.activeScriptID
+        settings = fresh
+        flushNow()
     }
 }
 
@@ -418,6 +452,7 @@ class HotkeyManager {
     var onPreviousSection: (() -> Void)?
     var onNextSection: (() -> Void)?
     var onPasteClipboard: (() -> Void)?
+    var onCheatSheet: (() -> Void)?
 
     /// 부팅 시 등록에 실패한 액션(다른 앱이 이미 그 조합을 잡고 있는 경우 등).
     private(set) var failedActions: Set<HotkeyAction> = []
@@ -475,6 +510,7 @@ class HotkeyManager {
                     case 9: HotkeyManager.shared.onPreviousSection?()
                     case 10: HotkeyManager.shared.onNextSection?()
                     case 11: HotkeyManager.shared.onPasteClipboard?()
+                    case 12: HotkeyManager.shared.onCheatSheet?()
                     default: break
                     }
                 }
@@ -850,7 +886,9 @@ final class PrompterOverlayView: NSView {
     private let hudLabel = NSTextField(labelWithString: "")
     private let badgeLabel = NSTextField(labelWithString: "")
     private let toastLabel = NSTextField(labelWithString: "")
+    private let cheatSheetLabel = NSTextField(labelWithString: "")
     private var toastHideWork: DispatchWorkItem?
+    private var cheatSheetHideWork: DispatchWorkItem?
 
     /// 화면 높이에서 시선 밴드가 놓이는 위치(0=맨 위, 1=맨 아래).
     private let bandPosition: CGFloat = 0.38
@@ -912,6 +950,14 @@ final class PrompterOverlayView: NSView {
         toastLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         toastLabel.alignment = .center
 
+        cheatSheetLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        cheatSheetLabel.alignment = .left
+        cheatSheetLabel.maximumNumberOfLines = 0
+        cheatSheetLabel.wantsLayer = true
+        cheatSheetLabel.layer?.cornerRadius = 8
+        cheatSheetLabel.isHidden = true
+        addSubview(cheatSheetLabel)
+
         applyColors()
     }
 
@@ -933,6 +979,8 @@ final class PrompterOverlayView: NSView {
         }
         toastLabel.textColor = base
         toastLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+        cheatSheetLabel.textColor = base
+        cheatSheetLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
     }
 
     /// 이 레이어는 절대 이벤트를 먹지 않는다.
@@ -959,6 +1007,41 @@ final class PrompterOverlayView: NSView {
         hudLabel.frame = NSRect(x: width - 96, y: height - 26, width: 88, height: 18)
         badgeLabel.frame = NSRect(x: 8, y: height - 26, width: 132, height: 18)
         toastLabel.frame = NSRect(x: (width - 200) / 2, y: 18, width: 200, height: 24)
+
+        if !cheatSheetLabel.isHidden {
+            let size = cheatSheetLabel.attributedStringValue.size()
+            let boxWidth = min(width - 32, size.width + 28)
+            let boxHeight = min(height - 32, size.height + 20)
+            cheatSheetLabel.frame = NSRect(x: (width - boxWidth) / 2,
+                                           y: (height - boxHeight) / 2,
+                                           width: boxWidth, height: boxHeight)
+        }
+    }
+
+    /// 단축키 목록을 화면에 띄운다. 외울 필요 없이 필요할 때 확인하면 된다.
+    func toggleCheatSheet(_ lines: [(String, String)]) {
+        if !cheatSheetLabel.isHidden {
+            hideCheatSheet()
+            return
+        }
+        let width = lines.map { $0.0.count }.max() ?? 0
+        let body = lines
+            .map { "\($0.0.padding(toLength: max(width, $0.0.count), withPad: " ", startingAt: 0))   \($0.1)" }
+            .joined(separator: "\n")
+        cheatSheetLabel.stringValue = body
+        cheatSheetLabel.isHidden = false
+        needsLayout = true
+
+        cheatSheetHideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.hideCheatSheet() }
+        cheatSheetHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
+    }
+
+    func hideCheatSheet() {
+        cheatSheetHideWork?.cancel()
+        cheatSheetHideWork = nil
+        cheatSheetLabel.isHidden = true
     }
 
     private func layoutProgress() {
@@ -1125,6 +1208,48 @@ class PrompterView: NSView {
     private var scrollerHideTimer: Timer?
     let overlay = PrompterOverlayView()
     let controlStrip = PrompterControlStrip()
+    private let flipContainer = NSView()
+
+    /// 유리 프롬프터(반사 리그)는 거울에 비친 글자를 읽으므로 좌우를 뒤집어야 한다.
+    var mirrorHorizontal = false {
+        didSet {
+            guard mirrorHorizontal != oldValue else { return }
+            applyMirrorTransform()
+            SettingsStore.shared.update { $0.mirrorHorizontal = mirrorHorizontal }
+        }
+    }
+
+    var mirrorVertical = false {
+        didSet {
+            guard mirrorVertical != oldValue else { return }
+            applyMirrorTransform()
+            SettingsStore.shared.update { $0.mirrorVertical = mirrorVertical }
+        }
+    }
+
+    /// 셀프테스트용 — 반전이 실제 좌표 변환으로 이어졌는지 확인한다.
+    /// (레이어 transform 은 컴포지터가 적용하므로 픽셀 캡처로는 검증이 불안정하다)
+    func mirrorProbe() -> (topLeftMapsTo: CGPoint, size: CGSize)? {
+        guard let inner = flipContainer.layer, let outer = layer else { return nil }
+        return (inner.convert(CGPoint.zero, to: outer), flipContainer.bounds.size)
+    }
+
+    /// 레이어 transform 은 anchorPoint 기준으로 걸린다. AppKit 이 layer.frame 을 다시 쓰면
+    /// transform 과 충돌하므로, 매번 bounds/position 을 직접 맞춘 뒤 transform 을 건다.
+    private func applyMirrorTransform() {
+        guard let layer = flipContainer.layer else { return }
+        let size = flipContainer.bounds.size
+        guard size.width > 0, size.height > 0 else { return }
+
+        layer.transform = CATransform3DIdentity
+        layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.bounds = CGRect(origin: .zero, size: size)
+        layer.position = CGPoint(x: flipContainer.frame.midX, y: flipContainer.frame.midY)
+
+        guard mirrorHorizontal || mirrorVertical else { return }
+        layer.transform = CATransform3DMakeScale(mirrorHorizontal ? -1 : 1,
+                                                 mirrorVertical ? -1 : 1, 1)
+    }
 
     /// 스크롤 정책(맨 위로 갈지 읽던 자리를 지킬지)은 호출자가 정한다.
     /// 새 대본을 여는 것과, 보고 있는 대본을 편집하는 것은 다르게 다뤄야 한다.
@@ -1258,6 +1383,8 @@ class PrompterView: NSView {
     }
 
     private func setupViews() {
+        wantsLayer = true   // flipContainer 의 transform 이 좌표계에 제대로 반영되도록
+
         // Create scroll view
         scrollView = NSScrollView(frame: bounds)
         scrollView.autoresizingMask = [.width, .height]
@@ -1289,7 +1416,14 @@ class PrompterView: NSView {
         textView.backgroundColor = .clear
 
         scrollView.documentView = textView
-        addSubview(scrollView)
+
+        // 미러 반전은 이 컨테이너에만 건다. 오버레이·조작 바까지 뒤집히면
+        // 진행률·뱃지·버튼이 거울상이 되어 못 쓴다.
+        flipContainer.frame = bounds
+        flipContainer.autoresizingMask = [.width, .height]
+        flipContainer.wantsLayer = true
+        flipContainer.addSubview(scrollView)
+        addSubview(flipContainer)
 
         // 읽기 보조 레이어는 스크롤뷰의 형제로 위에 얹는다(이벤트는 통과시킨다).
         overlay.frame = bounds
@@ -1658,6 +1792,7 @@ class PrompterView: NSView {
         let widthChanged = abs(newSize.width - frame.width) > 0.5
         super.setFrameSize(newSize)
         layoutControlStrip()
+        applyMirrorTransform()   // 크기가 바뀌면 anchor/position 을 다시 맞춰야 한다
         guard let textView = textView else { return }
         textView.frame.size.width = newSize.width
         if widthChanged {
@@ -1994,6 +2129,20 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         countdownCheckbox.state = prompterController.countdownEnabled ? .on : .off
         countdownCheckbox.frame = NSRect(x: leftMargin + 160, y: yOffset, width: 220, height: 20)
         contentView.addSubview(countdownCheckbox)
+        yOffset -= 28
+
+        // 유리 프롬프터(반사 리그)용 반전
+        let mirrorH = NSButton(checkboxWithTitle: "좌우 반전 (유리 프롬프터)", target: self,
+                               action: #selector(mirrorHorizontalToggled(_:)))
+        mirrorH.state = prompterController.prompterView.mirrorHorizontal ? .on : .off
+        mirrorH.frame = NSRect(x: leftMargin, y: yOffset, width: 200, height: 20)
+        contentView.addSubview(mirrorH)
+
+        let mirrorV = NSButton(checkboxWithTitle: "상하 반전", target: self,
+                               action: #selector(mirrorVerticalToggled(_:)))
+        mirrorV.state = prompterController.prompterView.mirrorVertical ? .on : .off
+        mirrorV.frame = NSRect(x: leftMargin + 210, y: yOffset, width: 160, height: 20)
+        contentView.addSubview(mirrorV)
         yOffset -= 35
 
         // 목표 시간 -> 속도 역산
@@ -2251,6 +2400,14 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         prompterController?.countdownEnabled = (sender.state == .on)
     }
 
+    @objc func mirrorHorizontalToggled(_ sender: NSButton) {
+        prompterController?.prompterView.mirrorHorizontal = (sender.state == .on)
+    }
+
+    @objc func mirrorVerticalToggled(_ sender: NSButton) {
+        prompterController?.prompterView.mirrorVertical = (sender.state == .on)
+    }
+
     /// "이 대본을 N분에 읽는다"에서 스크롤 속도를 거꾸로 구한다.
     /// 강의·영상은 분량이 정해져 있어서, 속도를 감으로 맞추는 것보다 이쪽이 훨씬 빠르다.
     @objc func applyTargetDuration(_ sender: NSButton) {
@@ -2448,6 +2605,8 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         prompterView.lineHeight = CGFloat(settings.lineHeight)
         prompterView.textColor = settings.textColor.nsColor
         prompterView.overlay.showsFocusBand = settings.showFocusBand
+        prompterView.mirrorHorizontal = settings.mirrorHorizontal
+        prompterView.mirrorVertical = settings.mirrorVertical
         scrollSpeed = CGFloat(settings.scrollSpeed)
         countdownEnabled = settings.countdownEnabled
 
@@ -2758,6 +2917,16 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         prompterView.overlay.showToast("처음으로")
     }
 
+    /// 현재 설정된 단축키 전체를 화면에 띄운다(8초 후 자동으로 사라짐).
+    func toggleCheatSheet() {
+        let lines = HotkeyAction.allCases.map { action -> (String, String) in
+            let key = HotkeyManager.shared.hotkeyConfigs[action]?.displayString ?? "-"
+            let failed = HotkeyManager.shared.failedActions.contains(action)
+            return (key, action.name + (failed ? "  ⚠ 등록 실패" : ""))
+        }
+        prompterView.overlay.toggleCheatSheet(lines)
+    }
+
     /// 대본의 제목(#, ##, …) 단위로 건너뛴다. 긴 대본에서 원하는 대목을 찾는 가장 빠른 길.
     func jumpSection(forward: Bool) {
         guard let moved = prompterView.jumpToSection(forward: forward) else {
@@ -3036,6 +3205,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.prompterController.replaceScriptFromClipboard()
         }
 
+        hotkeyManager.onCheatSheet = { [weak self] in
+            self?.prompterController.toggleCheatSheet()
+        }
+
         hotkeyManager.registerHotkeys()
     }
 
@@ -3074,6 +3247,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(NSMenuItem(title: "설정...", action: #selector(showSettings), keyEquivalent: ","))
+
+        let maintenance = NSMenuItem(title: "설정 관리", action: nil, keyEquivalent: "")
+        let maintenanceMenu = NSMenu()
+        maintenanceMenu.addItem(NSMenuItem(title: "설정 내보내기...", action: #selector(exportSettings), keyEquivalent: ""))
+        maintenanceMenu.addItem(NSMenuItem(title: "설정 가져오기...", action: #selector(importSettings), keyEquivalent: ""))
+        maintenanceMenu.addItem(NSMenuItem.separator())
+        maintenanceMenu.addItem(NSMenuItem(title: "모든 설정 초기화...", action: #selector(resetSettings), keyEquivalent: ""))
+        maintenance.submenu = maintenanceMenu
+        menu.addItem(maintenance)
+
         menu.addItem(NSMenuItem(title: "업데이트 확인...", action: #selector(checkForUpdates), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -3135,6 +3318,82 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func pasteClipboardAsScript() {
         prompterController?.replaceScriptFromClipboard()
+    }
+
+    /// 파일 패널은 별도 프로세스가 그려 sharingType 을 강제할 수 없다(= 캡처에 찍힌다).
+    /// 그래서 이 기능들은 준비 단계 전용이며, 라이브 중에는 쓰지 않도록 안내한다.
+    @objc func exportSettings() {
+        guard let data = SettingsStore.shared.exportData() else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "ShadowCue-설정.json"
+        panel.allowedContentTypes = [.json]
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try data.write(to: url, options: .atomic)
+            prompterController?.prompterView.overlay.showToast("설정을 내보냈습니다")
+        } catch {
+            showWarning("설정을 저장하지 못했습니다", error.localizedDescription)
+        }
+    }
+
+    @objc func importSettings() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? Data(contentsOf: url) else { return }
+
+        guard SettingsStore.shared.importData(data) else {
+            showWarning("가져오지 못했습니다", "이 파일은 ShadowCue 설정 형식이 아닙니다.")
+            return
+        }
+        reapplySettingsEverywhere()
+        prompterController?.prompterView.overlay.showToast("설정을 가져왔습니다")
+    }
+
+    @objc func resetSettings() {
+        let alert = NSAlert()
+        alert.messageText = "모든 설정을 초기화할까요?"
+        alert.informativeText = "글자 크기·색상·속도·단축키·창 위치가 기본값으로 돌아갑니다.\n대본은 지워지지 않습니다."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "초기화")
+        alert.addButton(withTitle: "취소")
+        alert.window.sharingType = .none
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        SettingsStore.shared.resetAll()
+        HotkeyManager.shared.applyStoredHotkeys([])
+        for action in HotkeyAction.allCases {
+            HotkeyManager.shared.hotkeyConfigs[action] =
+                HotkeyConfig(keyCode: action.defaultKeyCode, modifiers: HotkeyAction.defaultModifiers)
+        }
+        HotkeyManager.shared.registerHotkeys()
+        refreshHotkeyFailureIndicator()
+        reapplySettingsEverywhere()
+        prompterController?.prompterView.overlay.showToast("설정을 초기화했습니다")
+    }
+
+    /// 설정이 통째로 바뀌었을 때(가져오기·초기화) 화면과 설정 창을 다시 맞춘다.
+    /// 설정 창은 컨트롤이 많아 개별 갱신보다 다시 만드는 편이 확실하다.
+    private func reapplySettingsEverywhere() {
+        guard let controller = prompterController else { return }
+        controller.applyLoadedSettings(SettingsStore.shared.settings)
+        let wasOpen = controller.settingsController?.window?.isVisible ?? false
+        controller.settingsController?.close()
+        controller.settingsController = nil
+        if wasOpen { controller.showSettings() }
+    }
+
+    private func showWarning(_ title: String, _ detail: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.alertStyle = .warning
+        alert.window.sharingType = .none
+        alert.runModal()
     }
 
     @objc func applyPreset(_ sender: NSMenuItem) {
@@ -3364,6 +3623,20 @@ func runPersistenceSelfTest() -> Bool {
         let before = store.settings
         store.update { $0.fontSize = 61 }
         check("같은 값 재대입은 무시", store.settings == before)
+
+        // 내보내기 -> 초기화 -> 가져오기 왕복
+        store.update { $0.fontSize = 55; $0.mirrorHorizontal = true; $0.maxLineWidth = 800 }
+        let exported = store.exportData()
+        check("내보내기 성공", exported != nil)
+        store.resetAll()
+        check("초기화되어 기본값", store.settings.fontSize == 32 && !store.settings.mirrorHorizontal)
+        if let exported {
+            check("가져오기 성공", store.importData(exported))
+            check("가져온 값 복원", store.settings.fontSize == 55
+                  && store.settings.mirrorHorizontal
+                  && store.settings.maxLineWidth == 800)
+        }
+        check("깨진 파일 거부", !store.importData(Data("이건 JSON 이 아니다".utf8)))
     }
     return pass
 }
@@ -3387,6 +3660,34 @@ func runSettingsLayoutSelfTest() -> Bool {
     return ok
 }
 
+/// 미러 반전이 실제로 좌표를 뒤집는지 검사한다.
+/// 반전 ON 이면 컨테이너의 (0,0) 이 부모 좌표계의 오른쪽 끝으로 가야 한다.
+func runMirrorSelfTest() -> Bool {
+    let view = PrompterView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+    view.layoutSubtreeIfNeeded()
+
+    guard let normal = view.mirrorProbe() else {
+        print("FAIL 미러 프로브 없음")
+        return false
+    }
+    let normalOK = abs(normal.topLeftMapsTo.x - 0) < 1
+
+    view.mirrorHorizontal = true
+    guard let mirrored = view.mirrorProbe() else { return false }
+    let mirroredOK = abs(mirrored.topLeftMapsTo.x - mirrored.size.width) < 1
+
+    view.mirrorHorizontal = false
+    guard let restored = view.mirrorProbe() else { return false }
+    let restoredOK = abs(restored.topLeftMapsTo.x - 0) < 1
+
+    let ok = normalOK && mirroredOK && restoredOK
+    print("\(ok ? "PASS" : "FAIL") 미러 반전 "
+          + "(기본 x=\(Int(normal.topLeftMapsTo.x)), "
+          + "반전 x=\(Int(mirrored.topLeftMapsTo.x))/폭 \(Int(mirrored.size.width)), "
+          + "복귀 x=\(Int(restored.topLeftMapsTo.x)))")
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -3398,7 +3699,8 @@ if CommandLine.arguments.contains("--selftest") {
     print("")
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
-    exit(persistenceOK && layoutOK ? 0 : 1)
+    let mirrorOK = runMirrorSelfTest()
+    exit(persistenceOK && layoutOK && mirrorOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
