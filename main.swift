@@ -32,14 +32,19 @@ enum HotkeyAction: Int, CaseIterable {
     case toggleClickThrough = 5
     case speedUp = 6
     case speedDown = 7
-    // ⚠️ 새 액션을 추가할 때는 rawValue 가 곧 hotkey ID 이므로 **4곳을 함께** 고쳐야 한다:
-    //    이 enum / HotkeyManager 의 콜백 프로퍼티 / 이벤트 핸들러 switch / AppDelegate 배선.
-    //    하나만 빠지면 등록은 되는데 아무 일도 안 일어나 원인을 찾기 어렵다.
+    // 새 액션을 추가할 때 고칠 곳: 이 enum / `name` / `defaultKeyCode` /
+    // HotkeyManager 의 콜백 프로퍼티 + `callback(for:)` / AppDelegate 배선.
+    //
+    // 앞의 넷은 **컴파일러가 강제한다**(전부 enum 위 exhaustive switch다).
+    // 예전에는 Carbon 콜백 안에서 UInt32 를 switch 해서 한 곳을 빠뜨려도 컴파일이 통과했고,
+    // 그러면 등록은 되는데 눌러도 아무 일이 없었다. 그 switch 를 없앴다.
+    // 컴파일러가 못 잡는 건 AppDelegate 배선 하나뿐이다 — 새 액션을 넣고 눌러 보라.
     case scrollToTop = 8
     case previousSection = 9
     case nextSection = 10
     case pasteClipboard = 11
     case cheatSheet = 12
+    case showLibrary = 13
 
     var name: String {
         switch self {
@@ -55,6 +60,7 @@ enum HotkeyAction: Int, CaseIterable {
         case .nextSection: return "다음 섹션"
         case .pasteClipboard: return "클립보드를 대본으로"
         case .cheatSheet: return "단축키 보기"
+        case .showLibrary: return "대본 라이브러리"
         }
     }
 
@@ -84,6 +90,9 @@ enum HotkeyAction: Int, CaseIterable {
         case .nextSection: return UInt32(kVK_ANSI_RightBracket)
         case .pasteClipboard: return UInt32(kVK_ANSI_V)
         case .cheatSheet: return UInt32(kVK_ANSI_Slash)
+        // L = Library. 남아 있는 글자 중 니모닉이 가장 분명하고, 한국어 macOS 의
+        // 공장 기본 단축키와도 겹치지 않는다.
+        case .showLibrary: return UInt32(kVK_ANSI_L)
         }
     }
 }
@@ -157,6 +166,14 @@ struct Settings: Codable, Equatable {
     var mirrorHorizontal: Bool = false
     var mirrorVertical: Bool = false
 
+    // 대본 라이브러리 창 — 문서가 아니라 UI 상태이므로 library.json 이 아니라 여기에 둔다.
+    var libraryWindowFrame: [Double]?
+    var librarySidebarWidth: Double = 260
+    var libraryExpandedFolderIDs: [String] = []
+    /// 사이드바 선택 복원용. **`activeScriptID` 와 의도적으로 별개다** —
+    /// 라이브러리에서 대본을 골라 보는 것과 그 대본을 프롬프터에 올리는 것은 다른 행동이다.
+    var libraryLastSelectedID: String?
+
     init() {}
 
     /// **전방호환 디코더 — 자동 합성에 맡기면 안 된다.**
@@ -189,6 +206,10 @@ struct Settings: Codable, Equatable {
         countdownEnabled  = value(.countdownEnabled, fallback.countdownEnabled)
         mirrorHorizontal  = value(.mirrorHorizontal, fallback.mirrorHorizontal)
         mirrorVertical    = value(.mirrorVertical, fallback.mirrorVertical)
+        libraryWindowFrame       = value(.libraryWindowFrame, fallback.libraryWindowFrame)
+        librarySidebarWidth      = value(.librarySidebarWidth, fallback.librarySidebarWidth)
+        libraryExpandedFolderIDs = value(.libraryExpandedFolderIDs, fallback.libraryExpandedFolderIDs)
+        libraryLastSelectedID    = value(.libraryLastSelectedID, fallback.libraryLastSelectedID)
     }
 }
 
@@ -283,17 +304,167 @@ final class SettingsStore {
 
 // MARK: - Script Storage
 
+/// 배열 원소 하나가 깨져도 나머지를 살리는 래퍼.
+///
+/// `[ScriptMeta].self` 로 한 번에 디코드하면 원소 하나 때문에 배열 전체가 throw 되고,
+/// 그러면 대본 300개짜리 라이브러리가 메타 하나 깨졌다고 통째로 사라진다.
+private struct Lenient<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws { value = try? T(from: decoder) }
+}
+
+/// 모델 타입들은 **전부 손으로 쓴 `init(from:)`** 을 갖는다.
+///
+/// 합성 디코더는 프로퍼티 기본값을 쓰지 않아서, 필드를 하나만 추가해도 그 키가 없는 기존 파일이
+/// `keyNotFound` 로 통째로 디코드 실패한다. `Settings`(위쪽)가 같은 이유로 이미 손으로 쓴
+/// 디코더를 갖고 있는데, 대본 쪽은 합성 디코더라 v2 필드를 추가하는 순간 v1 파일이 전부
+/// "읽기 실패 → 빈 라이브러리" 로 떨어졌을 것이다. 그 경로의 끝은 색인 전소다(ScriptStore 주석 참조).
 struct ScriptMeta: Codable, Equatable {
     var id: String
     var title: String
     var createdAt: Date
     var updatedAt: Date
     var lastScrollOffset: Double = 0
+    /// nil = 최상위. **없는 폴더를 가리켜도 버리지 않는다** — 트리 빌더가 최상위로 승격시킨다.
+    var folderID: String? = nil
+    /// 같은 부모 안에서의 순서. 이동·삭제 후 형제끼리 0..n-1 로 재정규화한다.
+    var sortIndex: Int = 0
+
+    init(id: String, title: String, createdAt: Date, updatedAt: Date,
+         lastScrollOffset: Double = 0, folderID: String? = nil, sortIndex: Int = 0) {
+        self.id = id; self.title = title
+        self.createdAt = createdAt; self.updatedAt = updatedAt
+        self.lastScrollOffset = lastScrollOffset
+        self.folderID = folderID; self.sortIndex = sortIndex
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // id 와 title 은 없으면 이 항목을 살릴 수 없다 — 여기서만 throw 하고(= Lenient 가 이 원소만 버림),
+        // 나머지 필드는 개별 폴백한다.
+        id = try c.decode(String.self, forKey: .id)
+        title = ((try? c.decodeIfPresent(String.self, forKey: .title)) ?? nil) ?? "제목 없음"
+        createdAt = ((try? c.decodeIfPresent(Date.self, forKey: .createdAt)) ?? nil) ?? Date()
+        updatedAt = ((try? c.decodeIfPresent(Date.self, forKey: .updatedAt)) ?? nil) ?? createdAt
+        lastScrollOffset = ((try? c.decodeIfPresent(Double.self, forKey: .lastScrollOffset)) ?? nil) ?? 0
+        folderID = (try? c.decodeIfPresent(String.self, forKey: .folderID)) ?? nil
+        sortIndex = ((try? c.decodeIfPresent(Int.self, forKey: .sortIndex)) ?? nil) ?? 0
+    }
+}
+
+/// 폴더 = 대본 분류(중첩 가능).
+///
+/// **파일시스템 디렉터리와 대응시키지 않는다.** 본문은 계속 `scripts/<uuid>.md` 평면 구조로 두고
+/// 폴더는 색인에만 존재한다. 실제 디렉터리로 만들면 이름 변경·이동마다 파일 이동이 따라붙고,
+/// 그 도중에 프로세스가 죽으면 색인과 디스크가 어긋나 복구가 어려워진다.
+struct ScriptFolder: Codable, Equatable {
+    var id: String
+    var name: String
+    var parentID: String? = nil
+    var sortIndex: Int = 0
+    var createdAt: Date
+    var updatedAt: Date
+
+    init(id: String, name: String, parentID: String? = nil, sortIndex: Int = 0,
+         createdAt: Date, updatedAt: Date) {
+        self.id = id; self.name = name; self.parentID = parentID
+        self.sortIndex = sortIndex; self.createdAt = createdAt; self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = ((try? c.decodeIfPresent(String.self, forKey: .name)) ?? nil) ?? "이름 없는 폴더"
+        parentID = (try? c.decodeIfPresent(String.self, forKey: .parentID)) ?? nil
+        sortIndex = ((try? c.decodeIfPresent(Int.self, forKey: .sortIndex)) ?? nil) ?? 0
+        createdAt = ((try? c.decodeIfPresent(Date.self, forKey: .createdAt)) ?? nil) ?? Date()
+        updatedAt = ((try? c.decodeIfPresent(Date.self, forKey: .updatedAt)) ?? nil) ?? createdAt
+    }
+}
+
+/// 보드 = 촬영용 묶음(대본 여러 개를 순서대로). **이 버전에는 UI 도 CRUD API 도 없다.**
+///
+/// 그런데도 지금 필드를 넣는 이유는 하나다: 이 버전 코드가 `library.json` 을 디코드-재인코드 하는
+/// 순간, 모르는 최상위 키는 조용히 사라진다. 지금 자리를 비워 두어야 다음 버전에서 만든 보드가
+/// 이 버전으로 한 번 되돌아가도 살아남고, 마이그레이션을 v3 로 또 하지 않아도 된다.
+///
+/// `scriptIDs` 가 소유가 아니라 **참조**인 것도 의도다 — 같은 대본이 여러 보드에 들어갈 수 있다.
+struct ScriptBoard: Codable, Equatable {
+    var id: String
+    var name: String
+    var scriptIDs: [String] = []
+    var sortIndex: Int = 0
+    var createdAt: Date
+    var updatedAt: Date
+    var notes: String = ""
+
+    init(id: String, name: String, scriptIDs: [String] = [], sortIndex: Int = 0,
+         createdAt: Date, updatedAt: Date, notes: String = "") {
+        self.id = id; self.name = name; self.scriptIDs = scriptIDs
+        self.sortIndex = sortIndex; self.createdAt = createdAt
+        self.updatedAt = updatedAt; self.notes = notes
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = ((try? c.decodeIfPresent(String.self, forKey: .name)) ?? nil) ?? "이름 없는 보드"
+        scriptIDs = ((try? c.decodeIfPresent([String].self, forKey: .scriptIDs)) ?? nil) ?? []
+        sortIndex = ((try? c.decodeIfPresent(Int.self, forKey: .sortIndex)) ?? nil) ?? 0
+        createdAt = ((try? c.decodeIfPresent(Date.self, forKey: .createdAt)) ?? nil) ?? Date()
+        updatedAt = ((try? c.decodeIfPresent(Date.self, forKey: .updatedAt)) ?? nil) ?? createdAt
+        notes = ((try? c.decodeIfPresent(String.self, forKey: .notes)) ?? nil) ?? ""
+    }
 }
 
 struct ScriptLibrary: Codable, Equatable {
-    var version: Int = 1
+    /// v1: scripts 만. v2: folders/boards + ScriptMeta.folderID/sortIndex.
+    static let currentVersion = 2
+
+    var version: Int = ScriptLibrary.currentVersion
     var scripts: [ScriptMeta] = []
+    var folders: [ScriptFolder] = []
+    var boards: [ScriptBoard] = []
+
+    init() {}
+
+    init(version: Int, scripts: [ScriptMeta], folders: [ScriptFolder] = [], boards: [ScriptBoard] = []) {
+        self.version = version; self.scripts = scripts
+        self.folders = folders; self.boards = boards
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // 버전 키가 없으면 v1 이다(v1 파일에는 version 이 있지만, 없어도 v1 로 보는 게 안전하다).
+        version = ((try? c.decodeIfPresent(Int.self, forKey: .version)) ?? nil) ?? 1
+        scripts = (((try? c.decodeIfPresent([Lenient<ScriptMeta>].self, forKey: .scripts)) ?? nil) ?? [])
+            .compactMap(\.value)
+        folders = (((try? c.decodeIfPresent([Lenient<ScriptFolder>].self, forKey: .folders)) ?? nil) ?? [])
+            .compactMap(\.value)
+        boards = (((try? c.decodeIfPresent([Lenient<ScriptBoard>].self, forKey: .boards)) ?? nil) ?? [])
+            .compactMap(\.value)
+    }
+}
+
+/// `library.json` 을 읽은 결과의 신뢰도.
+///
+/// **최초 실행과 로드 실패를 반드시 구분해야 한다.** 둘 다 "빈 라이브러리" 로 보이지만,
+/// 전자는 써도 되고 후자는 쓰면 안 된다. 구분은 파일 존재 여부로만 한다
+/// (`ensureActiveScript()` 가 이미 같은 원칙을 쓴다).
+enum LibraryLoadState: Equatable {
+    case fresh                                  // 파일 없음 = 진짜 최초 실행. 쓰기 허용
+    case ok
+    case repaired(dropped: Int)                 // 원소 일부만 버림. 쓰기 허용
+    case corruptTopLevel(preserved: URL?)       // 통째로 못 읽음. 쓰기 차단
+    case futureVersion(Int)                     // 이 빌드보다 새 포맷. 쓰기 차단
+
+    /// 이 상태에서 색인을 덮어쓰면 데이터가 사라지는가.
+    var blocksWrites: Bool {
+        switch self {
+        case .corruptTopLevel, .futureVersion: return true
+        case .fresh, .ok, .repaired: return false
+        }
+    }
 }
 
 /// 대본은 설정이 아니라 **문서**다. 그래서 UserDefaults 가 아니라 파일로 둔다.
@@ -329,7 +500,8 @@ enum ScriptStore {
 2. \(HotkeyAction.toggleClickThrough.defaultDisplayString) - 클릭스루 모드
 3. \(HotkeyAction.toggleVisibility.defaultDisplayString) - 숨기기/보이기
 
-> 설정 창에서 원하는 텍스트를 입력하세요. 입력하면 바로 반영됩니다.
+> \(HotkeyAction.showLibrary.defaultDisplayString) 로 대본 라이브러리를 열어 편집하세요.
+> 입력하면 바로 반영됩니다.
 """
 
     /// `SHADOWCUE_SUPPORT_DIR` 는 테스트가 **사용자의 진짜 대본 라이브러리를 건드리지 않게** 하는 훅이다.
@@ -348,10 +520,33 @@ enum ScriptStore {
     }
     static var scriptsURL: URL { baseURL.appendingPathComponent("scripts", isDirectory: true) }
     static var libraryURL: URL { baseURL.appendingPathComponent("library.json") }
+    /// 삭제한 대본이 잠시 머무는 곳. 지우는 게 아니라 옮기는 것이라 되돌릴 수 있다.
+    static var trashURL: URL { baseURL.appendingPathComponent("trash", isDirectory: true) }
 
     static func prepare() {
         try? FileManager.default.createDirectory(at: scriptsURL, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: trashURL, withIntermediateDirectories: true)
     }
+
+    // MARK: 색인 신뢰도
+
+    /// 색인을 신뢰할 수 없을 때 래치된다. 한 번 켜지면 어떤 경로로도 `library.json` 을 쓰지 않는다.
+    ///
+    /// **이 래치가 없으면 "대본을 열어 보기만 해도" 목록이 날아간다.** 경로는 이렇다:
+    ///   디코드 실패 → 빈 라이브러리 → `saveScrollOffset`(스크롤 1pt만 움직여도 불린다)의
+    ///   read-modify-write → `saveLibrary(빈 것)` → 색인 전소.
+    /// `.md` 본문은 남지만 목록에서 전부 사라지므로 사용자 입장에선 대본을 잃은 것과 같다.
+    private(set) static var isWriteBlocked = false
+    private(set) static var lastLoadState: LibraryLoadState = .fresh
+
+    /// 셀프테스트 전용 — 격리 디렉터리를 갈아엎은 뒤 래치를 푼다.
+    static func resetWriteBlockForTest() {
+        isWriteBlocked = false
+        lastLoadState = .fresh
+    }
+
+    /// 사용자가 "디스크에서 복구" 를 선택했을 때만 부른다.
+    static func unblockWritesAfterRecovery() { isWriteBlocked = false }
 
     static func url(for id: String) -> URL {
         scriptsURL.appendingPathComponent("\(id).md")
@@ -383,18 +578,529 @@ enum ScriptStore {
         }
     }
 
-    static func loadLibrary() -> ScriptLibrary {
-        guard let data = try? Data(contentsOf: libraryURL),
-              let library = try? JSONDecoder().decode(ScriptLibrary.self, from: data) else {
-            return ScriptLibrary()
+    /// 색인을 읽고 **얼마나 믿을 수 있는지까지** 돌려준다. 부작용으로 쓰기 래치를 갱신한다.
+    @discardableResult
+    static func loadLibraryDetailed() -> (library: ScriptLibrary, state: LibraryLoadState) {
+        func finish(_ library: ScriptLibrary, _ state: LibraryLoadState) -> (ScriptLibrary, LibraryLoadState) {
+            lastLoadState = state
+            // 래치는 켜지기만 하고 스스로 꺼지지 않는다. 한 번 의심스러운 파일을 본 실행에서는
+            // 이후 어떤 로드가 성공해도 쓰지 않는다(부분 성공에 속아 덮어쓰는 걸 막는다).
+            if state.blocksWrites { isWriteBlocked = true }
+            return (library, state)
         }
-        return library
+
+        guard FileManager.default.fileExists(atPath: libraryURL.path) else {
+            return finish(ScriptLibrary(), .fresh)      // 최초 실행 — 쓰기 허용
+        }
+        guard let data = try? Data(contentsOf: libraryURL) else {
+            return finish(ScriptLibrary(), .corruptTopLevel(preserved: preserveCorruptLibrary()))
+        }
+        guard let library = try? JSONDecoder().decode(ScriptLibrary.self, from: data) else {
+            return finish(ScriptLibrary(), .corruptTopLevel(preserved: preserveCorruptLibrary()))
+        }
+        if library.version > ScriptLibrary.currentVersion {
+            // 최신 버전에서 만든 파일이다. 이 빌드가 모르는 키(보드 등)를 지우지 않도록 쓰지 않는다.
+            return finish(library, .futureVersion(library.version))
+        }
+
+        // 최상위는 읽혔지만 원소가 버려졌는지 본다. 모델에 개수를 담지 않고 여기서 원본과 대조한다
+        // (모델을 순수하게 유지하려고 — Equatable/Codable 에 진단용 필드가 섞이면 왕복 비교가 깨진다).
+        let dropped = droppedElementCount(rawData: data, decoded: library)
+        if dropped > 0 {
+            _ = preserveCorruptLibrary()                // 버려진 원소를 되살릴 수 있게 원본 보존
+            return finish(library, .repaired(dropped: dropped))
+        }
+        return finish(library, .ok)
     }
 
-    static func saveLibrary(_ library: ScriptLibrary) {
+    /// 기존 호출부를 그대로 두기 위해 시그니처를 유지한다.
+    static func loadLibrary() -> ScriptLibrary { loadLibraryDetailed().library }
+
+    /// 원본 JSON 의 배열 길이와 디코드 결과 길이를 비교해 버려진 원소 수를 센다.
+    private static func droppedElementCount(rawData: Data, decoded: ScriptLibrary) -> Int {
+        guard let root = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any] else { return 0 }
+        func rawCount(_ key: String) -> Int { (root[key] as? [Any])?.count ?? 0 }
+        let d = (rawCount("scripts") - decoded.scripts.count)
+              + (rawCount("folders") - decoded.folders.count)
+              + (rawCount("boards")  - decoded.boards.count)
+        return max(0, d)
+    }
+
+    /// 의심스러운 색인을 타임스탬프 붙여 **복사**한다(원본은 그대로 둔다 — 손으로 고칠 수 있게).
+    @discardableResult
+    private static func preserveCorruptLibrary() -> URL? {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let dest = baseURL.appendingPathComponent("library.corrupt-\(stamp).json")
+        guard !FileManager.default.fileExists(atPath: dest.path) else { return dest }
+        do {
+            try FileManager.default.copyItem(at: libraryURL, to: dest)
+            return dest
+        } catch { return nil }
+    }
+
+    @discardableResult
+    static func saveLibrary(_ library: ScriptLibrary) -> Bool {
+        guard !isWriteBlocked else { return false }     // ← 색인 소실을 막는 단 하나의 가드
         prepare()
-        guard let data = try? JSONEncoder().encode(library) else { return }
-        try? data.write(to: libraryURL, options: .atomic)
+        // 본문(`write(id:text:)`)과 같은 규칙으로 직전 세대를 하나 남긴다.
+        if FileManager.default.fileExists(atPath: libraryURL.path) {
+            let backup = libraryURL.appendingPathExtension("bak")
+            try? FileManager.default.removeItem(at: backup)
+            try? FileManager.default.copyItem(at: libraryURL, to: backup)
+        }
+        guard let data = try? JSONEncoder().encode(library) else { return false }
+        do {
+            try data.write(to: libraryURL, options: .atomic)
+            return true
+        } catch { return false }
+    }
+
+    /// 최종 안전망 — `scripts/*.md` 를 훑어 색인을 재구성한다.
+    ///
+    /// 폴더 구조는 잃지만 **대본은 하나도 잃지 않는다.** 이 함수가 있기 때문에
+    /// 마이그레이션이 `.md` 를 건드리지 않는 한, 최악의 경우에도 되돌릴 수 있다.
+    static func rebuildLibraryFromDisk() -> ScriptLibrary {
+        prepare()
+        let fm = FileManager.default
+        let urls = (try? fm.contentsOfDirectory(at: scriptsURL,
+                                                includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey]))
+            ?? []
+        var metas: [ScriptMeta] = []
+        for url in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+        where url.pathExtension == "md" {
+            let id = url.deletingPathExtension().lastPathComponent
+            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+            let created = values?.creationDate ?? Date()
+            metas.append(ScriptMeta(id: id,
+                                    title: derivedTitle(from: text, fallbackIndex: metas.count + 1),
+                                    createdAt: created,
+                                    updatedAt: values?.contentModificationDate ?? created,
+                                    sortIndex: metas.count))
+        }
+        return ScriptLibrary(version: ScriptLibrary.currentVersion, scripts: metas)
+    }
+
+    /// 본문에서 제목을 유추한다: 첫 `# ` 헤딩 → 첫 비어 있지 않은 줄 → "복구된 대본 N".
+    static func derivedTitle(from text: String, fallbackIndex: Int) -> String {
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("#") {
+                let stripped = line.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces)
+                if !stripped.isEmpty { return String(stripped.prefix(40)) }
+            }
+            return String(line.prefix(40))
+        }
+        return "복구된 대본 \(fallbackIndex)"
+    }
+
+    // MARK: 구조 변경 (폴더·대본 CRUD)
+
+    /// **모든 구조 변경은 이 한 곳을 통과한다.**
+    ///
+    /// - 쓰기 차단 상태에서 조용히 성공하지 않는다(false 를 돌려준다).
+    /// - `body` 가 false 를 돌려주면 아무것도 쓰지 않는다(검증 실패 = 무변경).
+    /// - 성공 시 형제끼리 sortIndex 를 0..n-1 로 재정규화한다. 순서가 항상 정칙이라
+    ///   테스트가 `[1,2,0]` 같은 기대값을 그대로 쓸 수 있고, 중복 인덱스가 쌓이지 않는다.
+    @discardableResult
+    private static func mutate(_ body: (inout ScriptLibrary) -> Bool) -> Bool {
+        guard !isWriteBlocked else { return false }
+        var library = loadLibrary()
+        guard body(&library) else { return false }
+        normalizeOrder(&library)
+        return saveLibrary(library)
+    }
+
+    private static func normalizeOrder(_ library: inout ScriptLibrary) {
+        // 폴더와 대본은 같은 부모 안에서 각각 0..n-1 을 갖는다(트리 빌더가 폴더를 앞에 놓는다).
+        func renumberFolders(parent: String?) {
+            let ids = library.folders
+                .filter { $0.parentID == parent }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            for (order, id) in ids.enumerated() {
+                if let i = library.folders.firstIndex(where: { $0.id == id }) {
+                    library.folders[i].sortIndex = order
+                }
+            }
+        }
+        func renumberScripts(folder: String?) {
+            let ids = library.scripts
+                .filter { $0.folderID == folder }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            for (order, id) in ids.enumerated() {
+                if let i = library.scripts.firstIndex(where: { $0.id == id }) {
+                    library.scripts[i].sortIndex = order
+                }
+            }
+        }
+        var parents: [String?] = [nil]
+        parents.append(contentsOf: library.folders.map { Optional($0.id) })
+        for parent in parents { renumberFolders(parent: parent); renumberScripts(folder: parent) }
+    }
+
+    /// 같은 부모 안에서 뒤쪽으로 옮길 때의 인덱스 보정.
+    ///
+    /// **`at:` 은 "최종 위치" 가 아니라 "원래 목록 기준 삽입 지점" 이다** —
+    /// `NSOutlineView` 의 `acceptDrop(item:childIndex:)` 이 주는 좌표계에 맞춘 것이다.
+    /// `[A,B,C]` 에서 A 를 `at: 2` 로 옮기면 "B 와 C 사이" 라는 뜻이므로 `[B,A,C]` 가 되고,
+    /// 맨 끝은 `at: 3` 이다. 두 규약을 헷갈리면 드래그가 항상 한 칸씩 어긋난다.
+    ///
+    /// 보정이 필요한 이유: 옮길 원소를 목록에서 먼저 빼면, 그 원소보다 뒤에 있던 삽입 지점이
+    /// 한 칸 당겨진다. 앞쪽으로 옮길 때(`target <= old`)는 당겨지지 않으므로 보정하지 않는다.
+    private static func adjustedIndex(_ target: Int, movingFrom old: Int, sameParent: Bool) -> Int {
+        (sameParent && target > old) ? target - 1 : target
+    }
+
+    /// 대상 폴더의 조상 사슬에 `id` 가 있는지. 순환 이동을 막는다.
+    private static func isDescendant(_ candidate: String?, of ancestorID: String,
+                                     in library: ScriptLibrary) -> Bool {
+        var cursor = candidate
+        var guardCount = 0
+        while let current = cursor, guardCount < 1000 {
+            if current == ancestorID { return true }
+            cursor = library.folders.first(where: { $0.id == current })?.parentID
+            guardCount += 1
+        }
+        return false
+    }
+
+    // ── 폴더 ────────────────────────────────────────────────────────
+
+    @discardableResult
+    static func createFolder(name: String, parentID: String? = nil) -> ScriptFolder? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var created: ScriptFolder?
+        let ok = mutate { library in
+            if let parent = parentID,
+               !library.folders.contains(where: { $0.id == parent }) { return false }
+            let now = Date()
+            let next = library.folders.filter { $0.parentID == parentID }.count
+            let folder = ScriptFolder(id: UUID().uuidString, name: trimmed, parentID: parentID,
+                                      sortIndex: next, createdAt: now, updatedAt: now)
+            library.folders.append(folder)
+            created = folder
+            return true
+        }
+        return ok ? created : nil
+    }
+
+    @discardableResult
+    static func renameFolder(id: String, to name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }       // 빈 이름은 목록에서 사라진 것처럼 보인다
+        return mutate { library in
+            guard let i = library.folders.firstIndex(where: { $0.id == id }) else { return false }
+            library.folders[i].name = trimmed
+            library.folders[i].updatedAt = Date()
+            return true
+        }
+    }
+
+    /// `at` 이 nil 이면 맨 끝.
+    @discardableResult
+    static func moveFolder(id: String, toParent parentID: String?, at index: Int? = nil) -> Bool {
+        mutate { library in
+            guard let current = library.folders.first(where: { $0.id == id }) else { return false }
+            if let parent = parentID,
+               !library.folders.contains(where: { $0.id == parent }) { return false }
+            // 자기 자신이나 자손 안으로 넣으면 트리가 끊겨 대본이 통째로 사라진 것처럼 보인다.
+            guard !isDescendant(parentID, of: id, in: library) else { return false }
+
+            let sameParent = current.parentID == parentID
+            let siblings = library.folders
+                .filter { $0.parentID == parentID && $0.id != id }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            let oldIndex = library.folders
+                .filter { $0.parentID == parentID }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .firstIndex(of: current) ?? siblings.count
+            var order = siblings
+            let target = min(max(0, adjustedIndex(index ?? order.count, movingFrom: oldIndex,
+                                                  sameParent: sameParent)), order.count)
+            order.insert(id, at: target)
+
+            guard let i = library.folders.firstIndex(where: { $0.id == id }) else { return false }
+            library.folders[i].parentID = parentID
+            library.folders[i].updatedAt = Date()
+            for (position, folderID) in order.enumerated() {
+                if let j = library.folders.firstIndex(where: { $0.id == folderID }) {
+                    library.folders[j].sortIndex = position
+                }
+            }
+            return true
+        }
+    }
+
+    enum FolderDeleteStrategy {
+        /// 안에 있던 것을 부모로 끌어올린다(기본 — 실수로 지워도 내용은 남는다).
+        case promoteChildren
+        /// 안에 있던 대본까지 휴지통으로.
+        case deleteContents
+    }
+
+    @discardableResult
+    static func deleteFolder(id: String, strategy: FolderDeleteStrategy = .promoteChildren) -> DeletedBundle? {
+        var bundle: DeletedBundle?
+        let ok = mutate { library in
+            guard let target = library.folders.first(where: { $0.id == id }) else { return false }
+            let descendants = descendantFolderIDs(of: id, in: library)
+            let affected = descendants.union([id])
+
+            switch strategy {
+            case .promoteChildren:
+                for i in library.folders.indices where library.folders[i].parentID == id {
+                    library.folders[i].parentID = target.parentID
+                }
+                for i in library.scripts.indices where library.scripts[i].folderID == id {
+                    library.scripts[i].folderID = target.parentID
+                }
+                library.folders.removeAll { $0.id == id }
+                bundle = DeletedBundle(folders: [target], scripts: [], deletedAt: Date())
+
+            case .deleteContents:
+                let doomedFolders = library.folders.filter { affected.contains($0.id) }
+                let doomedScripts = library.scripts.filter { affected.contains($0.folderID ?? "") }
+                var moved: [(ScriptMeta, URL?)] = []
+                for meta in doomedScripts {
+                    moved.append((meta, moveToTrash(id: meta.id)))
+                }
+                library.folders.removeAll { affected.contains($0.id) }
+                library.scripts.removeAll { affected.contains($0.folderID ?? "") }
+                bundle = DeletedBundle(folders: doomedFolders, scripts: moved, deletedAt: Date())
+            }
+            return true
+        }
+        if !ok, let pending = bundle {
+            // 색인 저장이 실패했으면 옮긴 파일을 되돌린다(파일과 색인이 어긋나면 안 된다).
+            for (_, url) in pending.scripts { restoreFromTrash(url) }
+            return nil
+        }
+        return ok ? bundle : nil
+    }
+
+    private static func descendantFolderIDs(of id: String, in library: ScriptLibrary) -> Set<String> {
+        var result: Set<String> = []
+        var queue = [id]
+        while let current = queue.popLast() {
+            for child in library.folders where child.parentID == current && !result.contains(child.id) {
+                result.insert(child.id)
+                queue.append(child.id)
+            }
+        }
+        return result
+    }
+
+    // ── 대본 ────────────────────────────────────────────────────────
+
+    @discardableResult
+    static func createScript(title: String, in folderID: String? = nil, text: String = "") -> String? {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let id = UUID().uuidString
+        guard write(id: id, text: text) else { return nil }
+        let ok = mutate { library in
+            if let folder = folderID,
+               !library.folders.contains(where: { $0.id == folder }) { return false }
+            let now = Date()
+            let next = library.scripts.filter { $0.folderID == folderID }.count
+            library.scripts.append(ScriptMeta(id: id, title: trimmed.isEmpty ? "새 대본" : trimmed,
+                                              createdAt: now, updatedAt: now,
+                                              folderID: folderID, sortIndex: next))
+            return true
+        }
+        if !ok {
+            // 색인에 못 넣었으면 방금 만든 파일을 남기지 않는다(목록에 없는 유령 파일 방지).
+            try? FileManager.default.removeItem(at: url(for: id))
+            return nil
+        }
+        return id
+    }
+
+    @discardableResult
+    static func renameScript(id: String, to title: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return mutate { library in
+            guard let i = library.scripts.firstIndex(where: { $0.id == id }) else { return false }
+            library.scripts[i].title = trimmed
+            library.scripts[i].updatedAt = Date()
+            return true
+        }
+    }
+
+    @discardableResult
+    static func moveScript(id: String, toFolder folderID: String?, at index: Int? = nil) -> Bool {
+        mutate { library in
+            guard let current = library.scripts.first(where: { $0.id == id }) else { return false }
+            if let folder = folderID,
+               !library.folders.contains(where: { $0.id == folder }) { return false }
+
+            let sameParent = current.folderID == folderID
+            let siblings = library.scripts
+                .filter { $0.folderID == folderID && $0.id != id }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            let oldIndex = library.scripts
+                .filter { $0.folderID == folderID }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .firstIndex(where: { $0.id == id }) ?? siblings.count
+            var order = siblings
+            let target = min(max(0, adjustedIndex(index ?? order.count, movingFrom: oldIndex,
+                                                  sameParent: sameParent)), order.count)
+            order.insert(id, at: target)
+
+            guard let i = library.scripts.firstIndex(where: { $0.id == id }) else { return false }
+            library.scripts[i].folderID = folderID
+            library.scripts[i].updatedAt = Date()
+            for (position, scriptID) in order.enumerated() {
+                if let j = library.scripts.firstIndex(where: { $0.id == scriptID }) {
+                    library.scripts[j].sortIndex = position
+                }
+            }
+            return true
+        }
+    }
+
+    @discardableResult
+    static func deleteScript(id: String) -> DeletedBundle? {
+        guard !isWriteBlocked else { return nil }
+        var meta: ScriptMeta?
+        var trashed: URL?
+        // 파일을 먼저 옮기고 색인을 고친다. 순서가 반대면 색인에서 사라진 뒤 파일 이동이 실패해
+        // 목록에 없는 유령 파일이 남는다.
+        guard let existing = loadLibrary().scripts.first(where: { $0.id == id }) else { return nil }
+        meta = existing
+        trashed = moveToTrash(id: id)
+
+        let ok = mutate { library in
+            library.scripts.removeAll { $0.id == id }
+            return true
+        }
+        guard ok, let m = meta else {
+            restoreFromTrash(trashed)      // 색인 저장 실패 → 파일 원위치
+            return nil
+        }
+        return DeletedBundle(folders: [], scripts: [(m, trashed)], deletedAt: Date())
+    }
+
+    @discardableResult
+    static func duplicateScript(id: String) -> String? {
+        guard let source = loadLibrary().scripts.first(where: { $0.id == id }) else { return nil }
+        return createScript(title: source.title + " 사본", in: source.folderID,
+                            text: read(id: id) ?? "")
+    }
+
+    @discardableResult
+    static func restore(_ bundle: DeletedBundle) -> Bool {
+        guard !isWriteBlocked else { return false }
+        let library = loadLibrary()
+        // 같은 id 가 이미 있으면 되살리지 않는다(중복 생성 방지).
+        guard !bundle.scripts.contains(where: { entry in
+            library.scripts.contains { $0.id == entry.meta.id }
+        }) else { return false }
+
+        for (_, url) in bundle.scripts { restoreFromTrash(url) }
+        return mutate { lib in
+            for folder in bundle.folders where !lib.folders.contains(where: { $0.id == folder.id }) {
+                lib.folders.append(folder)
+            }
+            for (meta, _) in bundle.scripts where !lib.scripts.contains(where: { $0.id == meta.id }) {
+                lib.scripts.append(meta)
+            }
+            return true
+        }
+    }
+
+    /// 되돌리기 스냅샷. 본문을 메모리에 들고 있지 않고 **휴지통 파일 URL 만** 들고 있는다.
+    struct DeletedBundle {
+        var folders: [ScriptFolder]
+        var scripts: [(meta: ScriptMeta, trashedFile: URL?)]
+        var deletedAt: Date
+    }
+
+    /// 지우지 않고 옮긴다(rename 이라 원자적이고, 복사와 달리 중간 상태가 없다).
+    private static func moveToTrash(id: String) -> URL? {
+        prepare()
+        let source = url(for: id)
+        guard FileManager.default.fileExists(atPath: source.path) else { return nil }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let dest = trashURL.appendingPathComponent("\(id)-\(stamp).md")
+        try? FileManager.default.removeItem(at: dest)
+        do {
+            try FileManager.default.moveItem(at: source, to: dest)
+            try? FileManager.default.removeItem(at: source.appendingPathExtension("bak"))
+            return dest
+        } catch { return nil }
+    }
+
+    private static func restoreFromTrash(_ trashed: URL?) {
+        guard let trashed, FileManager.default.fileExists(atPath: trashed.path) else { return }
+        // 파일명이 <id>-<epoch>.md 이므로 마지막 하이픈 앞이 id 다.
+        let base = trashed.deletingPathExtension().lastPathComponent
+        guard let cut = base.lastIndex(of: "-") else { return }
+        let id = String(base[base.startIndex..<cut])
+        prepare()
+        let dest = url(for: id)
+        try? FileManager.default.removeItem(at: dest)
+        try? FileManager.default.moveItem(at: trashed, to: dest)
+    }
+
+    /// 휴지통이 무한히 커지지 않게 기동 때 한 번 솎는다.
+    /// 되돌리기는 며칠 안에 하는 행동이므로 30일이면 넉넉하고, 개수 상한을 함께 두어
+    /// 하루에 수십 개를 지운 경우에도 디스크가 계속 불어나지 않게 한다.
+    static func pruneTrash(keepDays: Int = 30, keepCount: Int = 50) {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(at: trashURL,
+                                                     includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        let dated = urls.map { url -> (URL, Date) in
+            let d = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            return (url, d ?? .distantPast)
+        }.sorted { $0.1 > $1.1 }        // 최신 먼저
+
+        let cutoff = Date().addingTimeInterval(-Double(keepDays) * 86_400)
+        for (index, entry) in dated.enumerated() where index >= keepCount || entry.1 < cutoff {
+            try? fm.removeItem(at: entry.0)
+        }
+    }
+
+    // MARK: 마이그레이션
+
+    /// v1 → v2. **`library.json` 에만 손댄다. `scripts/*.md` 는 읽지도 쓰지도 않는다.**
+    ///
+    /// 반드시 `loadActiveScript()` 보다 **먼저** 불러야 한다. 그 경로가
+    /// `ensureActiveScript → touch → saveLibrary` 로 이어져 v1 파일 위에 v2 를 얹어 버리기 때문이다.
+    @discardableResult
+    static func migrateIfNeeded() -> Bool {
+        let (library, state) = loadLibraryDetailed()
+        // 의심스러운 파일은 건드리지 않는다. 마이그레이션이야말로 덮어쓰기이므로 가장 위험하다.
+        guard !state.blocksWrites else { return false }
+        guard state != .fresh else { return false }         // 쓸 게 없다
+        guard library.version < ScriptLibrary.currentVersion else { return false }   // 멱등
+
+        // v1 원본을 한 번만 남긴다(이미 있으면 덮어쓰지 않는다 — 두 번째 실행이 첫 백업을 지우면 안 된다).
+        let v1Backup = baseURL.appendingPathComponent("library.v\(library.version).json")
+        if !FileManager.default.fileExists(atPath: v1Backup.path) {
+            try? FileManager.default.copyItem(at: libraryURL, to: v1Backup)
+        }
+
+        var migrated = library
+        migrated.version = ScriptLibrary.currentVersion
+        migrated.folders = []
+        migrated.boards = []
+        // 기존 배열 순서를 그대로 순서로 굳힌다(그 전엔 순서 개념 자체가 없었다).
+        for index in migrated.scripts.indices {
+            migrated.scripts[index].folderID = nil
+            migrated.scripts[index].sortIndex = index
+        }
+        // 실패해도 차단하지 않는다 — v1 파일이 그대로 남아 있고 v2 디코더가 v1 을 읽을 수 있어
+        // 기능적 손실이 없다. 다음 실행에 다시 시도한다.
+        return saveLibrary(migrated)
     }
 
     /// 어디까지 읽었는지 기억한다(재실행 후 이어읽기).
@@ -429,9 +1135,25 @@ enum ScriptStore {
     static func ensureActiveScript() -> (id: String, text: String) {
         prepare()
         let storedID = SettingsStore.shared.settings.activeScriptID
+
+        // ① 저장된 대본이 아직 있으면 그것
         if let id = storedID, exists(id: id) {
             return (id, read(id: id) ?? "")
         }
+
+        // ② 없으면 **남아 있는 대본 중 최신**으로 넘어간다.
+        //    라이브러리에서 활성 대본을 지우면 여기로 오는데, 곧장 ③으로 가면 멀쩡한 대본 옆에
+        //    데모 대본이 새로 생긴다. 격리 도메인으로 테스트를 돌릴 때마다 내용이 똑같은
+        //    "기본 대본" 이 다섯 개 쌓였던 것과 같은 종류의 사고다(build.sh 주석 참조).
+        let survivors = loadLibrary().scripts
+            .filter { exists(id: $0.id) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+        if let next = survivors.first {
+            SettingsStore.shared.update { $0.activeScriptID = next.id }
+            return (next.id, read(id: next.id) ?? "")
+        }
+
+        // ③ 하나도 없을 때만 새로 만든다
         let id = storedID ?? UUID().uuidString
         write(id: id, text: demoScript)
         touch(id: id, title: "기본 대본")
@@ -463,9 +1185,34 @@ class HotkeyManager {
     var onNextSection: (() -> Void)?
     var onPasteClipboard: (() -> Void)?
     var onCheatSheet: (() -> Void)?
+    var onShowLibrary: (() -> Void)?
 
     /// 부팅 시 등록에 실패한 액션(다른 앱이 이미 그 조합을 잡고 있는 경우 등).
     private(set) var failedActions: Set<HotkeyAction> = []
+
+    /// 액션 → 콜백. **이 switch 는 enum 위에서 돌기 때문에 case 를 빠뜨리면 컴파일이 실패한다.**
+    ///
+    /// 예전에는 Carbon 콜백 안에서 `hotKeyID.id`(UInt32)를 switch 했다. 숫자 위 switch 라
+    /// `default: break` 가 있어야 하고, 그러면 **case 를 안 넣어도 컴파일이 통과한다** —
+    /// 단축키는 등록되는데 눌러도 아무 일이 없고 원인을 찾기 어렵다.
+    /// (enum 정의부 주석이 "4곳을 함께 고쳐야 한다" 고 경고하던 자리 중 하나다)
+    func callback(for action: HotkeyAction) -> (() -> Void)? {
+        switch action {
+        case .togglePlay: return onTogglePlay
+        case .scrollUp: return onScrollUp
+        case .scrollDown: return onScrollDown
+        case .toggleVisibility: return onToggleVisibility
+        case .toggleClickThrough: return onToggleClickThrough
+        case .speedUp: return onSpeedUp
+        case .speedDown: return onSpeedDown
+        case .scrollToTop: return onScrollToTop
+        case .previousSection: return onPreviousSection
+        case .nextSection: return onNextSection
+        case .pasteClipboard: return onPasteClipboard
+        case .cheatSheet: return onCheatSheet
+        case .showLibrary: return onShowLibrary
+        }
+    }
 
     init() {
         // Set default hotkey configurations
@@ -508,21 +1255,10 @@ class HotkeyManager {
                 GetEventParameter(theEvent, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
 
                 DispatchQueue.main.async {
-                    switch hotKeyID.id {
-                    case 1: HotkeyManager.shared.onTogglePlay?()
-                    case 2: HotkeyManager.shared.onScrollUp?()
-                    case 3: HotkeyManager.shared.onScrollDown?()
-                    case 4: HotkeyManager.shared.onToggleVisibility?()
-                    case 5: HotkeyManager.shared.onToggleClickThrough?()
-                    case 6: HotkeyManager.shared.onSpeedUp?()
-                    case 7: HotkeyManager.shared.onSpeedDown?()
-                    case 8: HotkeyManager.shared.onScrollToTop?()
-                    case 9: HotkeyManager.shared.onPreviousSection?()
-                    case 10: HotkeyManager.shared.onNextSection?()
-                    case 11: HotkeyManager.shared.onPasteClipboard?()
-                    case 12: HotkeyManager.shared.onCheatSheet?()
-                    default: break
-                    }
+                    // 분기는 여기서 하지 않는다 — callback(for:) 하나만 두어야 액션을 추가할 때
+                    // 컴파일러가 누락을 잡아 준다(위 주석 참조).
+                    guard let action = HotkeyAction(rawValue: Int(hotKeyID.id)) else { return }
+                    HotkeyManager.shared.callback(for: action)?()
                 }
                 return noErr
             }
@@ -1128,6 +1864,7 @@ final class PrompterControlStrip: NSView {
     var onBigger: (() -> Void)?
     var onTop: (() -> Void)?
     var onSettings: (() -> Void)?
+    var onLibrary: (() -> Void)?
 
     private var playButton: NSButton?
     private var hideWork: DispatchWorkItem?
@@ -1147,6 +1884,9 @@ final class PrompterControlStrip: NSView {
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+        // 창이 좁으면 스트립이 fittingWidth 보다 작게 잘리는데, 그때 버튼이 둥근 배경 밖으로
+        // 삐져나가 대본 위에 떠다닌다. 버튼이 하나 늘 때마다 이 경계는 더 자주 걸린다.
+        layer?.masksToBounds = true
         alphaValue = 0
 
         playButton = addButton("▶︎") { [weak self] in self?.onTogglePlay?() }
@@ -1155,6 +1895,7 @@ final class PrompterControlStrip: NSView {
         _ = addButton("가")     { [weak self] in self?.onSmaller?() }
         _ = addButton("가+")    { [weak self] in self?.onBigger?() }
         _ = addButton("처음")   { [weak self] in self?.onTop?() }
+        _ = addButton("대본")   { [weak self] in self?.onLibrary?() }
         _ = addButton("설정")   { [weak self] in self?.onSettings?() }
     }
 
@@ -1918,8 +2659,45 @@ class FineUndoTextView: NSTextView {
     }
 }
 
+/// `.accessory` 앱은 메뉴바를 띄우지 않아 Edit 메뉴의 키 등가물(⌘C/V/X/A/Z)이 동작하지 않을 수 있다.
+///
+/// 대본을 붙여넣는 창에서 ⌘V 가 안 먹으면 앱이 통째로 쓸모없어지므로, 우리 창이 키 윈도우일 때만
+/// 도는 로컬 모니터로 폴백한다. **설정 창과 라이브러리 창이 공용으로 쓴다** — 복붙하면 두 벌이 되고,
+/// 한쪽만 고치는 사고가 난다.
+final class EditKeyFallback {
+    private var monitor: Any?
+
+    /// `window` 를 클로저로 받는 이유: 컨트롤러가 창을 나중에 만들거나 교체해도 따라가야 한다.
+    init(window: @escaping () -> NSWindow?) {
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard let target = window(), target.isKeyWindow,
+                  !HotkeyRecorderField.isRecordingActive else { return event }
+
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags == .command || flags == [.command, .shift] else { return event }
+
+            let shift = flags.contains(.shift)
+            let selector: Selector?
+            switch event.charactersIgnoringModifiers?.lowercased() ?? "" {
+            case "c": selector = #selector(NSText.copy(_:))
+            case "v": selector = #selector(NSText.paste(_:))
+            case "x": selector = #selector(NSText.cut(_:))
+            case "a": selector = #selector(NSText.selectAll(_:))
+            case "z": selector = shift ? Selector(("redo:")) : Selector(("undo:"))
+            default:  selector = nil
+            }
+            guard let sel = selector else { return event }
+            return NSApp.sendAction(sel, to: nil, from: nil) ? nil : event
+        }
+    }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+}
+
 // MARK: - Settings Window Controller
-class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
+class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var prompterController: PrompterWindowController?
     var hotkeyRecorders: [HotkeyAction: HotkeyRecorderField] = [:]
     // viewWithTag 조회 대신 직접 참조를 들고 있는다.
@@ -1935,9 +2713,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     var kernValueLabel: NSTextField?
     var maxLineWidthValueLabel: NSTextField?
     var targetMinutesField: NSTextField?
-    var prompterTextView: FineUndoTextView?  // 텍스트 입력창 참조
-    private var editKeyMonitor: Any?
-    private var livePreviewWorkItem: DispatchWorkItem?
+    private var editKeyFallback: EditKeyFallback?
 
     convenience init(prompterController: PrompterWindowController) {
         let window = NSWindow(
@@ -1966,13 +2742,6 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
 
     /// 대본이 밖(메뉴 전환·클립보드 투입)에서 바뀌면 편집 상자도 따라가야 한다.
     /// 안 그러면 설정창에 옛 대본이 남아 다음 타이핑이 그걸 되살린다.
-    func reloadScriptText() {
-        guard let textView = prompterTextView, let controller = prompterController else { return }
-        let current = controller.prompterView.text
-        guard textView.string != current else { return }
-        livePreviewWorkItem?.cancel()
-        textView.setupInitialText(current)
-    }
 
     private func setupUI() {
         guard let window = window, let prompterController = prompterController else { return }
@@ -2006,44 +2775,20 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         contentView.addSubview(subtitleLabel)
         yOffset -= 50
 
-        // Text input
-        let textLabel = NSTextField(labelWithString: "프롬프터 텍스트:")
-        textLabel.frame = NSRect(x: leftMargin, y: yOffset, width: labelWidth, height: 20)
-        contentView.addSubview(textLabel)
-        yOffset -= 25
+        // 대본 편집은 라이브러리 창으로 옮겼다. 여기 있던 410×100 상자로는
+        // 강의 대본 한 편도 화면에 안 들어왔다. 이 창은 외관·단축키만 담당한다.
+        let libraryButton = NSButton(title: "대본 라이브러리 열기...", target: self,
+                                     action: #selector(openLibrary))
+        libraryButton.frame = NSRect(x: leftMargin, y: yOffset - 4, width: 190, height: 28)
+        libraryButton.bezelStyle = .rounded
+        contentView.addSubview(libraryButton)
 
-        let textScrollView = NSScrollView(frame: NSRect(x: leftMargin, y: yOffset - 80, width: 410, height: 100))
-        let textView = FineUndoTextView(frame: textScrollView.bounds)
-        textView.isEditable = true
-        textView.isRichText = false
-        textView.font = NSFont.systemFont(ofSize: 14)
-        textView.allowsUndo = true
-        textView.autoresizingMask = [.width, .height]
-        textView.delegate = self   // 실시간 반영
-        textScrollView.documentView = textView
-        textScrollView.hasVerticalScroller = true
-        textScrollView.borderType = .bezelBorder
-        contentView.addSubview(textScrollView)
-
-        // Store reference to text view as instance variable
-        self.prompterTextView = textView
-
-        // Set text and clear undo history
-        textView.setupInitialText(prompterController.prompterView.text)
-        yOffset -= 115
-
-        // Apply text button
-        // 타이핑하면 자동 반영되므로 이 버튼은 "지금 즉시 파일에 확정"이라는 의미로 남긴다.
-        let applyTextButton = NSButton(title: "지금 저장", target: self, action: #selector(applyText(_:)))
-        applyTextButton.frame = NSRect(x: leftMargin, y: yOffset, width: 100, height: 28)
-        applyTextButton.bezelStyle = .rounded
-        contentView.addSubview(applyTextButton)
-
-        let autoApplyHint = NSTextField(labelWithString: "입력하면 자동으로 반영·저장됩니다")
-        autoApplyHint.font = NSFont.systemFont(ofSize: 11)
-        autoApplyHint.textColor = .secondaryLabelColor
-        autoApplyHint.frame = NSRect(x: leftMargin + 110, y: yOffset + 4, width: 260, height: 18)
-        contentView.addSubview(autoApplyHint)
+        let libraryHint = NSTextField(labelWithString:
+            "대본 작성·정리는 여기서 (\(HotkeyAction.showLibrary.defaultDisplayString))")
+        libraryHint.font = NSFont.systemFont(ofSize: 11)
+        libraryHint.textColor = .secondaryLabelColor
+        libraryHint.frame = NSRect(x: leftMargin + 200, y: yOffset, width: 230, height: 18)
+        contentView.addSubview(libraryHint)
         yOffset -= 45
 
         // === Appearance Section ===
@@ -2301,15 +3046,18 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         resetButton.bezelStyle = .rounded
         contentView.addSubview(resetButton)
 
-        // 내용이 고정 높이를 넘으면 아래쪽 컨트롤이 잘려 나간다.
-        // (단축키 행이 7개에서 11개로 늘면서 실제로 넘쳤다)
-        // 부족한 만큼 컨테이너를 키우고 전체를 위로 밀어 항상 들어맞게 한다.
+        // 내용이 고정 높이와 안 맞으면 컨테이너를 맞춘다.
+        //
+        // 원래는 "넘칠 때 늘리기" 만 했다(단축키 행이 7개에서 11개로 늘며 실제로 잘렸다).
+        // 그런데 대본 편집 상자(185pt)를 라이브러리 창으로 옮기면서 반대 방향이 생겼다 —
+        // 남는 만큼 줄이지 않으면 창 아래에 빈 공간이 남아 성기게 보인다.
+        // 좌표계가 좌하단 원점이라 두 경우 모두 subview 를 delta 만큼 밀면 된다(부호만 다름).
         let bottomPadding: CGFloat = 20
-        if yOffset < bottomPadding {
-            let deficit = bottomPadding - yOffset
-            contentView.frame.size.height += deficit
+        let delta = bottomPadding - yOffset          // 양수 = 부족, 음수 = 남음
+        if abs(delta) > 0.5 {
+            contentView.frame.size.height += delta
             for subview in contentView.subviews {
-                subview.frame.origin.y += deficit
+                subview.frame.origin.y += delta
             }
         }
 
@@ -2329,31 +3077,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     /// 동작하지 않을 수 있다. 대본을 붙여넣는 창에서 붙여넣기가 안 되면 앱이 무용지물이므로
     /// 설정창이 키 윈도우일 때만 도는 로컬 폴백을 둔다. 메뉴 경로가 살아 있어도 결과는 같다.
     private func installEditKeyFallback() {
-        editKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self = self,
-                  let window = self.window, window.isKeyWindow,
-                  !HotkeyRecorderField.isRecordingActive else { return event }
-
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            guard flags == .command || flags == [.command, .shift] else { return event }
-
-            let shift = flags.contains(.shift)
-            let selector: Selector?
-            switch event.charactersIgnoringModifiers?.lowercased() ?? "" {
-            case "c": selector = #selector(NSText.copy(_:))
-            case "v": selector = #selector(NSText.paste(_:))
-            case "x": selector = #selector(NSText.cut(_:))
-            case "a": selector = #selector(NSText.selectAll(_:))
-            case "z": selector = shift ? Selector(("redo:")) : Selector(("undo:"))
-            default:  selector = nil
-            }
-            guard let sel = selector else { return event }
-            return NSApp.sendAction(sel, to: nil, from: nil) ? nil : event
-        }
-    }
-
-    deinit {
-        if let monitor = editKeyMonitor { NSEvent.removeMonitor(monitor) }
+        editKeyFallback = EditKeyFallback(window: { [weak self] in self?.window })
     }
 
     private func handleHotkeyChange(action: HotkeyAction, keyCode: UInt32, modifiers: UInt32) -> Bool {
@@ -2399,32 +3123,8 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         }
     }
 
-    @objc func applyText(_ sender: NSButton) {
-        guard let textView = prompterTextView, let controller = prompterController else { return }
-        controller.updateScript(textView.string, immediate: true)
-        if !controller.flushScript() {
-            // 조용히 삼키면 사용자는 저장된 줄 안다.
-            let alert = NSAlert()
-            alert.messageText = "대본을 저장하지 못했습니다"
-            alert.informativeText = "화면에는 반영됐지만 파일 쓰기에 실패했습니다.\n\n\(ScriptStore.baseURL.path)"
-            alert.alertStyle = .warning
-            alert.window.sharingType = .none
-            alert.runModal()
-        }
-    }
-
-    // MARK: NSTextViewDelegate — 실시간 반영
-
-    func textDidChange(_ notification: Notification) {
-        guard let textView = prompterTextView, notification.object as? NSTextView === textView else { return }
-        // 화면 반영은 0.3초, 파일 쓰기는 updateScript 안에서 다시 1.5초로 묶인다.
-        livePreviewWorkItem?.cancel()
-        let snapshot = textView.string
-        let work = DispatchWorkItem { [weak self] in
-            self?.prompterController?.updateScript(snapshot)
-        }
-        livePreviewWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    @objc func openLibrary() {
+        prompterController?.showLibrary()
     }
 
     @objc func fontSizeChanged(_ sender: NSSlider) {
@@ -2546,6 +3246,947 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     }
 }
 
+// MARK: - Script Library Window Controller
+
+/// 대본을 폴더로 정리하고 큰 편집기에서 고치는 창.
+///
+/// **이 창은 촬영 중에 열린다.** 그래서 프롬프터 창과 같은 급으로 다룬다 —
+/// 캡처 제외, 전체화면 위로 뜨는 창 레벨, 최소화 차단.
+///
+/// 한 가지 규칙이 UI 전체를 지배한다: **선택은 전환이 아니다.**
+/// 사이드바에서 대본을 클릭하는 것이 라이브 프롬퍼터를 바꿔 버리면 카메라 앞에서 사고가 난다.
+/// 전환은 더블클릭 / ⌘Return / 명시적 버튼으로만 일어난다.
+final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate, NSSplitViewDelegate,
+                                           NSOutlineViewDataSource, NSOutlineViewDelegate,
+                                           NSTextViewDelegate, NSTextFieldDelegate, NSMenuDelegate {
+    /// **weak 이어야 한다.** 프롬프터가 settingsController 를 strong 으로 잡고 있어 이미 순환이 있고
+    /// (AppDelegate 가 프롬프터를 영구 보유해서 증상이 안 났을 뿐이다), 라이브러리 창은 닫혔다
+    /// 열렸다 하므로 같은 실수를 반복하면 실제로 샌다.
+    weak var prompterController: PrompterWindowController?
+
+    private var splitView: NSSplitView!
+    private var outlineView: NSOutlineView!
+    private var editorTextView: FineUndoTextView!
+    private var editorScrollView: NSScrollView!
+    private var titleField: NSTextField!
+    private var loadButton: NSButton!
+    private var statusLabel: NSTextField!
+    private var warningLabel: NSTextField!
+
+    private var roots: [LibraryNode] = []
+    private var editingScriptID: String?
+    /// 프로그램적으로 텍스트를 대입하는 구간. 이 사이의 textDidChange 는 사용자 입력이 아니다.
+    private var isApplyingExternalChange = false
+    private var previewWork: DispatchWorkItem?
+    private var inactiveWriteWork: DispatchWorkItem?
+    private var editKeyFallback: EditKeyFallback?
+    /// 컨텍스트 메뉴에서 "새 …" 를 만들 위치. menuNeedsUpdate 가 정하고 액션이 읽는다.
+    private var newItemDestination: String?
+    /// refreshTree 재진입 차단(위 주석 참조).
+    private var isRefreshingTree = false
+
+    private static let sidebarColumnID = NSUserInterfaceItemIdentifier("name")
+
+    // MARK: 생성
+
+    convenience init(prompterController: PrompterWindowController) {
+        let stored = SettingsStore.shared.settings.libraryWindowFrame
+        let frame = (stored?.count == 4)
+            ? NSRect(x: stored![0], y: stored![1], width: stored![2], height: stored![3])
+            : NSRect(x: 0, y: 0, width: 960, height: 640)
+
+        let window = NSWindow(contentRect: frame,
+                              styleMask: [.titled, .closable, .resizable],
+                              backing: .buffered, defer: false)
+        window.title = "대본 라이브러리"
+        window.minSize = NSSize(width: 640, height: 420)
+
+        // 촬영 중에 여는 창이다. 스텔스는 여기서 직접 건다 —
+        // installStealthGuard 의 didUpdate 감시는 창이 처음 표시된 **뒤에** 오므로 백스톱일 뿐이다.
+        window.sharingType = .none
+
+        // 일반 레벨이면 전체화면 Zoom/OBS 뒤로 숨어 "단축키를 눌렀는데 아무 일도 안 일어난다" 로 보인다.
+        // 프롬프터(statusWindow+1000)보다는 낮게 둬서 대본을 가리지 않는다.
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isReleasedWhenClosed = false
+
+        // 최소화는 styleMask 에 `.miniaturizable` 을 **넣지 않는 것**으로 막는다(버튼은 흐리게 남는다).
+        // 막아야 하는 이유는 둘이다: `.accessory` 앱이라 Dock 에 되돌릴 자리가 없고,
+        // Dock 축소판은 sharingType 보호를 못 받아 녹화에 대본 제목이 찍힌다.
+        //
+        // ⚠️ 버튼을 `isHidden` 으로 감추면 안 된다 — 그 자리가 비면서 macOS 26 의 좌측 정렬
+        // 창 제목이 확대 버튼 위로 겹쳐 그려진다(실기기 확인, 2026-08-02).
+        // 프롬프터 창은 창 자체가 안 보이므로 감춰도 되지만 여기는 보이는 창이다.
+
+        if stored == nil { window.center() }
+
+        self.init(window: window)
+        self.prompterController = prompterController
+        window.delegate = self
+        setupUI()
+        editKeyFallback = EditKeyFallback(window: { [weak self] in self?.window })
+        refreshTree()
+        restoreSelection()
+    }
+
+    // MARK: 레이아웃 (오토레이아웃을 쓰지 않는다 — 파일 전체가 스프링&스트럿이다)
+
+    private func setupUI() {
+        guard let window = window, let content = window.contentView else { return }
+
+        splitView = NSSplitView(frame: content.bounds)
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.autoresizingMask = [.width, .height]
+        splitView.delegate = self
+
+        // ── 좌: 폴더 트리 ──────────────────────────────
+        let sidebarWidth = CGFloat(SettingsStore.shared.settings.librarySidebarWidth)
+        let outlineScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: sidebarWidth,
+                                                       height: content.bounds.height))
+        outlineScroll.hasVerticalScroller = true
+        outlineScroll.autohidesScrollers = true
+        outlineScroll.borderType = .noBorder
+
+        outlineView = NSOutlineView(frame: outlineScroll.bounds)
+        let column = NSTableColumn(identifier: Self.sidebarColumnID)
+        column.width = sidebarWidth - 8
+        column.resizingMask = .autoresizingMask
+        outlineView.addTableColumn(column)
+        // ⚠️ 이 대입을 빠뜨리면 화면이 통째로 비어 보인다(데이터 소스는 정상인데 아무것도 안 그림).
+        outlineView.outlineTableColumn = column
+        outlineView.headerView = nil
+        outlineView.rowSizeStyle = .default
+        outlineView.style = .sourceList
+        outlineView.allowsMultipleSelection = true
+        outlineView.dataSource = self
+        outlineView.delegate = self
+        outlineView.target = self
+        outlineView.doubleAction = #selector(loadSelectedIntoPrompter)
+        let contextMenu = NSMenu()
+        contextMenu.delegate = self       // 열릴 때마다 재구성(선택 상태에 따라 항목이 달라진다)
+        outlineView.menu = contextMenu
+
+        outlineView.registerForDraggedTypes([Self.nodePasteboardType])
+        outlineView.setDraggingSourceOperationMask(.move, forLocal: true)
+        outlineView.setDraggingSourceOperationMask([], forLocal: false)   // 앱 밖으로는 안 나간다
+        outlineView.draggingDestinationFeedbackStyle = .regular
+        outlineScroll.documentView = outlineView
+
+        // ── 우: 헤더 + 편집기 + 상태줄 ──────────────────
+        let rightWidth = content.bounds.width - sidebarWidth - splitView.dividerThickness
+        let right = NSView(frame: NSRect(x: 0, y: 0, width: rightWidth, height: content.bounds.height))
+
+        let headerHeight: CGFloat = 44
+        let footerHeight: CGFloat = 28
+
+        titleField = NSTextField(frame: NSRect(x: 12, y: right.bounds.height - headerHeight + 10,
+                                               width: rightWidth - 160, height: 24))
+        titleField.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        titleField.isBordered = false
+        titleField.drawsBackground = false
+        titleField.isEditable = false          // 이름 변경은 커밋 5에서
+        titleField.stringValue = ""
+        titleField.autoresizingMask = [.width, .minYMargin]
+        right.addSubview(titleField)
+
+        loadButton = NSButton(title: "프롬프터에 올리기", target: self,
+                              action: #selector(loadSelectedIntoPrompter))
+        loadButton.bezelStyle = .rounded
+        loadButton.frame = NSRect(x: rightWidth - 148, y: right.bounds.height - headerHeight + 8,
+                                  width: 136, height: 26)
+        loadButton.keyEquivalent = "\r"
+        loadButton.keyEquivalentModifierMask = [.command]
+        loadButton.autoresizingMask = [.minXMargin, .minYMargin]
+        right.addSubview(loadButton)
+
+        warningLabel = NSTextField(labelWithString: "")
+        warningLabel.frame = NSRect(x: 12, y: right.bounds.height - headerHeight - 2,
+                                    width: rightWidth - 24, height: 16)
+        warningLabel.font = NSFont.systemFont(ofSize: 11)
+        warningLabel.textColor = .systemOrange
+        warningLabel.autoresizingMask = [.width, .minYMargin]
+        warningLabel.isHidden = true
+        right.addSubview(warningLabel)
+
+        editorScrollView = NSScrollView(frame: NSRect(x: 0, y: footerHeight,
+                                                      width: rightWidth,
+                                                      height: right.bounds.height - headerHeight - footerHeight))
+        editorScrollView.hasVerticalScroller = true
+        editorScrollView.borderType = .noBorder
+        editorScrollView.autoresizingMask = [.width, .height]
+
+        editorTextView = FineUndoTextView(frame: editorScrollView.bounds)
+        editorTextView.minSize = NSSize(width: 0, height: 0)
+        editorTextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                        height: CGFloat.greatestFiniteMagnitude)
+        editorTextView.isVerticallyResizable = true
+        editorTextView.isHorizontallyResizable = false
+        editorTextView.autoresizingMask = [.width]
+        editorTextView.isEditable = false        // 선택 전에는 비활성
+        editorTextView.isRichText = false
+        editorTextView.allowsUndo = true
+        editorTextView.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        editorTextView.textContainerInset = NSSize(width: 12, height: 12)
+        // 스마트 따옴표가 들어가면 마크다운 파서가 흔들린다(`**굵게**` 의 별표와 달리 눈에 안 띈다).
+        editorTextView.isAutomaticQuoteSubstitutionEnabled = false
+        editorTextView.isAutomaticDashSubstitutionEnabled = false
+        editorTextView.isAutomaticTextReplacementEnabled = false
+        editorTextView.delegate = self
+        editorScrollView.documentView = editorTextView
+        right.addSubview(editorScrollView)
+
+        statusLabel = NSTextField(labelWithString: "대본을 선택하세요")
+        statusLabel.frame = NSRect(x: 12, y: 6, width: rightWidth - 24, height: 16)
+        statusLabel.font = NSFont.systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.autoresizingMask = [.width, .maxYMargin]
+        right.addSubview(statusLabel)
+
+        splitView.addSubview(outlineScroll)
+        splitView.addSubview(right)
+        content.addSubview(splitView)
+
+        updateWarningBar()
+    }
+
+    /// 색인을 못 써서 저장이 안 되는 상태를 상시 표시한다. 조용히 넘어가면
+    /// 사용자는 "고쳤는데 다음에 열면 원래대로" 를 반복하게 된다.
+    private func updateWarningBar() {
+        guard ScriptStore.isWriteBlocked else {
+            warningLabel.isHidden = true
+            return
+        }
+        warningLabel.stringValue = "⚠︎ 대본 목록이 손상되어 저장이 잠겨 있습니다. 편집 내용이 유지되지 않습니다."
+        warningLabel.isHidden = false
+    }
+
+    // MARK: NSSplitViewDelegate
+
+    /// 기본 비례 분배면 창을 키울 때 사이드바도 같이 넓어진다. 사이드바는 고정, 편집기가 흡수한다.
+    func splitView(_ sv: NSSplitView, resizeSubviewsWithOldSize oldSize: NSSize) {
+        guard sv.subviews.count == 2 else { return }
+        let width = max(0, min(sv.subviews[0].frame.width, sv.bounds.width - 200))
+        let divider = sv.dividerThickness
+        sv.subviews[0].frame = NSRect(x: 0, y: 0, width: width, height: sv.bounds.height)
+        sv.subviews[1].frame = NSRect(x: width + divider, y: 0,
+                                      width: max(0, sv.bounds.width - width - divider),
+                                      height: sv.bounds.height)
+    }
+
+    func splitView(_ sv: NSSplitView, constrainMinCoordinate proposed: CGFloat,
+                   ofSubviewAt index: Int) -> CGFloat { 180 }
+    func splitView(_ sv: NSSplitView, constrainMaxCoordinate proposed: CGFloat,
+                   ofSubviewAt index: Int) -> CGFloat { 420 }
+
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard let first = splitView?.subviews.first else { return }
+        SettingsStore.shared.update { $0.librarySidebarWidth = Double(first.frame.width) }
+    }
+
+    // MARK: 트리 갱신
+
+    /// 펼침/선택을 보존하며 통째로 다시 그린다.
+    ///
+    /// 증분 갱신을 쓰지 않는 이유는 `LibraryNode` 주석 참조 — 매번 새 객체라 증분 API 와
+    /// 조합하면 "이미 지운 항목 참조" 크래시가 나기 쉽다.
+    func refreshTree() {
+        // ⚠️ **재진입 금지.** NSOutlineView 는 reloadData 재진입을 지원하지 않는다
+        // ("NSOutlineView Warning: Reentrant call to reloadData detected").
+        //
+        // 재진입 경로가 실제로 있다: reloadData 가 편집 중인 셀의 필드 에디터를 정리하면서
+        // controlTextDidEndEditing 을 부르고, 거기서 다시 refreshTree 를 부른다.
+        // 그러면 아웃라인이 뒤엉켜 알 수 없는 상태로 멈춘다 — 셀프테스트가 5회 중 5회
+        // NSAlert 안에서 정지했고, 원인이 이 경고였다(2026-08-02).
+        guard !isRefreshingTree else { return }
+        isRefreshingTree = true
+        defer { isRefreshingTree = false }
+
+        // 창을 막 만든 시점에는 아웃라인에 행이 하나도 없어서 "지금 펼쳐진 폴더" 를 물어봐야 답이 없다.
+        // 그 빈 답을 그대로 저장하면 **지난 실행의 펼침 상태가 통째로 지워지고**,
+        // 폴더가 다 접힌 채로 뜨니 그 안의 대본은 행 자체가 없어 선택 복원까지 조용히 실패한다.
+        // 그래서 첫 빌드에서는 반드시 설정에 남아 있는 값을 씨앗으로 삼는다.
+        let expanded = outlineView.numberOfRows > 0
+            ? expandedFolderIDs()
+            : SettingsStore.shared.settings.libraryExpandedFolderIDs
+        let selected = selectedNodeIDs()
+
+        roots = LibraryTree.build(from: ScriptStore.loadLibrary())
+        outlineView.reloadData()
+
+        var byID: [String: LibraryNode] = [:]
+        func index(_ nodes: [LibraryNode]) {
+            for node in nodes { byID[node.id] = node; index(node.children) }
+        }
+        index(roots)
+
+        for id in expanded {
+            if let node = byID[id] { outlineView.expandItem(node) }
+        }
+        let rows = selected.compactMap { byID[$0] }.map { outlineView.row(forItem: $0) }.filter { $0 >= 0 }
+        outlineView.selectRowIndexes(IndexSet(rows), byExtendingSelection: false)
+
+        SettingsStore.shared.update { $0.libraryExpandedFolderIDs = expandedFolderIDs() }
+        updateWarningBar()
+    }
+
+    /// **화면에 지금 펼쳐져 있는** 폴더. 아웃라인이 비어 있으면 빈 배열이다(설정값이 아니다) —
+    /// 호출부가 그 차이를 알고 써야 한다.
+    private func expandedFolderIDs() -> [String] {
+        guard outlineView != nil else { return [] }
+        var result: [String] = []
+        for row in 0..<outlineView.numberOfRows {
+            if let node = outlineView.item(atRow: row) as? LibraryNode,
+               node.isFolder, outlineView.isItemExpanded(node) {
+                result.append(node.id)
+            }
+        }
+        return result
+    }
+
+    private func selectedNodeIDs() -> [String] {
+        outlineView.selectedRowIndexes.compactMap {
+            (outlineView.item(atRow: $0) as? LibraryNode)?.id
+        }
+    }
+
+    private func restoreSelection() {
+        // 저장된 선택이 없으면 활성 대본을 고른다 — 창을 열면 지금 쓰는 대본이 바로 보이게.
+        let wanted = SettingsStore.shared.settings.libraryLastSelectedID
+            ?? prompterController?.activeScriptID
+        guard let wanted else { return }
+        for row in 0..<outlineView.numberOfRows {
+            if let node = outlineView.item(atRow: row) as? LibraryNode, node.id == wanted {
+                outlineView.selectRowIndexes([row], byExtendingSelection: false)
+                return
+            }
+        }
+    }
+
+    // MARK: NSOutlineViewDataSource
+
+    func outlineView(_ ov: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        (item as? LibraryNode)?.children.count ?? roots.count
+    }
+
+    func outlineView(_ ov: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        (item as? LibraryNode)?.children[index] ?? roots[index]
+    }
+
+    func outlineView(_ ov: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        (item as? LibraryNode)?.isFolder ?? false
+    }
+
+    // MARK: NSOutlineViewDelegate
+
+    func outlineView(_ ov: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard let node = item as? LibraryNode else { return nil }
+
+        let cell = NSTableCellView()
+        let image = NSImageView(frame: NSRect(x: 2, y: 2, width: 16, height: 16))
+        image.imageScaling = .scaleProportionallyDown
+        let symbol = node.isFolder ? "folder" : "doc.plaintext"
+        image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        image.contentTintColor = node.isFolder ? .secondaryLabelColor : .tertiaryLabelColor
+        cell.addSubview(image)
+        cell.imageView = image
+
+        let isActive = !node.isFolder && node.id == prompterController?.activeScriptID
+        let label = NSTextField(labelWithString: (isActive ? "● " : "") + node.title)
+        label.frame = NSRect(x: 22, y: 1, width: 400, height: 18)
+        label.lineBreakMode = .byTruncatingTail
+        label.autoresizingMask = [.width]
+        // 지금 카메라에 나가는 대본을 구분하는 유일한 신호다.
+        label.font = isActive ? NSFont.boldSystemFont(ofSize: 13) : NSFont.systemFont(ofSize: 13)
+        // 이름 변경이 어떤 항목인지 알아야 하는데, 편집이 끝나는 시점엔 클릭한 행이 이미 없을 수 있다.
+        // 그래서 뷰 자체에 id 를 실어 둔다.
+        label.identifier = NSUserInterfaceItemIdentifier(node.id)
+        label.delegate = self
+        label.isEditable = false          // 이름 변경 명령을 받았을 때만 켠다
+        cell.addSubview(label)
+        cell.textField = label
+        return cell
+    }
+
+    func outlineViewSelectionDidChange(_ notification: Notification) {
+        // 선택이 바뀌기 전에 예약된 쓰기를 확정한다 — 안 그러면 1.5초 뒤 디바운스가
+        // 이미 떠난 대본에 지금 편집기 내용을 쓴다.
+        flushPendingEdits()
+
+        let selected = outlineView.selectedRowIndexes.compactMap {
+            outlineView.item(atRow: $0) as? LibraryNode
+        }
+        guard selected.count == 1, let node = selected.first, !node.isFolder else {
+            showEditor(for: nil)
+            return
+        }
+        showEditor(for: node.id)
+        SettingsStore.shared.update { $0.libraryLastSelectedID = node.id }
+    }
+
+    func outlineViewItemDidExpand(_ notification: Notification) {
+        SettingsStore.shared.update { $0.libraryExpandedFolderIDs = expandedFolderIDs() }
+    }
+
+    func outlineViewItemDidCollapse(_ notification: Notification) {
+        SettingsStore.shared.update { $0.libraryExpandedFolderIDs = expandedFolderIDs() }
+    }
+
+    // MARK: 편집기
+
+    private func showEditor(for id: String?) {
+        editingScriptID = id
+        isApplyingExternalChange = true
+        defer { isApplyingExternalChange = false }
+
+        guard let id, let meta = ScriptStore.loadLibrary().scripts.first(where: { $0.id == id }) else {
+            editorTextView.setupInitialText("")
+            editorTextView.isEditable = false
+            titleField.stringValue = ""
+            statusLabel.stringValue = "대본을 선택하세요"
+            loadButton.isEnabled = false
+            return
+        }
+        let text = ScriptStore.read(id: id) ?? ""
+        editorTextView.setupInitialText(text)
+        editorTextView.isEditable = true
+        titleField.stringValue = meta.title
+        loadButton.isEnabled = true
+        updateStatus(charCount: text.count, saved: nil)
+    }
+
+    private func updateStatus(charCount: Int, saved: Date?) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let savedText = saved.map { " · 저장 \(formatter.string(from: $0))" } ?? ""
+        let active = editingScriptID == prompterController?.activeScriptID ? " · 프롬프터에 표시 중" : ""
+        statusLabel.stringValue = "\(charCount)자\(savedText)\(active)"
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard !isApplyingExternalChange, let id = editingScriptID else { return }
+        let snapshot = editorTextView.string
+        previewWork?.cancel()
+        inactiveWriteWork?.cancel()
+
+        if id == prompterController?.activeScriptID {
+            // 활성 대본 — 설정 창이 하던 것과 완전히 같은 경로.
+            // 0.3초 뒤 화면 반영, updateScript 안에서 다시 1.5초 뒤 파일 쓰기.
+            let work = DispatchWorkItem { [weak self] in
+                self?.prompterController?.updateScript(snapshot)
+                self?.updateStatus(charCount: snapshot.count, saved: Date())
+            }
+            previewWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        } else {
+            // 비활성 대본 — 미리보기 대상이 없으므로 0.3초 단계가 무의미하다. 한 단계만.
+            // **id 를 캡처**해야 쓰기 직전에 선택이 바뀌어도 엉뚱한 대본에 쓰지 않는다.
+            let work = DispatchWorkItem { [weak self] in
+                ScriptStore.write(id: id, text: snapshot)
+                ScriptStore.touch(id: id)
+                self?.updateStatus(charCount: snapshot.count, saved: Date())
+            }
+            inactiveWriteWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        }
+        updateStatus(charCount: snapshot.count, saved: nil)
+    }
+
+    /// 예약된 쓰기를 즉시 확정한다. 선택 변경·창 닫기·앱 전환·삭제 직전에 부른다.
+    func flushPendingEdits() {
+        if let work = previewWork { work.cancel(); previewWork = nil; work.perform() }
+        if let work = inactiveWriteWork { work.cancel(); inactiveWriteWork = nil; work.perform() }
+        prompterController?.flushScript()
+    }
+
+    // MARK: 드래그앤드롭
+
+    /// 사설 타입 하나만 싣는다.
+    ///
+    /// `.fileURL` 이나 `.string` 을 함께 실으면 다른 앱으로 실수로 끌어 놓았을 때
+    /// **대본 파일 경로가 새어 나간다**(스텔스 앱에서 그건 곧 대본 유출이다).
+    /// 외부 드롭을 받을 계획도 없으므로 걸러야 할 케이스를 아예 만들지 않는다.
+    static let nodePasteboardType = NSPasteboard.PasteboardType("com.shadowcue.library-node")
+
+    func outlineView(_ ov: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
+        guard let node = item as? LibraryNode, !ScriptStore.isWriteBlocked else { return nil }
+        let entry = NSPasteboardItem()
+        entry.setString(node.id, forType: Self.nodePasteboardType)
+        return entry
+    }
+
+    private func draggedNodes(from info: NSDraggingInfo) -> [LibraryNode] {
+        guard let items = info.draggingPasteboard.pasteboardItems else { return [] }
+        let ids = items.compactMap { $0.string(forType: Self.nodePasteboardType) }
+        var byID: [String: LibraryNode] = [:]
+        func index(_ nodes: [LibraryNode]) { for n in nodes { byID[n.id] = n; index(n.children) } }
+        index(roots)
+        return ids.compactMap { byID[$0] }
+    }
+
+    private func isDescendant(_ candidate: LibraryNode?, of ancestor: LibraryNode) -> Bool {
+        var cursor = candidate
+        while let current = cursor {
+            if current === ancestor { return true }
+            cursor = current.parent
+        }
+        return false
+    }
+
+    func outlineView(_ ov: NSOutlineView, validateDrop info: NSDraggingInfo,
+                     proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
+        // 앱 안에서 시작한 드래그만 받는다.
+        guard info.draggingSource as? NSOutlineView === ov, !ScriptStore.isWriteBlocked else { return [] }
+        let dragged = draggedNodes(from: info)
+        guard !dragged.isEmpty else { return [] }
+
+        // 대본 "위에" 떨어뜨리는 건 의미가 없다(대본은 자식을 가질 수 없다).
+        // 거부하는 대신 그 대본이 있는 폴더로 재조준한다 — 사용자 의도는 대개 그쪽이다.
+        if let target = item as? LibraryNode, !target.isFolder, index == NSOutlineViewDropOnItemIndex {
+            ov.setDropItem(target.parent, dropChildIndex: NSOutlineViewDropOnItemIndex)
+            return .move
+        }
+
+        // 폴더를 자기 자신이나 자손 안으로 넣으면 트리가 끊겨 **대본이 통째로 사라진 것처럼 보인다.**
+        // 저장 계층의 moveFolder 도 거부하지만, 여기서 막아야 드롭 표시가 안 뜬다.
+        if let target = item as? LibraryNode {
+            for node in dragged where node.isFolder {
+                if isDescendant(target, of: node) { return [] }
+            }
+        }
+        return .move
+    }
+
+    func outlineView(_ ov: NSOutlineView, acceptDrop info: NSDraggingInfo,
+                     item: Any?, childIndex index: Int) -> Bool {
+        let dragged = draggedNodes(from: info)
+        guard !dragged.isEmpty else { return false }
+        let destination = (item as? LibraryNode)?.id      // nil = 최상위
+
+        flushPendingEdits()
+        // 여러 개를 끌었으면 **화면에 보이던 순서대로** 처리해야 최종 배치가 눈과 일치한다.
+        var cursor = index
+        var moved = false
+        for node in dragged {
+            let ok = node.isFolder
+                ? ScriptStore.moveFolder(id: node.id, toParent: destination,
+                                         at: index == NSOutlineViewDropOnItemIndex ? nil : cursor)
+                : ScriptStore.moveScript(id: node.id, toFolder: destination,
+                                         at: index == NSOutlineViewDropOnItemIndex ? nil : cursor)
+            if ok {
+                moved = true
+                if index != NSOutlineViewDropOnItemIndex { cursor += 1 }
+            }
+        }
+        guard moved else { return false }
+        refreshTree()
+        // 옮긴 항목을 다시 고른다 — 안 그러면 사용자가 방금 옮긴 게 어디 갔는지 눈으로 찾아야 한다.
+        let ids = Set(dragged.map(\.id))
+        var rows: [Int] = []
+        for row in 0..<outlineView.numberOfRows {
+            if let node = outlineView.item(atRow: row) as? LibraryNode, ids.contains(node.id) {
+                rows.append(row)
+            }
+        }
+        outlineView.selectRowIndexes(IndexSet(rows), byExtendingSelection: false)
+        return true
+    }
+
+    // MARK: 컨텍스트 메뉴
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        // ⚠️ 선택에 없는 행을 우클릭했으면 **먼저 그 행을 선택한다.**
+        // 안 하면 눈으로 겨눈 항목이 아니라 아까 선택해 둔 다른 항목이 지워진다.
+        //
+        // clickedRow 가 -1 인 경로도 있다(키보드로 메뉴를 열거나 빈 곳을 눌렀을 때).
+        // 그때 target 을 nil 로 두면 선택된 대본이 멀쩡히 있는데도 "새 대본/새 폴더" 만 나온다.
+        // → currentTargetNode() 와 같은 규칙(클릭 우선, 없으면 선택)을 쓴다.
+        let clicked = outlineView.clickedRow
+        if clicked >= 0 && !outlineView.selectedRowIndexes.contains(clicked) {
+            outlineView.selectRowIndexes([clicked], byExtendingSelection: false)
+        }
+        let target = currentTargetNode()
+
+        // 새로 만들 위치: 폴더를 눌렀으면 그 안, 대본을 눌렀으면 그 대본이 있는 폴더, 빈 곳이면 최상위.
+        let destination: String? = target.flatMap { $0.isFolder ? $0.id : $0.parent?.id }
+
+        func add(_ title: String, _ selector: Selector, enabled: Bool = true) {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = enabled
+            item.representedObject = target
+            menu.addItem(item)
+        }
+
+        let writable = !ScriptStore.isWriteBlocked
+        newItemDestination = destination
+        add("새 대본", #selector(createScriptHere), enabled: writable)
+        add("새 폴더", #selector(createFolderHere), enabled: writable)
+
+        // ⌘Z 는 편집기의 텍스트 되돌리기가 가져가므로, 삭제 되돌리기는 메뉴에만 둔다.
+        // (같은 키에 두 의미를 얹으면 어느 쪽이 동작할지 사용자가 예측할 수 없다)
+        if !lastDeleted.isEmpty {
+            add("삭제 취소", #selector(undoLastDelete), enabled: writable)
+        }
+
+        guard let target else { return }
+        menu.addItem(.separator())
+        add("이름 변경", #selector(renameSelected), enabled: writable)
+        if !target.isFolder {
+            add("복제", #selector(duplicateSelected), enabled: writable)
+            add("프롬프터에 올리기", #selector(loadSelectedIntoPrompter))
+        }
+
+        // 이동 ▸ — 드래그를 못 쓰는 상황(긴 트리, 트랙패드)을 위한 정식 경로.
+        let moveItem = NSMenuItem(title: "이동", action: nil, keyEquivalent: "")
+        moveItem.submenu = buildMoveMenu(for: target)
+        moveItem.isEnabled = writable
+        menu.addItem(moveItem)
+
+        menu.addItem(.separator())
+        add("Finder 에서 보기", #selector(revealSelectedInFinder), enabled: !target.isFolder)
+        menu.addItem(.separator())
+        add("삭제", #selector(deleteSelected), enabled: writable)
+    }
+
+    private func buildMoveMenu(for node: LibraryNode) -> NSMenu {
+        let menu = NSMenu()
+        let root = NSMenuItem(title: "최상위로", action: #selector(moveSelected(_:)), keyEquivalent: "")
+        root.target = self
+        root.representedObject = nil as String?
+        menu.addItem(root)
+        menu.addItem(.separator())
+
+        // 자기 자신과 자손은 넣지 않는다(넣으면 트리가 끊긴다 — 저장 계층도 거부하지만
+        // 고를 수 있게 두면 "눌렀는데 아무 일도 없다" 가 된다).
+        let library = ScriptStore.loadLibrary()
+        var blocked: Set<String> = []
+        if node.isFolder {
+            blocked.insert(node.id)
+            var queue = [node.id]
+            while let current = queue.popLast() {
+                for child in library.folders where child.parentID == current {
+                    blocked.insert(child.id); queue.append(child.id)
+                }
+            }
+        }
+
+        func addLevel(_ parent: String?, depth: Int) {
+            let siblings = library.folders
+                .filter { $0.parentID == parent }
+                .sorted { $0.sortIndex < $1.sortIndex }
+            for folder in siblings {
+                let item = NSMenuItem(title: String(repeating: "    ", count: depth) + folder.name,
+                                      action: #selector(moveSelected(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = folder.id
+                item.isEnabled = !blocked.contains(folder.id)
+                menu.addItem(item)
+                addLevel(folder.id, depth: depth + 1)
+            }
+        }
+        addLevel(nil, depth: 0)
+        return menu
+    }
+
+    // MARK: 구조 변경 액션
+
+    @objc func createScriptHere() {
+        guard let id = ScriptStore.createScript(title: "새 대본", in: newItemDestination) else {
+            reportWriteFailure(); return
+        }
+        refreshTree()
+        selectAndBeginRename(id)
+    }
+
+    @objc func createFolderHere() {
+        guard let folder = ScriptStore.createFolder(name: "새 폴더", parentID: newItemDestination) else {
+            reportWriteFailure(); return
+        }
+        refreshTree()
+        selectAndBeginRename(folder.id)
+    }
+
+    @objc func duplicateSelected() {
+        guard let node = currentTargetNode(), !node.isFolder else { return }
+        flushPendingEdits()
+        guard let copy = ScriptStore.duplicateScript(id: node.id) else { reportWriteFailure(); return }
+        refreshTree()
+        selectAndBeginRename(copy)
+    }
+
+    @objc func renameSelected() {
+        guard let node = currentTargetNode() else { return }
+        selectAndBeginRename(node.id)
+    }
+
+    @objc func moveSelected(_ sender: NSMenuItem) {
+        guard let node = currentTargetNode() else { return }
+        let destination = sender.representedObject as? String
+        let ok = node.isFolder
+            ? ScriptStore.moveFolder(id: node.id, toParent: destination)
+            : ScriptStore.moveScript(id: node.id, toFolder: destination)
+        if !ok { reportWriteFailure(); return }
+        refreshTree()
+    }
+
+    @objc func revealSelectedInFinder() {
+        guard let node = currentTargetNode(), !node.isFolder else { return }
+        // Finder 는 별도 프로세스라 캡처에 찍힌다. 촬영 중에는 쓰면 안 된다.
+        NSWorkspace.shared.activateFileViewerSelecting([ScriptStore.url(for: node.id)])
+    }
+
+    /// 삭제 — 이 순서가 계약이다. 어기면 유령 파일이 남거나 활성 대본이 사라진 채로 남는다.
+    @objc func deleteSelected() {
+        let nodes = outlineView.selectedRowIndexes.compactMap {
+            outlineView.item(atRow: $0) as? LibraryNode
+        }
+        guard !nodes.isEmpty else { return }
+
+        let scriptIDs = Set(nodes.filter { !$0.isFolder }.map(\.id))
+        let folders = nodes.filter { $0.isFolder }
+
+        if let confirm = deleteConfirmation(scripts: scriptIDs.count, folders: folders.count),
+           confirm != .alertFirstButtonReturn { return }
+
+        // ① 예약된 쓰기부터 정리한다(순서 중요 — 아래 주석 참조)
+        flushPendingEdits()
+        prompterController?.prepareForDeletion(of: scriptIDs)
+
+        // ② 삭제
+        var bundles: [ScriptStore.DeletedBundle] = []
+        for id in scriptIDs {
+            if let bundle = ScriptStore.deleteScript(id: id) { bundles.append(bundle) }
+        }
+        for folder in folders {
+            if let bundle = ScriptStore.deleteFolder(id: folder.id, strategy: .promoteChildren) {
+                bundles.append(bundle)
+            }
+        }
+
+        // ③ 활성 대본이 사라졌으면 프롬프터가 스스로 다음 대본을 고른다
+        prompterController?.libraryDidChange(deleted: scriptIDs)
+
+        lastDeleted = bundles
+        refreshTree()
+        showEditor(for: nil)
+    }
+
+    private func deleteConfirmation(scripts: Int, folders: Int) -> NSApplication.ModalResponse? {
+        // 대본이 없고 빈 폴더만 지우는 건 되돌리기 쉬우므로 묻지 않는다.
+        guard scripts > 0 else { return nil }
+        let alert = NSAlert()
+        alert.window.sharingType = .none        // 촬영 중에 뜰 수 있다
+        alert.messageText = scripts == 1 ? "대본을 삭제할까요?" : "대본 \(scripts)개를 삭제할까요?"
+        alert.informativeText = "지우지 않고 휴지통으로 옮깁니다. 우클릭 메뉴의 '삭제 취소' 로 되돌리거나, "
+            + "30일 안에는 \(ScriptStore.baseURL.appendingPathComponent("trash").path) 에서 직접 꺼낼 수 있습니다."
+        alert.addButton(withTitle: "삭제")
+        alert.addButton(withTitle: "취소")
+        return alert.runModal()
+    }
+
+    /// 직전 삭제 1회분. 되돌리기용.
+    private var lastDeleted: [ScriptStore.DeletedBundle] = []
+
+    @objc func undoLastDelete() {
+        guard !lastDeleted.isEmpty else { return }
+        for bundle in lastDeleted { ScriptStore.restore(bundle) }
+        lastDeleted = []
+        refreshTree()
+    }
+
+    private func currentTargetNode() -> LibraryNode? {
+        let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
+        guard row >= 0 else { return nil }
+        return outlineView.item(atRow: row) as? LibraryNode
+    }
+
+    private func selectAndBeginRename(_ id: String) {
+        for row in 0..<outlineView.numberOfRows {
+            guard let node = outlineView.item(atRow: row) as? LibraryNode, node.id == id else { continue }
+            outlineView.selectRowIndexes([row], byExtendingSelection: false)
+            outlineView.scrollRowToVisible(row)
+            // 만들자마자 이름을 고칠 수 있게 편집 상태로 들어간다("새 대본" 이 쌓이지 않게).
+            if let cell = outlineView.view(atColumn: 0, row: row, makeIfNecessary: true) as? NSTableCellView {
+                cell.textField?.isEditable = true
+                outlineView.window?.makeFirstResponder(cell.textField)
+            }
+            return
+        }
+    }
+
+    private func reportWriteFailure() {
+        updateWarningBar()
+
+        // ⚠️ **저장이 잠긴 상태에서는 모달을 띄우지 않는다.**
+        //
+        // 잠김은 기동 시 한 번 알렸고 창 상단 경고 바가 계속 떠 있다. 여기서 또 띄우면
+        // 실패할 때마다 모달이 쌓인다. 특히 색인을 못 읽는 상태에서는 "현재 이름" 조회도
+        // 실패해 이름이 안 바뀐 편집까지 저장 시도로 분류되므로, **사이드바를 클릭하는 것만으로**
+        // 모달이 뜬다. 셀프테스트가 여기서 반복해 멈춰 발견했다(2026-08-02).
+        guard !ScriptStore.isWriteBlocked else { return }
+
+        // 여기까지 왔으면 예상 밖의 쓰기 실패다(권한·디스크). 조용히 삼키면 사용자는 저장된 줄 안다.
+        let alert = NSAlert()
+        alert.window.sharingType = .none
+        alert.messageText = "대본 목록을 저장하지 못했습니다"
+        alert.informativeText = "저장 경로에 쓸 수 없습니다:\n\(ScriptStore.baseURL.path)"
+        alert.runModal()
+    }
+
+    // MARK: 인라인 이름 변경
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              let id = field.identifier?.rawValue else { return }
+        field.isEditable = false
+
+        let typed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ● 활성 표시가 붙어 있으면 벗겨 낸다(표시는 이름의 일부가 아니다).
+        let cleaned = typed.hasPrefix("● ") ? String(typed.dropFirst(2)) : typed
+
+        let library = ScriptStore.loadLibrary()
+        let isFolder = library.folders.contains { $0.id == id }
+        let currentName = isFolder
+            ? library.folders.first { $0.id == id }?.name
+            : library.scripts.first { $0.id == id }?.title
+
+        // ⚠️ **바뀐 게 없으면 아무것도 하지 않는다.**
+        //
+        // 편집을 "끝내는" 경로는 사용자가 Return 을 친 것 말고도 많다 — 선택이 바뀌거나
+        // 트리를 다시 그리기만 해도 편집 세션이 닫히며 이 델리게이트가 불린다.
+        // 그때마다 저장을 시도하면, 저장이 잠긴 상태에서는 **행을 클릭하는 것만으로 모달이 뜬다.**
+        // (셀프테스트가 이 지점에서 영구히 멈춰 발견했다 — 스택이 selectRowIndexes →
+        //  controlTextDidEndEditing → reportWriteFailure → NSAlert.runModal 이었다)
+        guard !cleaned.isEmpty, cleaned != currentName else {
+            refreshTree()       // 표시를 원래대로 되돌린다(빈 입력·● 접두사 등)
+            return
+        }
+
+        let ok = isFolder
+            ? ScriptStore.renameFolder(id: id, to: cleaned)
+            : ScriptStore.renameScript(id: id, to: cleaned)
+        refreshTree()
+        if !ok { reportWriteFailure() }
+        if id == editingScriptID { showEditor(for: id) }
+    }
+
+    // MARK: 액션
+
+    @objc func loadSelectedIntoPrompter() {
+        guard let node = outlineView.item(atRow: outlineView.selectedRow) as? LibraryNode,
+              !node.isFolder else { return }
+        flushPendingEdits()
+        prompterController?.switchToScript(id: node.id)
+        refreshTree()       // 활성 표시(볼드 + ●) 갱신
+    }
+
+    // MARK: 프롬퍼터 → 라이브러리 (한 방향)
+
+    /// 프롬프터 쪽에서 대본이 바뀌었다. **선택은 건드리지 않는다** — 사용자가 보고 있던 자리를
+    /// 뺏지 않기 위해서다. 활성 표시만 갱신하고, 같은 대본을 편집 중이면 텍스트를 다시 읽는다.
+    func prompterDidSwitchScript(to id: String?) {
+        refreshTree()
+        guard let id, id == editingScriptID else { return }
+        let incoming = ScriptStore.read(id: id) ?? ""
+        // 실제로 루프를 끊는 건 이 동등성 검사다.
+        guard editorTextView.string != incoming else { return }
+        isApplyingExternalChange = true
+        editorTextView.setupInitialText(incoming)
+        isApplyingExternalChange = false
+        updateStatus(charCount: incoming.count, saved: nil)
+    }
+
+    // MARK: NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        flushPendingEdits()
+        saveWindowFrame()
+        SettingsStore.shared.flushNow()
+    }
+
+    func windowDidMove(_ notification: Notification) { saveWindowFrame() }
+    func windowDidResize(_ notification: Notification) { saveWindowFrame() }
+
+    private func saveWindowFrame() {
+        guard let frame = window?.frame else { return }
+        SettingsStore.shared.update {
+            $0.libraryWindowFrame = [Double(frame.origin.x), Double(frame.origin.y),
+                                     Double(frame.width), Double(frame.height)]
+        }
+    }
+
+    // MARK: 셀프테스트 프로브
+
+    /// 창을 띄우지 않고 핵심 뷰를 꺼낸다. 중첩 뷰를 재귀 탐색하는 방식은 취약해서 쓰지 않는다.
+    var layoutProbeForTest: (split: NSSplitView, outline: NSOutlineView, editor: NSTextView)? {
+        guard let splitView, let outlineView, let editorTextView else { return nil }
+        return (splitView, outlineView, editorTextView)
+    }
+
+    var editorScrollFrameForTest: NSRect { editorScrollView?.frame ?? .zero }
+
+    /// 셀프테스트용 — 특정 행을 우클릭했을 때의 컨텍스트 메뉴를 만든다.
+    ///
+    /// GUI 로 검증하기 어려운 부분이라(합성 클릭은 NSMenu 의 추적 루프에서 잘 먹지 않는다)
+    /// 메뉴 구성과 액션 배선을 여기서 직접 확인한다.
+    func contextMenuForTest(selecting id: String) -> NSMenu? {
+        for row in 0..<outlineView.numberOfRows {
+            guard let node = outlineView.item(atRow: row) as? LibraryNode, node.id == id else { continue }
+            outlineView.selectRowIndexes([row], byExtendingSelection: false)
+            guard let menu = outlineView.menu else { return nil }
+            menuNeedsUpdate(menu)
+            return menu
+        }
+        return nil
+    }
+
+    /// 메뉴 항목을 실제로 눌렀을 때와 같은 경로로 실행한다.
+    func performMenuItemForTest(_ item: NSMenuItem) {
+        guard let action = item.action else { return }
+        _ = (item.target as AnyObject).perform(action, with: item)
+    }
+
+    /// 셀프테스트용 — 드래그 검증/수락을 창 없이 태운다.
+    /// (NSDraggingInfo 는 AppKit 이 만들어 주는 타입이라 흉내낼 수 없어, 노드 id 로 대신 받는다)
+    func validateDropForTest(dragging ids: [String], onto targetID: String?,
+                             childIndex: Int = NSOutlineViewDropOnItemIndex) -> Bool {
+        var byID: [String: LibraryNode] = [:]
+        func index(_ nodes: [LibraryNode]) { for n in nodes { byID[n.id] = n; index(n.children) } }
+        index(roots)
+        let dragged = ids.compactMap { byID[$0] }
+        guard !dragged.isEmpty, !ScriptStore.isWriteBlocked else { return false }
+        let target = targetID.flatMap { byID[$0] }
+        for node in dragged where node.isFolder {
+            if isDescendant(target, of: node) { return false }
+        }
+        return true
+    }
+
+    /// 셀프테스트용 — refreshTree 안에서 refreshTree 를 다시 부르면 튕겨 나오는지 본다.
+    /// true = 재진입이 차단됨.
+    func refreshTreeReentrancyProbeForTest() -> Bool {
+        var nestedRan = false
+        isRefreshingTree = true          // "지금 갱신 중" 상태를 만든 뒤
+        let before = roots.count
+        refreshTree()                    // 재진입 시도 — 아무것도 하지 않아야 한다
+        nestedRan = (roots.count != before) || outlineView.numberOfRows < 0
+        isRefreshingTree = false
+        return !nestedRan
+    }
+
+    /// 셀프테스트용 — 셀의 이름 편집이 끝난 상황을 재현한다.
+    func simulateEndEditingForTest(id: String, text: String) {
+        let field = NSTextField(string: text)
+        field.identifier = NSUserInterfaceItemIdentifier(id)
+        controlTextDidEndEditing(Notification(name: NSControl.textDidEndEditingNotification,
+                                              object: field))
+    }
+}
+
 // MARK: - Prompter Window Controller
 class PrompterWindowController: NSWindowController, NSWindowDelegate {
     var prompterView: PrompterView!
@@ -2589,6 +4230,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
     }
 
     var settingsController: SettingsWindowController?
+    var libraryController: ScriptLibraryWindowController?
 
     convenience init() {
         // Create panel that is invisible to screen capture
@@ -2656,6 +4298,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         strip.onBigger = { [weak self] in self?.adjustFontSize(by: 2) }
         strip.onTop = { [weak self] in self?.scrollToTop() }
         strip.onSettings = { [weak self] in self?.showSettings() }
+        strip.onLibrary = { [weak self] in self?.showLibrary() }
     }
 
     func adjustFontSize(by delta: CGFloat) {
@@ -2778,6 +4421,34 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    /// 셀프테스트 프로브 — 파일 쓰기가 예약된 상태인가.
+    var hasPendingScriptWriteForTest: Bool { scriptWriteWorkItem != nil }
+
+    /// 삭제 직전에 부른다. 삭제 대상이 활성 대본이면 예약된 쓰기를 **취소**한다.
+    ///
+    /// 안 하면 1.5초 뒤 디바운스가 방금 지운 id 로 파일을 되살려, **목록에는 없는데
+    /// 디스크에는 있는 유령 대본**이 남는다. 그 파일은 어떤 UI 로도 지울 수 없다.
+    /// 대상이 아니면 반대로 확정 저장한다(지우는 김에 다른 대본까지 잃을 이유는 없다).
+    func prepareForDeletion(of ids: Set<String>) {
+        guard let active = activeScriptID else { return }
+        if ids.contains(active) {
+            scriptWriteWorkItem?.cancel()
+            scriptWriteWorkItem = nil
+        } else {
+            flushScript()
+        }
+    }
+
+    /// 라이브러리에서 구조가 바뀌었다. 활성 대본이 사라졌으면 다음 대본으로 넘어간다.
+    func libraryDidChange(deleted: Set<String>) {
+        guard let active = activeScriptID, deleted.contains(active) else { return }
+        // activeScriptID 를 비워야 ensureActiveScript 가 "저장된 대본이 없다" 로 보고
+        // 남은 것 중 최신을 고른다. 하나도 없으면 거기서 새로 만든다.
+        activeScriptID = nil
+        SettingsStore.shared.update { $0.activeScriptID = nil }
+        loadActiveScript()
+    }
+
     /// 다른 대본으로 전환한다. 현재 대본은 먼저 확정 저장한다.
     func switchToScript(id: String) {
         guard id != activeScriptID else { return }
@@ -2794,7 +4465,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 
         let title = ScriptStore.loadLibrary().scripts.first { $0.id == id }?.title ?? "대본"
         prompterView.overlay.showToast(title)
-        settingsController?.reloadScriptText()
+        libraryController?.prompterDidSwitchScript(to: id)
     }
 
     func createNewScript() {
@@ -2817,7 +4488,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         prompterView.setText(text, preserveScroll: false)
         updateScript(text, immediate: true)
         prompterView.overlay.showToast("클립보드에서 대본 교체")
-        settingsController?.reloadScriptText()
+        libraryController?.prompterDidSwitchScript(to: activeScriptID)
     }
 
     private func restoreReadingPosition(for id: String, announce: Bool) {
@@ -3167,6 +4838,19 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         settingsController?.window?.makeKeyAndOrderFront(nil)
         settingsController?.showRegistrationFailures()
     }
+
+    /// 대본 라이브러리를 연다. 이미 떠 있으면 앞으로 가져오고 트리를 최신으로 맞춘다
+    /// (창을 닫아 두는 동안 다른 경로로 대본이 바뀌었을 수 있다).
+    func showLibrary() {
+        if libraryController == nil {
+            libraryController = ScriptLibraryWindowController(prompterController: self)
+        } else {
+            libraryController?.refreshTree()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        libraryController?.showWindow(nil)
+        libraryController?.window?.makeKeyAndOrderFront(nil)
+    }
 }
 
 // MARK: - App Delegate
@@ -3184,6 +4868,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 스텔스 가드를 창 생성보다 먼저 건다.
         installStealthGuard()
+
+        // 대본 색인을 v2 로 올린다. **반드시 loadActiveScript() 보다 먼저.**
+        // 그 경로가 ensureActiveScript → touch → saveLibrary 로 이어져,
+        // 정규화되지 않은 v1 파일 위에 v2 를 얹어 버린다.
+        ScriptStore.migrateIfNeeded()
+        ScriptStore.pruneTrash()
+        reportLibraryProblemIfNeeded()
 
         // Create prompter window
         prompterController = PrompterWindowController()
@@ -3247,6 +4938,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 색인을 신뢰할 수 없을 때만 사용자에게 알린다.
+    ///
+    /// 조용히 넘어가면 안 된다 — 쓰기가 차단된 상태에서는 새 대본을 만들어도, 이름을 바꿔도
+    /// 다음 실행에 사라진다. "저장이 안 되는데 아무 말도 없는" 상태가 가장 나쁘다.
+    private func reportLibraryProblemIfNeeded() {
+        switch ScriptStore.lastLoadState {
+        case .fresh, .ok, .repaired:
+            return      // repaired 는 이미 살릴 건 다 살렸고 쓰기도 열려 있다
+        case .futureVersion(let version):
+            let alert = NSAlert()
+            alert.window.sharingType = .none
+            alert.messageText = "대본 목록이 더 새로운 버전에서 만들어졌습니다"
+            alert.informativeText = """
+                목록 형식 v\(version) 은 이 버전(v\(ScriptLibrary.currentVersion))이 모릅니다.
+                여기서 저장하면 새 버전이 기록한 정보가 지워지므로, 대본 목록을 읽기 전용으로 둡니다.
+                최신 ShadowCue 로 여시면 정상 동작합니다.
+                """
+            alert.addButton(withTitle: "읽기 전용으로 계속")
+            alert.runModal()
+        case .corruptTopLevel(let preserved):
+            let alert = NSAlert()
+            alert.window.sharingType = .none
+            alert.messageText = "대본 목록 파일을 읽지 못했습니다"
+            alert.informativeText = """
+                대본 본문(\(ScriptStore.scriptsURL.path))은 그대로 있습니다. 목록만 손상됐습니다.
+                덮어쓰지 않도록 저장을 잠가 두었습니다.
+
+                '목록 다시 만들기' 를 누르면 대본 파일을 훑어 목록을 새로 만듭니다.
+                폴더 구성은 사라지지만 대본은 하나도 잃지 않습니다.
+                \(preserved.map { "\n손상된 원본은 \($0.lastPathComponent) 로 남겨 두었습니다." } ?? "")
+                """
+            alert.addButton(withTitle: "목록 다시 만들기")
+            alert.addButton(withTitle: "읽기 전용으로 계속")
+            if alert.runModal() == .alertFirstButtonReturn {
+                let rebuilt = ScriptStore.rebuildLibraryFromDisk()
+                ScriptStore.unblockWritesAfterRecovery()
+                _ = ScriptStore.saveLibrary(rebuilt)
+            }
+        }
+    }
+
     private func setupHotkeys() {
         let hotkeyManager = HotkeyManager.shared
 
@@ -3298,6 +5030,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.prompterController.toggleCheatSheet()
         }
 
+        hotkeyManager.onShowLibrary = { [weak self] in
+            self?.prompterController.showLibrary()
+        }
+
         hotkeyManager.registerHotkeys()
     }
 
@@ -3328,6 +5064,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         presetItem.submenu = presetMenu
         menu.addItem(presetItem)
         menu.addItem(NSMenuItem.separator())
+
+        // 대본 서브메뉴 안이 아니라 **최상위**에 둔다. 상태아이템 자체가 잘 안 보이는데
+        // (메뉴바가 꽉 찬 맥에서는 아예 가려진다) 어렵게 열었을 때 한 단계 더 들어가게 하면 안 된다.
+        menu.addItem(NSMenuItem(title: "대본 라이브러리...", action: #selector(showLibrary), keyEquivalent: "l"))
 
         scriptMenuItem = NSMenuItem(title: "대본", action: nil, keyEquivalent: "")
         scriptMenuItem?.submenu = NSMenu()
@@ -3541,6 +5281,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let windowMenu = NSMenu(title: "윈도우")
         windowMenu.addItem(NSMenuItem(title: "프롬프터 보이기", action: #selector(showPrompter), keyEquivalent: "1"))
         windowMenu.addItem(NSMenuItem(title: "설정 열기", action: #selector(showSettings), keyEquivalent: "2"))
+        windowMenu.addItem(NSMenuItem(title: "대본 라이브러리", action: #selector(showLibrary), keyEquivalent: "3"))
 
         let windowMenuItem = NSMenuItem()
         windowMenuItem.submenu = windowMenu
@@ -3571,6 +5312,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showSettings() {
         prompterController.showSettings()
+    }
+
+    @objc func showLibrary() {
+        prompterController.showLibrary()
     }
 
     @objc func showAbout() {
@@ -3742,10 +5487,18 @@ func runSettingsLayoutSelfTest() -> Bool {
     }
     let lowest = document.subviews.map { $0.frame.minY }.min() ?? 0
     let highest = document.subviews.map { $0.frame.maxY }.max() ?? 0
-    let ok = lowest >= 0 && highest <= document.frame.height + 0.5
+    let fits = lowest >= 0 && highest <= document.frame.height + 0.5
+
+    // 컨트롤을 **빼도** 맞아야 한다. 예전 보정은 "넘칠 때 늘리기" 만 해서,
+    // 대본 편집 상자(185pt)를 라이브러리 창으로 옮기자 창 아래에 그만큼 빈 공간이 남았다.
+    // 위아래 여백의 합이 이 정도를 넘으면 보정이 한쪽 방향으로만 도는 것이다.
+    let slack = document.frame.height - (highest - lowest)
+    let tight = slack <= 90
+
+    let ok = fits && tight
     print("\(ok ? "PASS" : "FAIL") 설정 창 레이아웃 "
           + "(높이 \(Int(document.frame.height)), 컨트롤 \(document.subviews.count)개, "
-          + "최하단 y=\(Int(lowest)), 최상단 y=\(Int(highest)))")
+          + "최하단 y=\(Int(lowest)), 최상단 y=\(Int(highest)), 여백 \(Int(slack)))")
     return ok
 }
 
@@ -3891,6 +5644,848 @@ func runSupportDirIsolationSelfTest() -> Bool {
     return ok
 }
 
+// MARK: - 라이브러리 트리
+
+/// 아웃라인 뷰 전용 참조 래퍼.
+///
+/// `NSOutlineView` 는 항목을 **객체 동일성**으로 추적하므로 값 타입 배열을 그대로 줄 수 없다.
+/// 색인을 읽을 때마다 새로 만들고 전체 `reloadData` 로 간다 — 증분 API(`insertItems`)는
+/// 매번 새 객체라 "이미 지운 항목을 참조" 크래시가 나기 쉽고, 수십~수백 규모에서
+/// 전체 리로드 비용은 무시할 만하다.
+final class LibraryNode {
+    enum Kind { case folder(ScriptFolder), script(ScriptMeta) }
+    let kind: Kind
+    var children: [LibraryNode] = []
+    weak var parent: LibraryNode?
+
+    init(_ kind: Kind) { self.kind = kind }
+
+    var id: String {
+        switch kind {
+        case .folder(let f): return f.id
+        case .script(let s): return s.id
+        }
+    }
+    var title: String {
+        switch kind {
+        case .folder(let f): return f.name
+        case .script(let s): return s.title
+        }
+    }
+    var isFolder: Bool { if case .folder = kind { return true }; return false }
+    var sortIndex: Int {
+        switch kind {
+        case .folder(let f): return f.sortIndex
+        case .script(let s): return s.sortIndex
+        }
+    }
+}
+
+enum LibraryTree {
+    /// 색인을 트리로 만든다. **순수 함수** — 창 없이 테스트할 수 있다.
+    ///
+    /// 세 가지를 반드시 지킨다:
+    /// 1. 없는 폴더를 가리키는 항목은 **최상위로 승격**한다. 버리면 대본이 사라진 것처럼 보인다.
+    /// 2. `parentID` 순환이 파일에 들어 있어도 방문 집합으로 끊어 유한 트리를 만든다.
+    /// 3. 같은 부모 안에서 폴더가 대본보다 앞에 온다.
+    static func build(from library: ScriptLibrary) -> [LibraryNode] {
+        let validFolderIDs = Set(library.folders.map(\.id))
+
+        // 순환 검출 — 조상 사슬을 따라가다 자기 자신을 만나면 그 폴더는 최상위로 올린다.
+        func rootedParent(of folder: ScriptFolder) -> String? {
+            guard let parent = folder.parentID, validFolderIDs.contains(parent) else { return nil }
+            var seen: Set<String> = [folder.id]
+            var cursor: String? = parent
+            while let current = cursor {
+                if seen.contains(current) { return nil }     // 순환 → 최상위로
+                seen.insert(current)
+                cursor = library.folders.first(where: { $0.id == current })?.parentID
+            }
+            return parent
+        }
+
+        var nodes: [String: LibraryNode] = [:]
+        var effectiveParent: [String: String?] = [:]
+        for folder in library.folders {
+            nodes[folder.id] = LibraryNode(.folder(folder))
+            effectiveParent[folder.id] = rootedParent(of: folder)
+        }
+
+        var roots: [LibraryNode] = []
+        for folder in library.folders {
+            guard let node = nodes[folder.id] else { continue }
+            if let parentID = effectiveParent[folder.id] ?? nil, let parent = nodes[parentID] {
+                node.parent = parent
+                parent.children.append(node)
+            } else {
+                roots.append(node)
+            }
+        }
+        for script in library.scripts {
+            let node = LibraryNode(.script(script))
+            // 고아 대본은 버리지 않고 최상위로 올린다.
+            if let folderID = script.folderID, let parent = nodes[folderID] {
+                node.parent = parent
+                parent.children.append(node)
+            } else {
+                roots.append(node)
+            }
+        }
+
+        func sort(_ list: inout [LibraryNode]) {
+            list.sort { a, b in
+                if a.isFolder != b.isFolder { return a.isFolder }       // 폴더 먼저
+                if a.sortIndex != b.sortIndex { return a.sortIndex < b.sortIndex }
+                return a.title.localizedStandardCompare(b.title) == .orderedAscending
+            }
+            for node in list { sort(&node.children) }
+        }
+        sort(&roots)
+        return roots
+    }
+
+    /// 트리 전체 노드 수. 유실 검출용.
+    static func count(_ roots: [LibraryNode]) -> Int {
+        roots.reduce(0) { $0 + 1 + count($1.children) }
+    }
+}
+
+// MARK: - 대본 라이브러리 셀프테스트
+
+/// 지원 디렉터리를 초기 상태로 되돌린다.
+///
+/// **`SHADOWCUE_SUPPORT_DIR` 이 없으면 아무것도 하지 않는다.** 이 가드가 없으면 실수 한 번에
+/// 사용자의 진짜 대본 라이브러리가 통째로 지워진다. build.sh 는 항상 훅을 주지만 누군가
+/// 바이너리를 손으로 실행할 수 있으므로 코드에서 막는다. 훅이 없으면 호출부가 테스트를 건너뛴다.
+@discardableResult
+func resetSupportDirForTest() -> Bool {
+    guard let dir = ProcessInfo.processInfo.environment["SHADOWCUE_SUPPORT_DIR"],
+          !dir.isEmpty else { return false }
+    try? FileManager.default.removeItem(atPath: dir)
+    ScriptStore.resetWriteBlockForTest()
+    ScriptStore.prepare()
+    return true
+}
+
+private func writeLibraryJSONForTest(_ json: String) {
+    ScriptStore.prepare()
+    try? json.data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+}
+
+/// A. v1 → v2 마이그레이션.
+func runLibraryMigrationSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 라이브러리 마이그레이션 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 마이그레이션: \(label)") }
+    }
+
+    // 스크롤 위치까지 담긴 실제 v1 형태
+    writeLibraryJSONForTest("""
+    {"version":1,"scripts":[
+      {"id":"aaa","title":"첫 대본","createdAt":100,"updatedAt":200,"lastScrollOffset":42.5},
+      {"id":"bbb","title":"둘째 대본","createdAt":300,"updatedAt":400}
+    ]}
+    """)
+    let before = try? Data(contentsOf: ScriptStore.libraryURL)
+
+    check("마이그레이션 성공", ScriptStore.migrateIfNeeded())
+    let lib = ScriptStore.loadLibrary()
+    check("version==2", lib.version == 2)
+    check("대본 2개 보존", lib.scripts.count == 2)
+    check("id 순서 보존", lib.scripts.map(\.id) == ["aaa", "bbb"])
+    check("title 보존", lib.scripts.map(\.title) == ["첫 대본", "둘째 대본"])
+    check("스크롤 위치 보존", lib.scripts.first?.lastScrollOffset == 42.5)
+    check("folderID 전부 nil", lib.scripts.allSatisfy { $0.folderID == nil })
+    check("sortIndex 0..n-1", lib.scripts.map(\.sortIndex) == [0, 1])
+    check("folders/boards 비어 있음", lib.folders.isEmpty && lib.boards.isEmpty)
+
+    let backup = ScriptStore.baseURL.appendingPathComponent("library.v1.json")
+    let backupData = try? Data(contentsOf: backup)
+    check("v1 백업 존재", backupData != nil)
+    check("v1 백업 바이트 동일", backupData == before)
+
+    // 멱등성 — 두 번째 호출은 아무것도 하지 않고, 첫 백업을 덮어쓰지도 않는다
+    check("두 번째 호출은 no-op", ScriptStore.migrateIfNeeded() == false)
+    check("백업이 덮어써지지 않음", (try? Data(contentsOf: backup)) == before)
+    check("재호출 후에도 대본 2개", ScriptStore.loadLibrary().scripts.count == 2)
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 마이그레이션 (v1→v2, 대본 \(lib.scripts.count)개, sortIndex \(lib.scripts.map(\.sortIndex)))")
+    return ok
+}
+
+/// B. 손상된 색인 방어 — **이 테스트가 이번 커밋의 핵심이다.**
+///
+/// 수정 전 코드에서는 `loadLibrary()` 가 디코드 실패 시 조용히 빈 라이브러리를 돌려주고,
+/// 그 뒤 `touch`/`saveScrollOffset` 의 read-modify-write 가 멀쩡한 색인을 덮어썼다.
+func runLibraryCorruptionGuardSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 색인 손상 방어 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 색인 방어: \(label)") }
+    }
+
+    // (1) 파일 없음 = 최초 실행. 쓰기 허용.
+    check("파일 없음 → .fresh", ScriptStore.loadLibraryDetailed().state == .fresh)
+    check(".fresh 는 쓰기 허용", ScriptStore.saveLibrary(ScriptLibrary()))
+
+    // (2) 정상 왕복
+    resetSupportDirForTest()
+    var good = ScriptLibrary()
+    good.scripts = [ScriptMeta(id: "x", title: "정상", createdAt: Date(), updatedAt: Date())]
+    check("정상 저장", ScriptStore.saveLibrary(good))
+    check("정상 → .ok", ScriptStore.loadLibraryDetailed().state == .ok)
+
+    // (3) 최상위 손상 → 차단
+    resetSupportDirForTest()
+    ScriptStore.saveLibrary(good)
+    writeLibraryJSONForTest("{{{ 이건 JSON 이 아니다")
+    let corruptBytes = try? Data(contentsOf: ScriptStore.libraryURL)
+    let corruptState = ScriptStore.loadLibraryDetailed().state
+    if case .corruptTopLevel = corruptState {} else { ok = false; print("FAIL 색인 방어: 손상 판정") }
+    check("쓰기 래치 켜짐", ScriptStore.isWriteBlocked)
+    check("손상 원본 사본 생성", (try? FileManager.default.contentsOfDirectory(atPath: ScriptStore.baseURL.path))?
+        .contains { $0.hasPrefix("library.corrupt-") } == true)
+
+    // ★ 직접 저장이 막히는가
+    check("saveLibrary 거부", ScriptStore.saveLibrary(ScriptLibrary()) == false)
+    check("파일 바이트 무변경(직접)", (try? Data(contentsOf: ScriptStore.libraryURL)) == corruptBytes)
+
+    // ★★ **간접 경로**가 막히는가 — 실제 사고 경로 재현.
+    //    touch 와 saveScrollOffset 은 사용자가 대본을 열어 보기만 해도 불린다.
+    ScriptStore.touch(id: "x", title: "덮어쓰기 시도")
+    ScriptStore.saveScrollOffset(id: "x", offset: 999)
+    check("파일 바이트 무변경(touch/scroll 경유)",
+          (try? Data(contentsOf: ScriptStore.libraryURL)) == corruptBytes)
+    check("마이그레이션도 거부", ScriptStore.migrateIfNeeded() == false)
+
+    // (4) 원소 일부만 손상 → 나머지 생존 + 쓰기 허용
+    resetSupportDirForTest()
+    writeLibraryJSONForTest("""
+    {"version":2,"scripts":[
+      {"id":"ok1","title":"살아남음","createdAt":100,"updatedAt":200},
+      {"title":"id 가 없어 못 살림","createdAt":100,"updatedAt":200}
+    ],"folders":[],"boards":[]}
+    """)
+    let repaired = ScriptStore.loadLibraryDetailed()
+    check("일부 손상 → .repaired(1)", repaired.state == .repaired(dropped: 1))
+    check("정상 원소 생존", repaired.library.scripts.map(\.id) == ["ok1"])
+    check(".repaired 는 쓰기 허용", ScriptStore.isWriteBlocked == false)
+
+    // (5) 미래 버전 → 차단 (다운그레이드한 사용자의 보드를 날리지 않는다)
+    resetSupportDirForTest()
+    writeLibraryJSONForTest("""
+    {"version":99,"scripts":[{"id":"z","title":"미래","createdAt":1,"updatedAt":1}]}
+    """)
+    check("미래 버전 판정", ScriptStore.loadLibraryDetailed().state == .futureVersion(99))
+    check("미래 버전은 쓰기 차단", ScriptStore.saveLibrary(ScriptLibrary()) == false)
+
+    // (6) 디스크에서 복구 — 최종 안전망
+    resetSupportDirForTest()
+    ScriptStore.write(id: "r1", text: "# 복구된 제목\n본문")
+    ScriptStore.write(id: "r2", text: "헤딩 없는 첫 줄\n둘째 줄")
+    ScriptStore.write(id: "r3", text: "")
+    let rebuilt = ScriptStore.rebuildLibraryFromDisk()
+    check("3개 전부 복구", rebuilt.scripts.count == 3)
+    check("헤딩에서 제목", rebuilt.scripts.contains { $0.title == "복구된 제목" })
+    check("첫 줄에서 제목", rebuilt.scripts.contains { $0.title == "헤딩 없는 첫 줄" })
+    check("빈 본문도 제목 부여", rebuilt.scripts.allSatisfy { !$0.title.isEmpty })
+
+    print("\(ok ? "PASS" : "FAIL") 색인 손상 방어 (차단 래치·간접경로·부분복구·디스크재구성)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// G. `Settings` 전방호환 디코더 나열 누락 자동 검출.
+///
+/// 필드를 추가하면서 `init(from:)` 의 나열 블록에 한 줄을 빠뜨리는 실수는 반드시 재발한다.
+/// 컴파일은 되고 "저장은 되는데 다음 실행에 항상 기본값" 이 되므로 눈으로는 안 잡힌다.
+/// 인코딩한 JSON 의 값을 기계적으로 바꿔 넣고 되읽어, 바뀐 값이 하나도 빠짐없이 반영되는지 본다.
+func runSettingsDecoderCoverageSelfTest() -> Bool {
+    guard let baseData = try? JSONEncoder().encode(Settings()),
+          var root = try? JSONSerialization.jsonObject(with: baseData) as? [String: Any] else {
+        print("FAIL 설정 디코더 커버리지 — 인코딩 실패")
+        return false
+    }
+
+    // 기본값과 확실히 다른 값으로 전부 덮는다.
+    var mutatedKeys: [String] = []
+    for (key, value) in root {
+        switch value {
+        case let n as NSNumber:
+            // Bool 과 숫자를 구분한다(NSNumber 는 둘 다 담는다).
+            if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                root[key] = !n.boolValue
+            } else {
+                root[key] = n.doubleValue + 7
+            }
+            mutatedKeys.append(key)
+        case let s as String:
+            root[key] = s + "-변경"
+            mutatedKeys.append(key)
+        case is [Any]:
+            // 배열은 타입을 몰라 안전하게 못 바꾼다. 아래 Optional 왕복에서 따로 검사한다.
+            continue
+        default:
+            continue
+        }
+    }
+
+    guard let mutatedData = try? JSONSerialization.data(withJSONObject: root),
+          let decoded = try? JSONDecoder().decode(Settings.self, from: mutatedData),
+          let roundTrip = try? JSONEncoder().encode(decoded),
+          let after = try? JSONSerialization.jsonObject(with: roundTrip) as? [String: Any] else {
+        print("FAIL 설정 디코더 커버리지 — 왕복 실패")
+        return false
+    }
+
+    // 나열에서 빠진 필드는 기본값으로 남으므로, 바꾼 값과 다르게 나온다.
+    var missing: [String] = []
+    for key in mutatedKeys {
+        let expected = root[key] as? NSObject
+        let actual = after[key] as? NSObject
+        if expected != actual { missing.append(key) }
+    }
+
+    // Optional 필드는 기본 인코딩에 키가 없어 위 방식으로 못 덮는다 → 값을 채워 왕복.
+    var s = Settings()
+    s.windowFrame = [1, 2, 3, 4]
+    s.activeScriptID = "AID"
+    s.fontName = "Menlo"
+    s.libraryWindowFrame = [5, 6, 7, 8]
+    s.libraryLastSelectedID = "LID"
+    s.libraryExpandedFolderIDs = ["f1", "f2"]
+    let optionalOK = (try? JSONEncoder().encode(s))
+        .flatMap { try? JSONDecoder().decode(Settings.self, from: $0) } == s
+
+    let ok = missing.isEmpty && optionalOK
+    print("\(ok ? "PASS" : "FAIL") 설정 디코더 커버리지 "
+          + "(검사 \(mutatedKeys.count)개"
+          + (missing.isEmpty ? "" : ", 나열 누락: \(missing.sorted().joined(separator: ", "))")
+          + ", 옵셔널 왕복=\(optionalOK))")
+    return ok
+}
+
+/// C. 폴더·대본 CRUD.
+func runFolderCRUDSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 폴더·대본 CRUD (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL CRUD: \(label)") }
+    }
+
+    // 폴더 생성·중첩·이름 변경
+    guard let a = ScriptStore.createFolder(name: "LG AX") else {
+        print("FAIL CRUD: 폴더 생성"); return false
+    }
+    guard let b = ScriptStore.createFolder(name: "1차수", parentID: a.id) else {
+        print("FAIL CRUD: 중첩 폴더 생성"); return false
+    }
+    guard let c = ScriptStore.createFolder(name: "손자", parentID: b.id) else {
+        print("FAIL CRUD: 3단 폴더 생성"); return false
+    }
+    check("빈 이름 폴더 거부", ScriptStore.createFolder(name: "   ") == nil)
+    check("없는 부모 거부", ScriptStore.createFolder(name: "x", parentID: "없는폴더") == nil)
+    check("이름 변경", ScriptStore.renameFolder(id: a.id, to: "LG 인화원"))
+    check("빈 이름 변경 거부", ScriptStore.renameFolder(id: a.id, to: "  ") == false)
+    check("이름 반영", ScriptStore.loadLibrary().folders.first { $0.id == a.id }?.name == "LG 인화원")
+
+    // ★ 순환 이동 거부 — 이걸 놓치면 트리가 끊겨 대본이 통째로 사라진 것처럼 보인다
+    let snapshot = ScriptStore.loadLibrary()
+    check("자기 자신을 부모로 거부", ScriptStore.moveFolder(id: a.id, toParent: a.id) == false)
+    check("자식을 부모로 거부", ScriptStore.moveFolder(id: a.id, toParent: b.id) == false)
+    check("손자를 부모로 거부", ScriptStore.moveFolder(id: a.id, toParent: c.id) == false)
+    check("거부 시 라이브러리 무변경", ScriptStore.loadLibrary() == snapshot)
+    check("정상 이동은 허용", ScriptStore.moveFolder(id: c.id, toParent: nil))
+
+    // 대본 생성·이동
+    guard let s1 = ScriptStore.createScript(title: "오프닝", in: a.id, text: "본문1"),
+          let s2 = ScriptStore.createScript(title: "데모", in: a.id, text: "본문2"),
+          let s3 = ScriptStore.createScript(title: "마무리", in: a.id, text: "본문3") else {
+        print("FAIL CRUD: 대본 생성"); return false
+    }
+    func orderIn(_ folder: String?) -> [String] {
+        ScriptStore.loadLibrary().scripts
+            .filter { $0.folderID == folder }
+            .sorted { $0.sortIndex < $1.sortIndex }
+            .map(\.title)
+    }
+    check("생성 순서", orderIn(a.id) == ["오프닝", "데모", "마무리"])
+
+    // ★★ 오프바이원 — at: 은 **원래 목록 기준 삽입 지점**이다(NSOutlineView 드롭 좌표계).
+    //     [오프닝,데모,마무리] 에서 0번을 at:2 로= "데모와 마무리 사이" → [데모,오프닝,마무리].
+    //     보정을 빼면 한 칸 밀려 [데모,마무리,오프닝] 이 된다.
+    check("at:2 = 사이에 끼움", ScriptStore.moveScript(id: s1, toFolder: a.id, at: 2))
+    check("결과 [데모,오프닝,마무리]", orderIn(a.id) == ["데모", "오프닝", "마무리"])
+    check("sortIndex 재정규화",
+          ScriptStore.loadLibrary().scripts.filter { $0.folderID == a.id }
+              .map(\.sortIndex).sorted() == [0, 1, 2])
+
+    // 맨 끝으로 = 원소 개수와 같은 인덱스
+    check("at:3 = 맨 끝", ScriptStore.moveScript(id: s1, toFolder: a.id, at: 3))
+    check("결과 [데모,마무리,오프닝]", orderIn(a.id) == ["데모", "마무리", "오프닝"])
+    // 앞쪽으로 옮길 때는 보정하지 않는다(당겨지지 않으므로)
+    check("at:0 = 맨 앞", ScriptStore.moveScript(id: s1, toFolder: a.id, at: 0))
+    check("결과 [오프닝,데모,마무리]", orderIn(a.id) == ["오프닝", "데모", "마무리"])
+
+    // 폴더 간 이동 / 루트 복귀
+    check("다른 폴더로 이동", ScriptStore.moveScript(id: s2, toFolder: b.id))
+    check("이동 반영", orderIn(b.id) == ["데모"])
+    check("루트로 이동", ScriptStore.moveScript(id: s3, toFolder: nil))
+    check("루트 반영", orderIn(nil).contains("마무리"))
+    check("없는 폴더로 이동 거부", ScriptStore.moveScript(id: s3, toFolder: "없음") == false)
+
+    // 삭제 → 복원 왕복 (본문 바이트까지)
+    let bodyBefore = ScriptStore.read(id: s3)
+    guard let bundle = ScriptStore.deleteScript(id: s3) else {
+        print("FAIL CRUD: 대본 삭제"); return false
+    }
+    check("색인에서 제거", ScriptStore.loadLibrary().scripts.contains { $0.id == s3 } == false)
+    check("scripts/ 에서 사라짐", ScriptStore.exists(id: s3) == false)
+    check("휴지통에 존재", bundle.scripts.first?.trashedFile
+        .map { FileManager.default.fileExists(atPath: $0.path) } == true)
+    check("복원 성공", ScriptStore.restore(bundle))
+    check("복원 후 본문 동일", ScriptStore.read(id: s3) == bodyBefore)
+    check("복원 후 색인 복귀", ScriptStore.loadLibrary().scripts.contains { $0.id == s3 })
+    check("중복 복원 거부", ScriptStore.restore(bundle) == false)
+
+    // 폴더 삭제 — 승격
+    let promoted = ScriptStore.deleteFolder(id: b.id, strategy: .promoteChildren)
+    check("승격 삭제 성공", promoted != nil)
+    check("자식 대본이 부모로 승격",
+          ScriptStore.loadLibrary().scripts.first { $0.id == s2 }?.folderID == a.id)
+    check("승격 시 본문 유지", ScriptStore.exists(id: s2))
+
+    // 폴더 삭제 — 내용까지
+    guard let d = ScriptStore.createFolder(name: "버릴 폴더"),
+          let s4 = ScriptStore.createScript(title: "버려질 대본", in: d.id, text: "x") else {
+        print("FAIL CRUD: 삭제용 폴더 구성"); return false
+    }
+    check("내용 삭제 성공", ScriptStore.deleteFolder(id: d.id, strategy: .deleteContents) != nil)
+    check("폴더 제거", ScriptStore.loadLibrary().folders.contains { $0.id == d.id } == false)
+    check("대본도 제거", ScriptStore.loadLibrary().scripts.contains { $0.id == s4 } == false)
+    check("파일도 이동됨", ScriptStore.exists(id: s4) == false)
+
+    // 복제
+    let dup = ScriptStore.duplicateScript(id: s1)
+    check("복제 성공", dup != nil)
+    check("복제 본문 동일", dup.flatMap { ScriptStore.read(id: $0) } == ScriptStore.read(id: s1))
+
+    // ★ 쓰기 차단 상태에서 모든 CRUD 가 거부되는가
+    resetSupportDirForTest()
+    _ = ScriptStore.createFolder(name: "before")
+    try? "{{{".data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+    _ = ScriptStore.loadLibraryDetailed()               // 래치 켜짐
+    let frozen = try? Data(contentsOf: ScriptStore.libraryURL)
+    check("차단: createFolder", ScriptStore.createFolder(name: "n") == nil)
+    check("차단: createScript", ScriptStore.createScript(title: "n") == nil)
+    check("차단: renameFolder", ScriptStore.renameFolder(id: "x", to: "y") == false)
+    check("차단: moveScript", ScriptStore.moveScript(id: "x", toFolder: nil) == false)
+    check("차단: deleteScript", ScriptStore.deleteScript(id: "x") == nil)
+    check("차단: deleteFolder", ScriptStore.deleteFolder(id: "x") == nil)
+    check("차단 중 파일 무변경", (try? Data(contentsOf: ScriptStore.libraryURL)) == frozen)
+
+    print("\(ok ? "PASS" : "FAIL") 폴더·대본 CRUD (순환거부·오프바이원·삭제복원·차단)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// E. 트리 빌더 — 순수 함수라 파일도 창도 필요 없다.
+func runLibraryTreeSelfTest() -> Bool {
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 트리: \(label)") }
+    }
+    let now = Date()
+    func folder(_ id: String, _ parent: String?, _ order: Int = 0) -> ScriptFolder {
+        ScriptFolder(id: id, name: "F-\(id)", parentID: parent, sortIndex: order,
+                     createdAt: now, updatedAt: now)
+    }
+    func script(_ id: String, _ folder: String?, _ order: Int = 0) -> ScriptMeta {
+        ScriptMeta(id: id, title: "S-\(id)", createdAt: now, updatedAt: now,
+                   folderID: folder, sortIndex: order)
+    }
+
+    // 3단 중첩
+    var lib = ScriptLibrary()
+    lib.folders = [folder("a", nil), folder("b", "a"), folder("c", "b")]
+    lib.scripts = [script("s1", "c"), script("s2", nil)]
+    var roots = LibraryTree.build(from: lib)
+    check("최상위 2개(a + s2)", roots.count == 2)
+    check("총 노드 5개", LibraryTree.count(roots) == 5)
+    check("폴더가 대본보다 앞", roots.first?.isFolder == true)
+    check("3단 깊이", roots.first?.children.first?.children.first?.id == "c")
+
+    // ★ 고아 대본 — 없는 폴더를 가리켜도 버리지 않는다
+    lib = ScriptLibrary()
+    lib.folders = [folder("a", nil)]
+    lib.scripts = [script("orphan", "사라진폴더"), script("normal", "a")]
+    roots = LibraryTree.build(from: lib)
+    check("고아 대본 최상위 승격", roots.contains { $0.id == "orphan" })
+    check("총 노드 수 보존(3)", LibraryTree.count(roots) == 3)
+
+    // ★ 폴더 순환 — 파일에 A→B→A 가 들어 있어도 무한루프 없이 유한 트리
+    lib = ScriptLibrary()
+    lib.folders = [folder("x", "y"), folder("y", "x")]
+    lib.scripts = [script("s", "x")]
+    roots = LibraryTree.build(from: lib)
+    check("순환에도 노드 3개 유지", LibraryTree.count(roots) == 3)
+    check("순환 폴더가 최상위로", roots.contains { $0.id == "x" } || roots.contains { $0.id == "y" })
+
+    // 정렬 규칙
+    lib = ScriptLibrary()
+    lib.folders = [folder("f2", nil, 1), folder("f1", nil, 0)]
+    lib.scripts = [script("s2", nil, 1), script("s1", nil, 0)]
+    roots = LibraryTree.build(from: lib)
+    check("정렬: 폴더(순서) 뒤 대본(순서)", roots.map(\.id) == ["f1", "f2", "s1", "s2"])
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 트리 (중첩·고아승격·순환방어·정렬)")
+    return ok
+}
+
+/// D. 라이브러리 창 — 창을 화면에 띄우지 않고 레이아웃과 창 정책을 검사한다.
+func runLibraryWindowLayoutSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 라이브러리 창 레이아웃 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 라이브러리 창: \(label)") }
+    }
+
+    // 창 프레임 복원이 검사를 흔들지 않도록 저장값을 비운다.
+    SettingsStore.shared.update {
+        $0.libraryWindowFrame = nil
+        $0.librarySidebarWidth = 260
+    }
+    _ = ScriptStore.createScript(title: "테스트 대본", text: "본문")
+
+    let prompter = PrompterWindowController()
+    let library = ScriptLibraryWindowController(prompterController: prompter)
+    guard let window = library.window else {
+        print("FAIL 라이브러리 창: 창 없음"); return false
+    }
+    window.setFrame(NSRect(x: 0, y: 0, width: 960, height: 640), display: false)
+    window.contentView?.layoutSubtreeIfNeeded()
+
+    guard let probe = library.layoutProbeForTest else {
+        print("FAIL 라이브러리 창: 프로브 없음"); return false
+    }
+
+    // ★ 스텔스 — 이 창은 촬영 중에 열린다. 회귀하면 대본이 통째로 녹화에 찍힌다.
+    check("sharingType == .none", window.sharingType == .none)
+    check("floating 레벨", window.level == .floating)
+    check("모든 스페이스", window.collectionBehavior.contains(.canJoinAllSpaces))
+    check("전체화면 보조", window.collectionBehavior.contains(.fullScreenAuxiliary))
+    // 최소화 차단은 styleMask 로 한다. 버튼을 감추면 제목이 확대 버튼과 겹치므로
+    // "감춰졌는지" 가 아니라 "동작하지 않는지" 를 본다.
+    check("styleMask 에 miniaturizable 없음", !window.styleMask.contains(.miniaturizable))
+    check("최소화 버튼 비활성",
+          window.standardWindowButton(.miniaturizeButton)?.isEnabled != true)
+    check("최소화 버튼을 감추지 않음(제목 겹침 방지)",
+          window.standardWindowButton(.miniaturizeButton)?.isHidden != true)
+
+    // 레이아웃
+    let contentWidth = window.contentView?.bounds.width ?? 0
+    check("pane 2개", probe.split.subviews.count == 2)
+    let sidebarWidth = probe.split.subviews[0].frame.width
+    let editorPaneWidth = probe.split.subviews[1].frame.width
+    let sum = sidebarWidth + editorPaneWidth + probe.split.dividerThickness
+    check("pane 폭 합 == 콘텐츠 폭", abs(sum - contentWidth) < 1.5)
+    // ★ "큰 편집기" 요구의 회귀 방지 — 설정 창의 410×100 상자보다 확실히 크다는 걸 수치로 못 박는다.
+    check("편집기 폭 > 500", library.editorScrollFrameForTest.width > 500)
+    check("편집기 높이 > 400", library.editorScrollFrameForTest.height > 400)
+    check("편집기가 FineUndoTextView", probe.editor is FineUndoTextView)
+    // 셀을 실제로 만들어 내는지 본다. 데이터 소스가 멀쩡해도 viewFor 가 nil 을 돌려주면
+    // 행 수만 맞고 화면은 비어 보인다 — 행 수 단정만으로는 안 잡히는 실패다.
+    if let first = probe.outline.item(atRow: 0) {
+        let cell = library.outlineView(probe.outline,
+                                       viewFor: probe.outline.outlineTableColumn,
+                                       item: first) as? NSTableCellView
+        check("셀 뷰 생성됨", cell != nil)
+        check("셀에 제목 표시", (cell?.textField?.stringValue.isEmpty == false))
+    } else {
+        check("행이 하나 이상", false)
+    }
+
+    // 리사이즈 후 — 사이드바는 고정, 편집기가 흡수해야 한다
+    window.setFrame(NSRect(x: 0, y: 0, width: 1280, height: 800), display: false)
+    window.contentView?.layoutSubtreeIfNeeded()
+    let widerSidebar = probe.split.subviews[0].frame.width
+    let widerEditor = probe.split.subviews[1].frame.width
+    check("리사이즈 후 사이드바 유지", abs(widerSidebar - sidebarWidth) < 1.5)
+    check("리사이즈 후 편집기 확장", widerEditor > editorPaneWidth + 200)
+
+    // 트리에 대본이 보이는가
+    check("대본이 트리에 나타남", probe.outline.numberOfRows >= 1)
+
+    // ★ 펼침·선택 복원 — 창을 만드는 시점에 아웃라인이 비어 있어서, 거기서 읽은 빈 값을
+    //   그대로 저장하면 지난 실행의 펼침이 지워지고 폴더 안 대본은 선택 복원까지 실패한다.
+    //   (실기기에서 그대로 재현됐다 — 폴더가 다 접힌 채 뜨고 편집기가 비어 있었다)
+    guard let folder = ScriptStore.createFolder(name: "복원폴더"),
+          let nested = ScriptStore.createScript(title: "폴더 안 대본", in: folder.id, text: "안쪽") else {
+        print("FAIL 라이브러리 창: 복원 테스트용 구성"); return false
+    }
+    SettingsStore.shared.update {
+        $0.libraryExpandedFolderIDs = [folder.id]
+        $0.libraryLastSelectedID = nested
+    }
+    let reopened = ScriptLibraryWindowController(prompterController: prompter)
+    guard let reprobe = reopened.layoutProbeForTest else {
+        print("FAIL 라이브러리 창: 재생성 프로브 없음"); return false
+    }
+    let expandedNow = (0..<reprobe.outline.numberOfRows).compactMap {
+        reprobe.outline.item(atRow: $0) as? LibraryNode
+    }.filter { $0.isFolder && reprobe.outline.isItemExpanded($0) }.map(\.id)
+    check("폴더 펼침 복원", expandedNow.contains(folder.id))
+    check("설정의 펼침 상태가 지워지지 않음",
+          SettingsStore.shared.settings.libraryExpandedFolderIDs.contains(folder.id))
+    let selectedNow = reprobe.outline.selectedRowIndexes.compactMap {
+        (reprobe.outline.item(atRow: $0) as? LibraryNode)?.id
+    }
+    check("폴더 안 대본 선택 복원", selectedNow == [nested])
+    check("선택된 대본 본문이 편집기에", reprobe.editor.string == "안쪽")
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 창 레이아웃 "
+          + "(사이드바 \(Int(sidebarWidth)) / 편집기 \(Int(library.editorScrollFrameForTest.width))"
+          + "×\(Int(library.editorScrollFrameForTest.height)), 스텔스=\(window.sharingType == .none))")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// F. 삭제 3단 계약 — 유령 파일과 활성 대본 증발을 막는다.
+func runScriptDeletionSyncSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 대본 삭제 동기화 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 삭제 동기화: \(label)") }
+    }
+
+    guard let a = ScriptStore.createScript(title: "A", text: "본문 A"),
+          let b = ScriptStore.createScript(title: "B", text: "본문 B") else {
+        print("FAIL 삭제 동기화: 구성"); return false
+    }
+    SettingsStore.shared.update { $0.activeScriptID = a }
+
+    let prompter = PrompterWindowController()
+    prompter.loadActiveScript()
+    check("활성 = A", prompter.activeScriptID == a)
+
+    // ★ 예약된 쓰기가 취소되는가 — 안 되면 1.5초 뒤 디바운스가 지운 파일을 되살린다
+    prompter.updateScript("고치는 중")
+    check("쓰기 예약됨", prompter.hasPendingScriptWriteForTest)
+    prompter.prepareForDeletion(of: [a])
+    check("활성 대본 삭제 전 예약 취소", prompter.hasPendingScriptWriteForTest == false)
+
+    // 삭제 → 활성 승계
+    check("삭제 성공", ScriptStore.deleteScript(id: a) != nil)
+    prompter.libraryDidChange(deleted: [a])
+    check("활성이 A 가 아님", prompter.activeScriptID != a)
+    check("활성이 B 로 승계", prompter.activeScriptID == b)
+    check("승계된 대본 파일 존재", prompter.activeScriptID.map { ScriptStore.exists(id: $0) } == true)
+    check("지운 파일은 되살아나지 않음", ScriptStore.exists(id: a) == false)
+
+    // 비대상 삭제일 때는 예약을 취소하지 않고 **확정**한다(지우는 김에 다른 대본을 잃을 이유가 없다)
+    prompter.updateScript("B 를 고치는 중")
+    check("B 쓰기 예약됨", prompter.hasPendingScriptWriteForTest)
+    prompter.prepareForDeletion(of: ["관계없는id"])
+    check("비대상이면 확정 저장", ScriptStore.read(id: b) == "B 를 고치는 중")
+
+    // 전부 지우면 새로 만든다
+    for meta in ScriptStore.loadLibrary().scripts { _ = ScriptStore.deleteScript(id: meta.id) }
+    prompter.libraryDidChange(deleted: Set([b]))
+    let survivor = prompter.activeScriptID
+    check("전부 지운 뒤 새 대본 생성", survivor != nil)
+    check("새 대본 파일 존재", survivor.map { ScriptStore.exists(id: $0) } == true)
+    check("새 대본이 색인에 있음",
+          ScriptStore.loadLibrary().scripts.contains { $0.id == survivor })
+
+    print("\(ok ? "PASS" : "FAIL") 대본 삭제 동기화 (예약취소·활성승계·유령파일 방지)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// H. 우클릭 메뉴 구성과 액션 배선.
+///
+/// 이 부분은 GUI 로 검증하기 어렵다 — 합성 클릭은 NSMenu 의 자체 이벤트 추적 루프에서
+/// 잘 먹지 않아서, 실기기 시도에서 좌표가 맞는데도 항목이 실행되지 않았다.
+/// 그래서 메뉴를 만들고 액션을 직접 호출하는 경로로 검사한다.
+func runLibraryContextMenuSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 라이브러리 우클릭 메뉴 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 우클릭 메뉴: \(label)") }
+    }
+
+    guard let lg = ScriptStore.createFolder(name: "LG"),
+          let yt = ScriptStore.createFolder(name: "YT"),
+          let script = ScriptStore.createScript(title: "오프닝", in: lg.id, text: "본문") else {
+        print("FAIL 우클릭 메뉴: 구성"); return false
+    }
+    SettingsStore.shared.update { $0.libraryWindowFrame = nil; $0.libraryExpandedFolderIDs = [lg.id, yt.id] }
+
+    let prompter = PrompterWindowController()
+    let library = ScriptLibraryWindowController(prompterController: prompter)
+    guard let menu = library.contextMenuForTest(selecting: script) else {
+        print("FAIL 우클릭 메뉴: 메뉴 없음"); return false
+    }
+
+    let titles = menu.items.map(\.title).filter { !$0.isEmpty }
+    for expected in ["새 대본", "새 폴더", "이름 변경", "복제", "프롬프터에 올리기", "이동", "삭제"] {
+        check("항목 '\(expected)'", titles.contains(expected))
+    }
+
+    // ★ 이동 서브메뉴 — 최상위 + 모든 폴더가 나와야 한다
+    guard let moveItem = menu.items.first(where: { $0.title == "이동" }),
+          let moveMenu = moveItem.submenu else {
+        print("FAIL 우클릭 메뉴: 이동 서브메뉴 없음"); return false
+    }
+    check("이동에 '최상위로'", moveMenu.items.contains { $0.title == "최상위로" })
+    check("이동에 폴더 2개", moveMenu.items.filter { $0.representedObject is String }.count == 2)
+
+    // ★ 실제로 옮겨지는가 (메뉴 액션 배선)
+    guard let toYT = moveMenu.items.first(where: { ($0.representedObject as? String) == yt.id }) else {
+        print("FAIL 우클릭 메뉴: YT 항목 없음"); return false
+    }
+    library.performMenuItemForTest(toYT)
+    check("이동 실행됨",
+          ScriptStore.loadLibrary().scripts.first { $0.id == script }?.folderID == yt.id)
+
+    // 최상위로 되돌리기
+    if let toRoot = moveMenu.items.first(where: { $0.title == "최상위로" }) {
+        library.performMenuItemForTest(toRoot)
+        check("최상위로 이동",
+              ScriptStore.loadLibrary().scripts.first { $0.id == script }?.folderID == nil)
+    }
+
+    // 새 대본은 **우클릭한 항목이 속한 폴더**에 만들어져야 한다
+    guard let inLG = library.contextMenuForTest(selecting: lg.id),
+          let newScript = inLG.items.first(where: { $0.title == "새 대본" }) else {
+        print("FAIL 우클릭 메뉴: 폴더 메뉴 없음"); return false
+    }
+    let before = ScriptStore.loadLibrary().scripts.count
+    library.performMenuItemForTest(newScript)
+    let after = ScriptStore.loadLibrary().scripts
+    check("새 대본 생성", after.count == before + 1)
+    check("새 대본이 우클릭한 폴더 안에",
+          after.contains { $0.folderID == lg.id && $0.title == "새 대본" })
+
+    // 복제
+    if let dupMenu = library.contextMenuForTest(selecting: script),
+       let dup = dupMenu.items.first(where: { $0.title == "복제" }) {
+        let n = ScriptStore.loadLibrary().scripts.count
+        library.performMenuItemForTest(dup)
+        check("복제 실행", ScriptStore.loadLibrary().scripts.count == n + 1)
+        check("복제본 제목", ScriptStore.loadLibrary().scripts.contains { $0.title == "오프닝 사본" })
+    }
+
+    // ★ 이름이 그대로면 저장을 시도하지 않는다.
+    //   편집 세션은 사용자가 Return 을 치지 않아도 닫힌다(선택 변경·트리 재구성).
+    //   그때마다 저장하면, 잠긴 상태에서 **행을 클릭하는 것만으로 모달이 떠 앱이 멈춘다.**
+    //   실제로 이 테스트가 그 지점에서 영구히 멈춰 버그를 찾았다.
+    let renameCount = ScriptStore.loadLibrary().scripts.count
+    library.simulateEndEditingForTest(id: script, text: "오프닝")   // 원래 이름 그대로
+    check("동일 이름은 저장 시도 없음", ScriptStore.loadLibrary().scripts.count == renameCount)
+    library.simulateEndEditingForTest(id: script, text: "   ")      // 빈 입력
+    check("빈 이름은 원래 이름 유지",
+          ScriptStore.loadLibrary().scripts.first { $0.id == script }?.title == "오프닝")
+    library.simulateEndEditingForTest(id: script, text: "바뀐 이름")
+    check("바뀐 이름은 저장됨",
+          ScriptStore.loadLibrary().scripts.first { $0.id == script }?.title == "바뀐 이름")
+
+    // 쓰기가 잠기면 구조 변경 항목이 비활성이어야 한다
+    try? "{{{".data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+    _ = ScriptStore.loadLibraryDetailed()
+    if let locked = library.contextMenuForTest(selecting: script) {
+        let create = locked.items.first { $0.title == "새 대본" }
+        check("잠긴 상태에서 '새 대본' 비활성", create?.isEnabled == false)
+    }
+    // ★★ 잠긴 상태에서는 **어떤 편집 종료도 모달을 띄우면 안 된다.**
+    //
+    // 색인을 못 읽으면 "현재 이름" 조회도 실패해서, 이름이 안 바뀐 편집까지 저장 시도로
+    // 분류된다. 그때 모달을 띄우면 **사이드바를 클릭하는 것만으로** 모달이 뜨고,
+    // 실사용자는 색인이 깨진 상태에서 창을 쓸 수 없게 된다.
+    // 모달이 뜨면 이 줄에서 테스트가 영영 멈추므로, **통과 자체가 검증이다.**
+    library.simulateEndEditingForTest(id: script, text: "바뀐 이름")     // 같은 이름
+    library.simulateEndEditingForTest(id: script, text: "아주 다른 이름")  // 다른 이름
+    library.simulateEndEditingForTest(id: "존재하지 않는 id", text: "x")
+    check("잠긴 상태에서 편집 종료가 모달로 멈추지 않음", true)
+
+    // ★ refreshTree 재진입 — reloadData 안에서 다시 reloadData 를 부르면
+    //   NSOutlineView 가 "Reentrant call to reloadData detected" 를 내고 뒤엉킨다.
+    resetSupportDirForTest()
+    _ = ScriptStore.createScript(title: "재진입", text: "x")
+    let reentrant = ScriptLibraryWindowController(prompterController: prompter)
+    check("재진입 호출이 튕겨 나옴", reentrant.refreshTreeReentrancyProbeForTest())
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 우클릭 메뉴 (구성·이동·생성·복제·잠금)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// I. 드래그앤드롭 가드.
+///
+/// 폴더를 자기 자신이나 자손 안으로 떨어뜨리면 트리가 끊겨 **대본이 통째로 사라진 것처럼 보인다.**
+/// 저장 계층(moveFolder)이 2차 방어를 하지만, 드롭 표시가 뜨는 것 자체를 막아야 한다.
+func runLibraryDragDropSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 라이브러리 드래그앤드롭 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 드래그앤드롭: \(label)") }
+    }
+
+    guard let parent = ScriptStore.createFolder(name: "부모"),
+          let child = ScriptStore.createFolder(name: "자식", parentID: parent.id),
+          let grand = ScriptStore.createFolder(name: "손자", parentID: child.id),
+          let other = ScriptStore.createFolder(name: "남남"),
+          let script = ScriptStore.createScript(title: "대본", in: parent.id, text: "본문") else {
+        print("FAIL 드래그앤드롭: 구성"); return false
+    }
+    SettingsStore.shared.update {
+        $0.libraryWindowFrame = nil
+        $0.libraryExpandedFolderIDs = [parent.id, child.id, grand.id, other.id]
+    }
+    let prompter = PrompterWindowController()
+    let library = ScriptLibraryWindowController(prompterController: prompter)
+
+    // ★ 순환 드롭 거부
+    check("자기 자신 위로 거부", library.validateDropForTest(dragging: [parent.id], onto: parent.id) == false)
+    check("자식 안으로 거부", library.validateDropForTest(dragging: [parent.id], onto: child.id) == false)
+    check("손자 안으로 거부", library.validateDropForTest(dragging: [parent.id], onto: grand.id) == false)
+    // 정상 드롭은 허용
+    check("남 폴더로 허용", library.validateDropForTest(dragging: [parent.id], onto: other.id))
+    check("최상위로 허용", library.validateDropForTest(dragging: [child.id], onto: nil))
+    check("대본은 어디로든 허용", library.validateDropForTest(dragging: [script], onto: grand.id))
+
+    // 쓰기가 잠기면 드래그 자체를 시작하지 않는다
+    try? "{{{".data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+    _ = ScriptStore.loadLibraryDetailed()
+    check("잠긴 상태에서 드롭 거부", library.validateDropForTest(dragging: [script], onto: other.id) == false)
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 드래그앤드롭 (순환거부·정상허용·잠금)")
+    resetSupportDirForTest()
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -3900,15 +6495,28 @@ if CommandLine.arguments.contains("--selftest") {
         print("HOTKEY \(action.name): \(action.defaultDisplayString)")
     }
     print("")
+    // 격리 확인을 **먼저** 한다 — 격리가 깨진 상태에서 파괴적 테스트가 도는 최악의 순서를 피한다.
+    let supportDirOK = runSupportDirIsolationSelfTest()
+    let migrationOK = runLibraryMigrationSelfTest()
+    let corruptionOK = runLibraryCorruptionGuardSelfTest()
+    let decoderOK = runSettingsDecoderCoverageSelfTest()
+    let crudOK = runFolderCRUDSelfTest()
+    let treeOK = runLibraryTreeSelfTest()
+    let libWindowOK = runLibraryWindowLayoutSelfTest()
+    let deleteSyncOK = runScriptDeletionSyncSelfTest()
+    let ctxMenuOK = runLibraryContextMenuSelfTest()
+    let dragDropOK = runLibraryDragDropSelfTest()
+
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
     let mirrorOK = runMirrorSelfTest()
     let mirrorLayoutOK = runMirrorPersistsLayoutSelfTest()
     let buttonsOK = runWindowButtonsSelfTest()
     let cheatOK = runCheatSheetSelfTest()
-    let supportDirOK = runSupportDirIsolationSelfTest()
     exit(persistenceOK && layoutOK && mirrorOK && mirrorLayoutOK
-         && buttonsOK && cheatOK && supportDirOK ? 0 : 1)
+         && buttonsOK && cheatOK && supportDirOK
+         && migrationOK && corruptionOK && decoderOK && crudOK && treeOK
+         && libWindowOK && deleteSyncOK && ctxMenuOK && dragDropOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
