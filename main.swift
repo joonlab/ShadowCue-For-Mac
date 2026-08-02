@@ -36,6 +36,9 @@ enum HotkeyAction: Int, CaseIterable {
     //    이 enum / HotkeyManager 의 콜백 프로퍼티 / 이벤트 핸들러 switch / AppDelegate 배선.
     //    하나만 빠지면 등록은 되는데 아무 일도 안 일어나 원인을 찾기 어렵다.
     case scrollToTop = 8
+    case previousSection = 9
+    case nextSection = 10
+    case pasteClipboard = 11
 
     var name: String {
         switch self {
@@ -47,6 +50,9 @@ enum HotkeyAction: Int, CaseIterable {
         case .speedUp: return "속도 증가"
         case .speedDown: return "속도 감소"
         case .scrollToTop: return "처음으로"
+        case .previousSection: return "이전 섹션"
+        case .nextSection: return "다음 섹션"
+        case .pasteClipboard: return "클립보드를 대본으로"
         }
     }
 
@@ -72,6 +78,9 @@ enum HotkeyAction: Int, CaseIterable {
         case .speedUp: return UInt32(kVK_ANSI_Period)
         case .speedDown: return UInt32(kVK_ANSI_Comma)
         case .scrollToTop: return UInt32(kVK_ANSI_R)
+        case .previousSection: return UInt32(kVK_ANSI_LeftBracket)
+        case .nextSection: return UInt32(kVK_ANSI_RightBracket)
+        case .pasteClipboard: return UInt32(kVK_ANSI_V)
         }
     }
 }
@@ -131,6 +140,8 @@ struct Settings: Codable, Equatable {
     var windowFrame: [Double]?
     var hotkeys: [HotkeyRecord] = []
     var activeScriptID: String?
+    /// 뱃지가 상시 표시되므로 복원해도 "왜 클릭이 안 되지" 상태에 빠지지 않는다.
+    var isClickThrough: Bool = false
 
     init() {}
 
@@ -156,6 +167,7 @@ struct Settings: Codable, Equatable {
         windowFrame       = value(.windowFrame, fallback.windowFrame)
         hotkeys           = value(.hotkeys, fallback.hotkeys)
         activeScriptID    = value(.activeScriptID, fallback.activeScriptID)
+        isClickThrough    = value(.isClickThrough, fallback.isClickThrough)
     }
 }
 
@@ -390,6 +402,9 @@ class HotkeyManager {
     var onSpeedUp: (() -> Void)?
     var onSpeedDown: (() -> Void)?
     var onScrollToTop: (() -> Void)?
+    var onPreviousSection: (() -> Void)?
+    var onNextSection: (() -> Void)?
+    var onPasteClipboard: (() -> Void)?
 
     /// 부팅 시 등록에 실패한 액션(다른 앱이 이미 그 조합을 잡고 있는 경우 등).
     private(set) var failedActions: Set<HotkeyAction> = []
@@ -444,6 +459,9 @@ class HotkeyManager {
                     case 6: HotkeyManager.shared.onSpeedUp?()
                     case 7: HotkeyManager.shared.onSpeedDown?()
                     case 8: HotkeyManager.shared.onScrollToTop?()
+                    case 9: HotkeyManager.shared.onPreviousSection?()
+                    case 10: HotkeyManager.shared.onNextSection?()
+                    case 11: HotkeyManager.shared.onPasteClipboard?()
                     default: break
                     }
                 }
@@ -1093,36 +1111,51 @@ class PrompterView: NSView {
     private func parseMarkdown(_ markdown: String) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let lines = markdown.components(separatedBy: "\n")
+        var anchors: [Int] = []
 
         let baseParagraphStyle = NSMutableParagraphStyle()
         baseParagraphStyle.lineHeightMultiple = lineHeight
         baseParagraphStyle.alignment = .left
+
+        // 제목에는 본문 행간을 그대로 쓰지 않는다. lineHeightMultiple 이 큰 글자에 곱해지면
+        // 제목 줄만 과하게 벌어져 대본이 뚝뚝 끊겨 보인다.
+        let headingParagraphStyle = NSMutableParagraphStyle()
+        headingParagraphStyle.lineHeightMultiple = min(lineHeight, 1.15)
+        headingParagraphStyle.paragraphSpacingBefore = fontSize * 0.4
+        headingParagraphStyle.alignment = .left
 
         for (index, line) in lines.enumerated() {
             var processedLine = line
             var lineFont = NSFont.systemFont(ofSize: fontSize, weight: .medium)
             var lineColor = textColor
             var prefix = ""
+            var isHeading = false
 
             // Headers: #, ##, ###, ####, #####, ######
             if line.hasPrefix("###### ") {
                 processedLine = String(line.dropFirst(7))
                 lineFont = NSFont.systemFont(ofSize: fontSize * 0.85, weight: .semibold)
+                isHeading = true
             } else if line.hasPrefix("##### ") {
                 processedLine = String(line.dropFirst(6))
                 lineFont = NSFont.systemFont(ofSize: fontSize * 0.9, weight: .semibold)
+                isHeading = true
             } else if line.hasPrefix("#### ") {
                 processedLine = String(line.dropFirst(5))
                 lineFont = NSFont.systemFont(ofSize: fontSize * 1.0, weight: .bold)
+                isHeading = true
             } else if line.hasPrefix("### ") {
                 processedLine = String(line.dropFirst(4))
                 lineFont = NSFont.systemFont(ofSize: fontSize * 1.15, weight: .bold)
+                isHeading = true
             } else if line.hasPrefix("## ") {
                 processedLine = String(line.dropFirst(3))
                 lineFont = NSFont.systemFont(ofSize: fontSize * 1.3, weight: .bold)
+                isHeading = true
             } else if line.hasPrefix("# ") {
                 processedLine = String(line.dropFirst(2))
                 lineFont = NSFont.systemFont(ofSize: fontSize * 1.5, weight: .bold)
+                isHeading = true
             }
             // Unordered list: - or *
             else if line.hasPrefix("- ") || line.hasPrefix("* ") {
@@ -1147,6 +1180,13 @@ class PrompterView: NSView {
                 lineColor = textColor.withAlphaComponent(0.5)
             }
 
+            // 섹션 앵커: 제목 줄이 시작하는 문자 위치를 기록해 둔다(섹션 점프용).
+            if isHeading {
+                anchors.append(result.length)
+            }
+
+            let paragraphStyle = isHeading ? headingParagraphStyle : baseParagraphStyle
+
             // Process inline formatting: **bold**, *italic*, ~~strikethrough~~, `code`
             let attributedLine = Self.processInlineMarkdown(processedLine, baseFont: lineFont, baseColor: lineColor)
 
@@ -1155,14 +1195,14 @@ class PrompterView: NSView {
                 let prefixAttr = NSAttributedString(string: prefix, attributes: [
                     .font: lineFont,
                     .foregroundColor: lineColor,
-                    .paragraphStyle: baseParagraphStyle
+                    .paragraphStyle: paragraphStyle
                 ])
                 result.append(prefixAttr)
             }
 
             // Apply paragraph style to the line
             let lineWithStyle = NSMutableAttributedString(attributedString: attributedLine)
-            lineWithStyle.addAttribute(.paragraphStyle, value: baseParagraphStyle, range: NSRange(location: 0, length: lineWithStyle.length))
+            lineWithStyle.addAttribute(.paragraphStyle, value: paragraphStyle, range: NSRange(location: 0, length: lineWithStyle.length))
 
             result.append(lineWithStyle)
 
@@ -1175,7 +1215,45 @@ class PrompterView: NSView {
             }
         }
 
+        sectionAnchors = anchors
         return result
+    }
+
+    // MARK: 섹션 점프
+
+    /// 제목 줄이 시작하는 문자 인덱스 목록(parseMarkdown 이 채운다).
+    private(set) var sectionAnchors: [Int] = []
+
+    /// 문자 인덱스가 문서 좌표계에서 몇 px 지점인지.
+    private func documentY(forCharacterIndex index: Int) -> CGFloat? {
+        guard let layoutManager = textView?.layoutManager,
+              let container = textView?.textContainer,
+              index >= 0, index <= (textView?.string.count ?? 0) else { return nil }
+        let glyphIndex = layoutManager.glyphIndexForCharacter(at: index)
+        let rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyphIndex, length: 1),
+                                              in: container)
+        return rect.minY + (textView?.textContainerInset.height ?? 0)
+    }
+
+    /// 다음/이전 섹션으로 이동. 이동했으면 섹션 번호(1-based)와 총 개수를 돌려준다.
+    func jumpToSection(forward: Bool) -> (index: Int, total: Int)? {
+        guard !sectionAnchors.isEmpty else { return nil }
+        let positions = sectionAnchors.compactMap { documentY(forCharacterIndex: $0) }
+        guard !positions.isEmpty else { return nil }
+
+        let current = scrollOffset
+        let epsilon: CGFloat = 4
+        let target: CGFloat?
+        if forward {
+            target = positions.first { $0 > current + epsilon }
+        } else {
+            target = positions.last { $0 < current - epsilon }
+        }
+        guard let destination = target else { return nil }
+
+        scrollOffset = destination
+        let ordinal = (positions.firstIndex(of: destination) ?? 0) + 1
+        return (ordinal, positions.count)
     }
 
     /// 인스턴스 상태를 쓰지 않는 순수 함수라 static 으로 둔다(--selftest 에서 직접 검사하기 위해).
@@ -1433,6 +1511,16 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     func windowWillClose(_ notification: Notification) {
         // 설정을 만지고 창을 닫는 건 작업 확정이다. 디바운스를 기다리지 않고 기록한다.
         SettingsStore.shared.flushNow()
+    }
+
+    /// 대본이 밖(메뉴 전환·클립보드 투입)에서 바뀌면 편집 상자도 따라가야 한다.
+    /// 안 그러면 설정창에 옛 대본이 남아 다음 타이핑이 그걸 되살린다.
+    func reloadScriptText() {
+        guard let textView = prompterTextView, let controller = prompterController else { return }
+        let current = controller.prompterView.text
+        guard textView.string != current else { return }
+        livePreviewWorkItem?.cancel()
+        textView.setupInitialText(current)
     }
 
     private func setupUI() {
@@ -1806,10 +1894,13 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    /// 복원하지 않는다 — 상태 뱃지가 없는 상태로 복원하면 "창은 보이는데 클릭이 안 먹는"
-    /// 유령 상태가 되어 사용자가 원인을 찾지 못한다.
+    /// 상태 뱃지가 생겼으므로 이제 복원해도 안전하다(해제 방법이 화면에 항상 보인다).
     var isClickThrough = false {
-        didSet { applyWindowChrome() }
+        didSet {
+            guard isClickThrough != oldValue else { return }
+            applyWindowChrome()
+            SettingsStore.shared.update { $0.isClickThrough = isClickThrough }
+        }
     }
 
     var backgroundColor: NSColor = .black {
@@ -1903,6 +1994,9 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         prompterView.lineHeight = CGFloat(settings.lineHeight)
         prompterView.textColor = settings.textColor.nsColor
         scrollSpeed = CGFloat(settings.scrollSpeed)
+
+        isClickThrough = settings.isClickThrough
+        applyClickThroughState()
     }
 
     /// 저장된 창 위치가 지금도 쓸 수 있는지 검증한다.
@@ -1961,16 +2055,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         prompterView.setText(script.text, preserveScroll: false)
 
         // 이어읽기: 텍스트 레이아웃이 끝난 뒤에 적용해야 클램프에 걸리지 않는다.
-        let saved = ScriptStore.scrollOffset(id: script.id)
-        if saved > 1 {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.prompterView.scrollOffset = CGFloat(saved)
-                if self.prompterView.scrollOffset > 1 {
-                    self.prompterView.overlay.showToast("읽던 위치에서 계속")
-                }
-            }
-        }
+        restoreReadingPosition(for: script.id, announce: true)
     }
 
     /// 화면에는 즉시 반영하고, 파일 쓰기만 묶는다.
@@ -1990,6 +2075,60 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
             scriptWriteWorkItem = nil
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        }
+    }
+
+    /// 다른 대본으로 전환한다. 현재 대본은 먼저 확정 저장한다.
+    func switchToScript(id: String) {
+        guard id != activeScriptID else { return }
+        flushScript()
+        guard let text = ScriptStore.read(id: id) else {
+            prompterView.overlay.showToast("대본 파일을 찾을 수 없습니다")
+            return
+        }
+        activeScriptID = id
+        SettingsStore.shared.update { $0.activeScriptID = id }
+        SettingsStore.shared.flushNow()
+        prompterView.setText(text, preserveScroll: false)
+        restoreReadingPosition(for: id, announce: false)
+
+        let title = ScriptStore.loadLibrary().scripts.first { $0.id == id }?.title ?? "대본"
+        prompterView.overlay.showToast(title)
+        settingsController?.reloadScriptText()
+    }
+
+    func createNewScript() {
+        flushScript()
+        let existing = ScriptStore.loadLibrary().scripts.count
+        let id = UUID().uuidString
+        ScriptStore.write(id: id, text: "")
+        ScriptStore.touch(id: id, title: "새 대본 \(existing + 1)")
+        activeScriptID = nil          // switchToScript 의 동일 ID 가드를 통과시키기 위해
+        switchToScript(id: id)
+    }
+
+    /// 촬영 직전 ChatGPT·노션에서 뽑은 대본을 창 하나 안 열고 바로 넣는 최단 경로.
+    func replaceScriptFromClipboard() {
+        guard let text = NSPasteboard.general.string(forType: .string),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            prompterView.overlay.showToast("클립보드가 비어 있습니다")
+            return
+        }
+        prompterView.setText(text, preserveScroll: false)
+        updateScript(text, immediate: true)
+        prompterView.overlay.showToast("클립보드에서 대본 교체")
+        settingsController?.reloadScriptText()
+    }
+
+    private func restoreReadingPosition(for id: String, announce: Bool) {
+        let saved = ScriptStore.scrollOffset(id: id)
+        guard saved > 1 else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.prompterView.scrollOffset = CGFloat(saved)
+            if announce, self.prompterView.scrollOffset > 1 {
+                self.prompterView.overlay.showToast("읽던 위치에서 계속")
+            }
         }
     }
 
@@ -2122,6 +2261,18 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         prompterView.overlay.showToast("처음으로")
     }
 
+    /// 대본의 제목(#, ##, …) 단위로 건너뛴다. 긴 대본에서 원하는 대목을 찾는 가장 빠른 길.
+    func jumpSection(forward: Bool) {
+        guard let moved = prompterView.jumpToSection(forward: forward) else {
+            let reason = prompterView.sectionAnchors.isEmpty
+                ? "섹션 없음 (제목 줄 # 을 쓰면 생깁니다)"
+                : (forward ? "마지막 섹션" : "첫 섹션")
+            prompterView.overlay.showToast(reason)
+            return
+        }
+        prompterView.overlay.showToast("섹션 \(moved.index)/\(moved.total)")
+    }
+
     func toggleVisibility() {
         guard let window = window else { return }
         if window.isVisible {
@@ -2133,14 +2284,17 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 
     func toggleClickThrough() {
         isClickThrough.toggle()
-        window?.ignoresMouseEvents = isClickThrough
-        // 배경 변화는 isClickThrough 의 didSet -> applyWindowChrome() 이 처리한다.
+        applyClickThroughState()
+        prompterView.overlay.showToast(isClickThrough ? "클릭 통과 ON" : "클릭 통과 OFF")
+    }
 
-        // 클릭스루가 켜지면 창을 클릭할 수도, 휠로 스크롤할 수도 없다.
-        // 탈출 수단이 단축키 하나뿐이므로 상태를 **상시** 보여 준다.
+    /// 창의 마우스 통과 여부와 상태 뱃지를 현재 값에 맞춘다.
+    /// 클릭 통과가 켜지면 창을 클릭할 수도 휠로 스크롤할 수도 없어 탈출 수단이 단축키뿐이므로,
+    /// 해제 방법을 **상시** 보여 준다. (배경 어둡기는 didSet -> applyWindowChrome 이 처리)
+    func applyClickThroughState() {
+        window?.ignoresMouseEvents = isClickThrough
         let key = HotkeyManager.shared.hotkeyConfigs[.toggleClickThrough]?.displayString ?? ""
         prompterView.overlay.badgeText = isClickThrough ? "클릭 통과 중 · \(key) 로 해제" : nil
-        prompterView.overlay.showToast(isClickThrough ? "클릭 통과 ON" : "클릭 통과 OFF")
     }
 
     func speedUp() {
@@ -2184,12 +2338,16 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 }
 
 // MARK: - App Delegate
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var prompterController: PrompterWindowController!
     var statusItem: NSStatusItem?
     private var stealthObserver: Any?
     private var resignObserver: Any?
     private var hotkeyFailureMenuItem: NSMenuItem?
+    private var visibilityMenuItem: NSMenuItem?
+    private var playMenuItem: NSMenuItem?
+    private var clickThroughMenuItem: NSMenuItem?
+    private var scriptMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 스텔스 가드를 창 생성보다 먼저 건다.
@@ -2292,6 +2450,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.prompterController.scrollToTop()
         }
 
+        hotkeyManager.onPreviousSection = { [weak self] in
+            self?.prompterController.jumpSection(forward: false)
+        }
+
+        hotkeyManager.onNextSection = { [weak self] in
+            self?.prompterController.jumpSection(forward: true)
+        }
+
+        hotkeyManager.onPasteClipboard = { [weak self] in
+            self?.prompterController.replaceScriptFromClipboard()
+        }
+
         hotkeyManager.registerHotkeys()
     }
 
@@ -2300,11 +2470,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.button?.title = "☷"
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "프롬프터 보이기/숨기기", action: #selector(togglePrompter), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "재생/일시정지", action: #selector(togglePlay), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "클릭스루 모드", action: #selector(toggleClickThrough), keyEquivalent: ""))
+        menu.delegate = self   // 열릴 때마다 실제 상태로 갱신
+
+        visibilityMenuItem = NSMenuItem(title: "프롬프터 보이기", action: #selector(togglePrompter), keyEquivalent: "")
+        playMenuItem = NSMenuItem(title: "재생", action: #selector(togglePlay), keyEquivalent: "")
+        clickThroughMenuItem = NSMenuItem(title: "클릭 통과", action: #selector(toggleClickThrough), keyEquivalent: "")
+
+        menu.addItem(visibilityMenuItem!)
+        menu.addItem(playMenuItem!)
+        menu.addItem(clickThroughMenuItem!)
         menu.addItem(NSMenuItem(title: "처음으로", action: #selector(scrollToTop), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
+
+        scriptMenuItem = NSMenuItem(title: "대본", action: nil, keyEquivalent: "")
+        scriptMenuItem?.submenu = NSMenu()
+        menu.addItem(scriptMenuItem!)
+        menu.addItem(NSMenuItem(title: "클립보드를 대본으로", action: #selector(pasteClipboardAsScript), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+
         menu.addItem(NSMenuItem(title: "설정...", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "업데이트 확인...", action: #selector(checkForUpdates), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -2314,6 +2497,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyFailureMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         hotkeyFailureMenuItem?.isEnabled = false
         refreshHotkeyFailureIndicator()
+    }
+
+    // MARK: NSMenuDelegate
+
+    /// 메뉴를 열 때마다 현재 상태를 반영한다. 상태를 바꾸는 경로가 여럿(단축키·메뉴·설정창)이라
+    /// 각 경로에서 메뉴를 갱신하려 들면 반드시 빠지는 곳이 생긴다.
+    func menuWillOpen(_ menu: NSMenu) {
+        guard let controller = prompterController else { return }
+        let visible = controller.window?.isVisible ?? false
+        visibilityMenuItem?.title = visible ? "프롬프터 숨기기" : "프롬프터 보이기"
+        playMenuItem?.title = controller.isPlaying ? "일시정지" : "재생"
+        playMenuItem?.state = controller.isPlaying ? .on : .off
+        clickThroughMenuItem?.state = controller.isClickThrough ? .on : .off
+        rebuildScriptMenu()
+    }
+
+    /// 대본 목록을 서브메뉴로 노출한다. 촬영 중에는 파일 열기 패널을 쓸 수 없으므로
+    /// (별도 프로세스라 캡처에서 숨길 수 없다) 이 경로가 라이브 전환의 정식 수단이다.
+    private func rebuildScriptMenu() {
+        guard let submenu = scriptMenuItem?.submenu else { return }
+        submenu.removeAllItems()
+
+        let library = ScriptStore.loadLibrary()
+        let activeID = prompterController?.activeScriptID
+        if library.scripts.isEmpty {
+            let empty = NSMenuItem(title: "(없음)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            submenu.addItem(empty)
+        }
+        for meta in library.scripts.sorted(by: { $0.updatedAt > $1.updatedAt }) {
+            let item = NSMenuItem(title: meta.title, action: #selector(switchScript(_:)), keyEquivalent: "")
+            item.representedObject = meta.id
+            item.state = (meta.id == activeID) ? .on : .off
+            item.target = self
+            submenu.addItem(item)
+        }
+        submenu.addItem(NSMenuItem.separator())
+        let newItem = NSMenuItem(title: "새 대본", action: #selector(createScript), keyEquivalent: "")
+        newItem.target = self
+        submenu.addItem(newItem)
+    }
+
+    @objc func switchScript(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        prompterController?.switchToScript(id: id)
+    }
+
+    @objc func createScript() {
+        prompterController?.createNewScript()
+    }
+
+    @objc func pasteClipboardAsScript() {
+        prompterController?.replaceScriptFromClipboard()
     }
 
     /// 단축키가 안 먹는 이유를 사용자가 알 수 있게 한다.
