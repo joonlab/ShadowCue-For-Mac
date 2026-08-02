@@ -7325,6 +7325,432 @@ func runLibraryDragDropSelfTest() -> Bool {
     return ok
 }
 
+// MARK: - 보드 셀프테스트
+
+/// J. 보드 CRUD — 폴더·대본과 같은 계약(오프바이원·차단·복원) 위에 얹혀 있는지.
+///
+/// ★ 이 테스트의 존재 이유는 한 줄이다: **보드를 지워도 대본은 남아야 한다.**
+/// 보드는 대본을 소유하지 않고 참조한다. 그 구분이 무너지면 촬영 묶음을 정리하다
+/// 대본을 잃는다.
+func runBoardCRUDSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 보드 CRUD (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 보드 CRUD: \(label)") }
+    }
+
+    guard let s1 = ScriptStore.createScript(title: "오프닝", text: "본문1"),
+          let s2 = ScriptStore.createScript(title: "데모", text: "본문2"),
+          let s3 = ScriptStore.createScript(title: "마무리", text: "본문3") else {
+        print("FAIL 보드 CRUD: 대본 구성"); return false
+    }
+    guard let board = ScriptStore.createBoard(name: "8월 촬영") else {
+        print("FAIL 보드 CRUD: 보드 생성"); return false
+    }
+    check("빈 이름 보드 거부", ScriptStore.createBoard(name: "   ") == nil)
+    check("이름 변경", ScriptStore.renameBoard(id: board.id, to: "8월 유튜브"))
+    check("빈 이름 변경 거부", ScriptStore.renameBoard(id: board.id, to: " ") == false)
+    check("이름 반영",
+          ScriptStore.loadLibrary().boards.first { $0.id == board.id }?.name == "8월 유튜브")
+
+    // 담기
+    func titles(_ boardID: String) -> [String] {
+        let library = ScriptStore.loadLibrary()
+        return ScriptStore.resolvedScriptIDs(of: boardID, in: library).map { id in
+            library.scripts.first { $0.id == id }?.title ?? "?"
+        }
+    }
+    check("담기 1", ScriptStore.addScript(s1, toBoard: board.id))
+    check("담기 2", ScriptStore.addScript(s2, toBoard: board.id))
+    check("담기 3", ScriptStore.addScript(s3, toBoard: board.id))
+    check("담긴 순서", titles(board.id) == ["오프닝", "데모", "마무리"])
+    // ★ 중복 금지 — 허용하면 "지금 몇 번째" 가 모호해져 3/7 표시와 이동이 함께 무너진다
+    check("중복 담기 거부", ScriptStore.addScript(s1, toBoard: board.id) == false)
+    check("없는 대본 거부", ScriptStore.addScript("없음", toBoard: board.id) == false)
+    check("없는 보드 거부", ScriptStore.addScript(s1, toBoard: "없음") == false)
+
+    // ★★ 오프바이원 — `at:` 은 **원래 목록 기준 삽입 지점**이다(폴더·대본과 같은 규약).
+    check("at:2 = 사이에 끼움", ScriptStore.moveScriptInBoard(s1, boardID: board.id, at: 2))
+    check("결과 [데모,오프닝,마무리]", titles(board.id) == ["데모", "오프닝", "마무리"])
+    check("at:3 = 맨 끝", ScriptStore.moveScriptInBoard(s1, boardID: board.id, at: 3))
+    check("결과 [데모,마무리,오프닝]", titles(board.id) == ["데모", "마무리", "오프닝"])
+    check("at:0 = 맨 앞", ScriptStore.moveScriptInBoard(s1, boardID: board.id, at: 0))
+    check("결과 [오프닝,데모,마무리]", titles(board.id) == ["오프닝", "데모", "마무리"])
+    check("보드에 없는 대본 이동 거부",
+          ScriptStore.moveScriptInBoard("없음", boardID: board.id, at: 0) == false)
+
+    // 빼기 — 대본은 남는다
+    check("빼기", ScriptStore.removeScript(s2, fromBoard: board.id))
+    check("빼기 반영", titles(board.id) == ["오프닝", "마무리"])
+    check("★ 뺀 대본이 색인에 살아 있음",
+          ScriptStore.loadLibrary().scripts.contains { $0.id == s2 })
+    check("★ 뺀 대본 본문도 그대로", ScriptStore.read(id: s2) == "본문2")
+    check("없는 항목 빼기 거부", ScriptStore.removeScript(s2, fromBoard: board.id) == false)
+    _ = ScriptStore.addScript(s2, toBoard: board.id, at: 1)
+    check("되담기 위치", titles(board.id) == ["오프닝", "데모", "마무리"])
+
+    // ★ dangling — 지워진 대본은 배열에 남되 표시·탐색에서는 건너뛴다.
+    //   이 설계 덕분에 '삭제 취소' 가 보드 안 자리까지 공짜로 되살린다.
+    guard let deleted = ScriptStore.deleteScript(id: s2) else {
+        print("FAIL 보드 CRUD: 대본 삭제"); return false
+    }
+    check("★ 지워진 대본은 표시에서 빠짐", titles(board.id) == ["오프닝", "마무리"])
+    check("★ 색인에는 자리가 남아 있음",
+          ScriptStore.loadLibrary().boards.first { $0.id == board.id }?.scriptIDs.count == 3)
+    // dangling 이 앞에 낀 상태에서 순서를 바꿔도 어긋나지 않아야 한다(rawIndex 변환).
+    check("죽은 항목이 낀 채 맨 끝으로",
+          ScriptStore.moveScriptInBoard(s1, boardID: board.id, at: 2))
+    check("결과 [마무리,오프닝]", titles(board.id) == ["마무리", "오프닝"])
+    // ★ 되살아난 자리가 **원래 위치 그대로**여야 한다. 맨 끝에 붙는다면 죽은 항목을
+    //   배열에 남겨 둔 설계가 아무 값도 못 한 것이다(그럴 거면 삭제 때 지우는 게 낫다).
+    check("★ 삭제 취소가 보드 자리까지 되살림", ScriptStore.restore(deleted))
+    check("★ 되살아난 자리가 원래 위치", titles(board.id) == ["데모", "마무리", "오프닝"])
+
+    // 보드끼리 순서
+    guard let b2 = ScriptStore.createBoard(name: "리허설"),
+          let b3 = ScriptStore.createBoard(name: "잡담") else {
+        print("FAIL 보드 CRUD: 추가 보드"); return false
+    }
+    func boardOrder() -> [String] {
+        ScriptStore.loadLibrary().boards.sorted { $0.sortIndex < $1.sortIndex }.map(\.name)
+    }
+    check("보드 생성 순서", boardOrder() == ["8월 유튜브", "리허설", "잡담"])
+    check("보드 at:2", ScriptStore.moveBoard(id: board.id, at: 2))
+    check("보드 순서 [리허설,8월 유튜브,잡담]", boardOrder() == ["리허설", "8월 유튜브", "잡담"])
+    check("보드 sortIndex 재정규화",
+          ScriptStore.loadLibrary().boards.map(\.sortIndex).sorted() == [0, 1, 2])
+    check("없는 보드 이동 거부", ScriptStore.moveBoard(id: "없음", at: 0) == false)
+
+    // ★★★ 보드 삭제 — 대본은 하나도 사라지지 않는다
+    let scriptsBefore = Set(ScriptStore.loadLibrary().scripts.map(\.id))
+    guard let removedBundle = ScriptStore.deleteBoard(id: board.id) else {
+        print("FAIL 보드 CRUD: 보드 삭제"); return false
+    }
+    check("보드가 색인에서 제거됨",
+          ScriptStore.loadLibrary().boards.contains { $0.id == board.id } == false)
+    check("★★ 보드를 지워도 대본은 전부 남는다",
+          Set(ScriptStore.loadLibrary().scripts.map(\.id)) == scriptsBefore)
+    check("★★ 대본 파일도 그대로", ScriptStore.exists(id: s1) && ScriptStore.exists(id: s3))
+    check("보드 복원", ScriptStore.restore(removedBundle))
+    check("복원 후 담긴 순서까지 그대로", titles(board.id) == ["데모", "마무리", "오프닝"])
+    check("중복 복원 거부", ScriptStore.restore(removedBundle) == false)
+    check("다른 보드는 무사", ScriptStore.loadLibrary().boards.contains { $0.id == b2.id })
+    check("잡담 보드도 무사", ScriptStore.loadLibrary().boards.contains { $0.id == b3.id })
+
+    // ★ 쓰기 차단 상태에서 보드 API 전부 거부
+    resetSupportDirForTest()
+    guard let s = ScriptStore.createScript(title: "x", text: "x"),
+          let locked = ScriptStore.createBoard(name: "before") else {
+        print("FAIL 보드 CRUD: 차단 테스트 구성"); return false
+    }
+    _ = ScriptStore.addScript(s, toBoard: locked.id)
+    try? "{{{".data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+    _ = ScriptStore.loadLibraryDetailed()               // 래치 켜짐
+    let frozen = try? Data(contentsOf: ScriptStore.libraryURL)
+    check("차단: createBoard", ScriptStore.createBoard(name: "n") == nil)
+    check("차단: renameBoard", ScriptStore.renameBoard(id: locked.id, to: "n") == false)
+    check("차단: moveBoard", ScriptStore.moveBoard(id: locked.id, at: 0) == false)
+    check("차단: deleteBoard", ScriptStore.deleteBoard(id: locked.id) == nil)
+    check("차단: addScript", ScriptStore.addScript(s, toBoard: locked.id) == false)
+    check("차단: removeScript", ScriptStore.removeScript(s, fromBoard: locked.id) == false)
+    check("차단: moveScriptInBoard",
+          ScriptStore.moveScriptInBoard(s, boardID: locked.id, at: 0) == false)
+    check("차단 중 파일 무변경", (try? Data(contentsOf: ScriptStore.libraryURL)) == frozen)
+
+    print("\(ok ? "PASS" : "FAIL") 보드 CRUD (참조시맨틱·오프바이원·dangling·차단)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// K. 보드 이동 단축키의 계약.
+///
+/// 촬영 중에는 화면을 볼 수 없다. 그래서 **양 끝에서 감싸지 않는 것**과
+/// **지워진 대본을 건너뛰는 것**이 기능이 아니라 안전장치다.
+func runBoardNavigationSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 보드 이동 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 보드 이동: \(label)") }
+    }
+
+    guard let a = ScriptStore.createScript(title: "A", text: "가"),
+          let b = ScriptStore.createScript(title: "B", text: "나"),
+          let c = ScriptStore.createScript(title: "C", text: "다"),
+          let outside = ScriptStore.createScript(title: "보드 밖", text: "라"),
+          let board = ScriptStore.createBoard(name: "촬영") else {
+        print("FAIL 보드 이동: 구성"); return false
+    }
+    for id in [a, b, c] { _ = ScriptStore.addScript(id, toBoard: board.id) }
+
+    SettingsStore.shared.update { $0.activeBoardID = nil }
+    let prompter = PrompterWindowController()
+
+    // 활성 보드가 없으면 대본이 바뀌지 않는다(토스트만).
+    prompter.switchToScript(id: outside)
+    prompter.stepBoard(forward: true)
+    check("보드 없으면 대본 그대로", prompter.activeScriptID == outside)
+
+    // 보드 시작 = 첫 대본
+    prompter.startBoard(id: board.id)
+    check("보드 시작 → 첫 대본", prompter.activeScriptID == a)
+    check("활성 보드 기록", prompter.activeBoardID == board.id)
+
+    prompter.stepBoard(forward: true)
+    check("다음 → B", prompter.activeScriptID == b)
+    prompter.stepBoard(forward: true)
+    check("다음 → C", prompter.activeScriptID == c)
+
+    // ★ 끝에서 감싸지 않는다 — 마지막에서 한 번 더 눌러도 첫 대본으로 되감기지 않는다
+    prompter.stepBoard(forward: true)
+    check("★ 마지막에서 감싸지 않음", prompter.activeScriptID == c)
+    prompter.stepBoard(forward: false)
+    check("이전 → B", prompter.activeScriptID == b)
+    prompter.stepBoard(forward: false)
+    check("이전 → A", prompter.activeScriptID == a)
+    prompter.stepBoard(forward: false)
+    check("★ 첫 대본에서 감싸지 않음", prompter.activeScriptID == a)
+
+    // ★ 보드 밖 대본을 올린 상태 — 활성 보드는 유지되고, 양 끝에서 다시 들어간다
+    prompter.switchToScript(id: outside)
+    check("보드 밖으로 가도 활성 보드 유지", prompter.activeBoardID == board.id)
+    prompter.stepBoard(forward: true)
+    check("보드 밖 + 다음 = 첫 항목", prompter.activeScriptID == a)
+    prompter.switchToScript(id: outside)
+    prompter.stepBoard(forward: false)
+    check("보드 밖 + 이전 = 마지막 항목", prompter.activeScriptID == c)
+
+    // ★ 지워진 대본은 건너뛴다 — 죽은 자리에서 멈추면 촬영이 끊긴다
+    prompter.switchToScript(id: a)
+    _ = ScriptStore.deleteScript(id: b)
+    prompter.stepBoard(forward: true)
+    check("★ 지워진 항목 건너뛰고 C 로", prompter.activeScriptID == c)
+
+    // 보드가 사라지면 활성도 풀린다
+    prompter.startBoard(id: board.id)
+    _ = ScriptStore.deleteBoard(id: board.id)
+    prompter.boardDidDisappear(id: board.id)
+    check("보드 삭제 → 활성 해제", prompter.activeBoardID == nil)
+    let before = prompter.activeScriptID
+    prompter.stepBoard(forward: true)
+    check("활성 해제 후 이동 무효", prompter.activeScriptID == before)
+
+    // 빈 보드에서도 죽지 않는다
+    guard let empty = ScriptStore.createBoard(name: "빈 보드") else {
+        print("FAIL 보드 이동: 빈 보드 생성"); return false
+    }
+    prompter.startBoard(id: empty.id)
+    prompter.stepBoard(forward: true)
+    check("빈 보드에서 이동 무효", prompter.activeScriptID == before)
+
+    // 단축키가 배선돼 있는가 — 액션 추가 시 AppDelegate 배선만 컴파일러가 못 잡는다
+    check("다음 대본 기본키 = ⌃⌥→",
+          HotkeyAction.nextInBoard.defaultKeyCode == UInt32(kVK_RightArrow))
+    check("이전 대본 기본키 = ⌃⌥←",
+          HotkeyAction.previousInBoard.defaultKeyCode == UInt32(kVK_LeftArrow))
+    check("기본키가 다른 액션과 겹치지 않음", {
+        let all = HotkeyAction.allCases.map { "\($0.defaultKeyCode)-\(HotkeyAction.defaultModifiers)" }
+        return Set(all).count == all.count
+    }())
+
+    print("\(ok ? "PASS" : "FAIL") 보드 이동 (비감싸기·dangling건너뛰기·보드밖진입·해제)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// L. 사이드바에 보드가 붙은 뒤의 회귀 방어.
+///
+/// ★ 가장 중요한 검사는 **'보드에서 빼기' 가 대본을 지우지 않는가** 하나다.
+/// v1.3 의 삭제 규칙은 "폴더가 아니면 대본" 이었고, 그 규칙을 보드가 있는 트리에
+/// 그대로 두면 보드를 정리하다 대본이 사라진다.
+func runBoardSidebarSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 보드 사이드바 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 보드 사이드바: \(label)") }
+    }
+
+    guard let folder = ScriptStore.createFolder(name: "LG"),
+          let inFolder = ScriptStore.createScript(title: "오프닝", in: folder.id, text: "본문"),
+          let loose = ScriptStore.createScript(title: "잡담", text: "본문2"),
+          let board = ScriptStore.createBoard(name: "촬영"),
+          let other = ScriptStore.createBoard(name: "다른 보드") else {
+        print("FAIL 보드 사이드바: 구성"); return false
+    }
+    _ = ScriptStore.addScript(inFolder, toBoard: board.id)
+    SettingsStore.shared.update {
+        $0.libraryWindowFrame = nil
+        $0.libraryExpandedFolderIDs = [folder.id, board.id, other.id]
+        $0.libraryLastSelectedID = nil
+        $0.activeBoardID = nil
+    }
+
+    // ── 순수 빌더 ──
+    let library = ScriptStore.loadLibrary()
+    let sections = LibraryTree.buildSections(from: library)
+    check("최상위는 머리 행 2개", sections.count == 2 && sections.allSatisfy { $0.isSection })
+    check("첫 머리는 보드", sections[0].title == "보드")
+    check("보드 2개", sections[0].children.count == 2)
+    check("대본 트리는 두 번째 아래", sections[1].children.contains { $0.id == folder.id })
+    // ★ 행 정체성과 문서 정체성이 갈려 있는가 — 여기가 무너지면 펼침·선택 복원이 뒤엉킨다
+    let entry = sections[0].children.first { $0.id == board.id }?.children.first
+    check("보드 자리 존재", entry != nil)
+    check("★ 보드 자리의 행 id 는 대본 id 와 다름", entry?.id != inFolder)
+    check("★ 보드 자리의 행 id 는 보드로 한정", entry?.id == "\(board.id)/\(inFolder)")
+    check("★ 보드 자리의 문서 id 는 대본 id", entry?.scriptID == inFolder)
+    check("보드 자리는 그 보드 소속", entry?.boardID == board.id)
+    check("보드는 펼칠 수 있음", sections[0].children.first?.isExpandable == true)
+    check("보드 자리는 못 펼침", entry?.isExpandable == false)
+
+    // dangling 은 표시에서 빠진다
+    var withDangling = library
+    if let i = withDangling.boards.firstIndex(where: { $0.id == board.id }) {
+        withDangling.boards[i].scriptIDs.append("존재하지 않는 대본")
+    }
+    check("★ 죽은 자리는 트리에 안 나옴",
+          LibraryTree.buildSections(from: withDangling)[0].children
+              .first { $0.id == board.id }?.children.count == 1)
+
+    // ── 창 ──
+    let prompter = PrompterWindowController()
+    let window = ScriptLibraryWindowController(prompterController: prompter)
+    guard let probe = window.layoutProbeForTest else {
+        print("FAIL 보드 사이드바: 프로브 없음"); return false
+    }
+    window.window?.setFrame(NSRect(x: 0, y: 0, width: 960, height: 640), display: false)
+
+    let rows = (0..<probe.outline.numberOfRows).compactMap { probe.outline.item(atRow: $0) as? LibraryNode }
+    check("머리 행이 화면에 나옴", rows.filter { $0.isSection }.count == 2)
+    check("머리 행은 항상 펼쳐져 있음",
+          rows.filter { $0.isSection }.allSatisfy { probe.outline.isItemExpanded($0) })
+    check("머리 행은 고를 수 없음",
+          rows.filter { $0.isSection }.allSatisfy {
+              window.outlineView(probe.outline, shouldSelectItem: $0) == false
+          })
+    check("머리 행은 접을 수 없음",
+          rows.filter { $0.isSection }.allSatisfy {
+              window.outlineView(probe.outline, shouldCollapseItem: $0) == false
+          })
+    check("보드 행과 폴더 행이 함께 보임",
+          rows.contains { $0.id == board.id } && rows.contains { $0.id == folder.id })
+    // 셀이 실제로 그려지는가(행 수만 맞고 화면이 비는 실패는 행 수 단정으로 안 잡힌다)
+    if let boardRow = rows.first(where: { $0.isBoard }) {
+        let cell = window.outlineView(probe.outline, viewFor: probe.outline.outlineTableColumn,
+                                      item: boardRow) as? NSTableCellView
+        check("보드 셀 생성됨", cell != nil && cell?.textField?.stringValue.isEmpty == false)
+    } else {
+        check("보드 행이 있음", false)
+    }
+
+    // ── 드롭 판정 — 종류마다 갈 수 있는 곳이 다르다 ──
+    let entryRowID = "\(board.id)/\(inFolder)"
+    check("대본 → 보드 = 담기",
+          window.dropPlanLabelForTest(dragging: [loose], onto: board.id) == "addToBoard")
+    check("폴더는 보드에 못 담음",
+          window.dropPlanLabelForTest(dragging: [folder.id], onto: board.id) == "reject")
+    check("보드 자리 → 같은 보드 = 순서 변경",
+          window.dropPlanLabelForTest(dragging: [entryRowID], onto: board.id,
+                                      childIndex: 0) == "reorderInBoard")
+    check("★ 보드 자리 → 다른 보드 거부",
+          window.dropPlanLabelForTest(dragging: [entryRowID], onto: other.id) == "reject")
+    check("★ 보드 자리 → 폴더 트리 거부",
+          window.dropPlanLabelForTest(dragging: [entryRowID], onto: folder.id) == "reject")
+    check("보드 → 보드 머리 = 보드 순서",
+          window.dropPlanLabelForTest(dragging: [board.id],
+                                      onto: window.sectionIDForTest(boards: true)) == "reorderBoards")
+    check("보드 → 폴더 거부",
+          window.dropPlanLabelForTest(dragging: [board.id], onto: folder.id) == "reject")
+    check("대본 → 폴더 = 기존 폴더 이동",
+          window.dropPlanLabelForTest(dragging: [loose], onto: folder.id) == "scriptTree")
+    check("대본 → 보드 머리 거부(담을 보드가 없다)",
+          window.dropPlanLabelForTest(dragging: [loose],
+                                      onto: window.sectionIDForTest(boards: true)) == "reject")
+
+    // ── 우클릭 메뉴 ──
+    guard let boardMenu = window.contextMenuForTest(selecting: board.id) else {
+        print("FAIL 보드 사이드바: 보드 메뉴 없음"); return false
+    }
+    let boardTitles = boardMenu.items.map(\.title)
+    for expected in ["새 보드", "보드 시작", "위로", "아래로"] {
+        check("보드 메뉴 '\(expected)'", boardTitles.contains(expected))
+    }
+    check("★ 보드 메뉴의 삭제가 대본을 지우지 않는다고 적혀 있음",
+          boardTitles.contains { $0.contains("보드 삭제") && $0.contains("대본은 남습니다") })
+    check("보드 메뉴에 '이동' 없음(보드는 폴더로 안 간다)", !boardTitles.contains("이동"))
+
+    guard let entryMenu = window.contextMenuForTest(selecting: entryRowID) else {
+        print("FAIL 보드 사이드바: 보드 자리 메뉴 없음"); return false
+    }
+    let entryTitles = entryMenu.items.map(\.title)
+    check("보드 자리 메뉴 '보드에서 빼기'", entryTitles.contains("보드에서 빼기"))
+    check("★ 보드 자리 메뉴에 '삭제' 없음", !entryTitles.contains("삭제"))
+    check("보드 자리 메뉴 '대본에서 보기'", entryTitles.contains("대본에서 보기"))
+
+    // ★★ 실제로 눌러 본다 — 이름만 맞고 배선이 틀린 경우를 잡는다
+    if let remove = entryMenu.items.first(where: { $0.title == "보드에서 빼기" }) {
+        window.performMenuItemForTest(remove)
+        check("보드에서 빠짐", ScriptStore.resolvedScriptIDs(of: board.id).isEmpty)
+        check("★★ 대본은 색인에 그대로",
+              ScriptStore.loadLibrary().scripts.contains { $0.id == inFolder })
+        check("★★ 대본 파일도 그대로", ScriptStore.exists(id: inFolder))
+    } else {
+        check("'보드에서 빼기' 항목", false)
+    }
+
+    // '보드에 추가 ▸' 배선
+    guard let scriptMenu = window.contextMenuForTest(selecting: loose),
+          let addTo = scriptMenu.items.first(where: { $0.title == "보드에 추가" }),
+          let addMenu = addTo.submenu else {
+        print("FAIL 보드 사이드바: '보드에 추가' 없음"); return false
+    }
+    check("보드 2개가 목록에", addMenu.items.filter { $0.representedObject is String }.count == 2)
+    if let toBoard = addMenu.items.first(where: { ($0.representedObject as? String) == board.id }) {
+        window.performMenuItemForTest(toBoard)
+        check("메뉴로 담기 동작", ScriptStore.resolvedScriptIDs(of: board.id) == [loose])
+        // 이미 담긴 보드는 비활성으로 남는다(목록에서 빼면 "왜 안 보이지" 가 된다)
+        if let again = window.contextMenuForTest(selecting: loose)?
+            .items.first(where: { $0.title == "보드에 추가" })?.submenu?
+            .items.first(where: { ($0.representedObject as? String) == board.id }) {
+            check("이미 담긴 보드는 비활성", again.isEnabled == false)
+        }
+    } else {
+        check("보드 항목", false)
+    }
+
+    // ★★★ 보드를 지워도 대본은 남는다 (창 경로로)
+    let scriptsBefore = Set(ScriptStore.loadLibrary().scripts.map(\.id))
+    if let del = window.contextMenuForTest(selecting: board.id)?
+        .items.first(where: { $0.title.contains("보드 삭제") }) {
+        window.performMenuItemForTest(del)
+        check("보드가 지워짐", ScriptStore.loadLibrary().boards.contains { $0.id == board.id } == false)
+        check("★★★ 창 경로로 지워도 대본 전부 생존",
+              Set(ScriptStore.loadLibrary().scripts.map(\.id)) == scriptsBefore)
+    } else {
+        check("'보드 삭제' 항목", false)
+    }
+
+    // 보드 이름은 인라인 편집으로 바뀌고, 같은 이름이면 저장을 시도하지 않는다
+    // (잠긴 상태에서 행 클릭만으로 모달이 뜨던 버그와 같은 가드)
+    window.simulateEndEditingForTest(id: other.id, text: "다른 보드")     // 그대로
+    check("보드: 같은 이름은 무동작",
+          ScriptStore.loadLibrary().boards.first { $0.id == other.id }?.name == "다른 보드")
+    window.simulateEndEditingForTest(id: other.id, text: "이름 바뀜")
+    check("보드 인라인 이름 변경",
+          ScriptStore.loadLibrary().boards.first { $0.id == other.id }?.name == "이름 바뀜")
+
+    print("\(ok ? "PASS" : "FAIL") 보드 사이드바 (머리행·id분리·드롭판정·빼기≠삭제)")
+    resetSupportDirForTest()
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -7345,6 +7771,9 @@ if CommandLine.arguments.contains("--selftest") {
     let deleteSyncOK = runScriptDeletionSyncSelfTest()
     let ctxMenuOK = runLibraryContextMenuSelfTest()
     let dragDropOK = runLibraryDragDropSelfTest()
+    let boardCRUDOK = runBoardCRUDSelfTest()
+    let boardNavOK = runBoardNavigationSelfTest()
+    let boardSidebarOK = runBoardSidebarSelfTest()
 
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
@@ -7355,7 +7784,8 @@ if CommandLine.arguments.contains("--selftest") {
     exit(persistenceOK && layoutOK && mirrorOK && mirrorLayoutOK
          && buttonsOK && cheatOK && supportDirOK
          && migrationOK && corruptionOK && decoderOK && crudOK && treeOK
-         && libWindowOK && deleteSyncOK && ctxMenuOK && dragDropOK ? 0 : 1)
+         && libWindowOK && deleteSyncOK && ctxMenuOK && dragDropOK
+         && boardCRUDOK && boardNavOK && boardSidebarOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
