@@ -5832,30 +5832,84 @@ func runSupportDirIsolationSelfTest() -> Bool {
 /// 매번 새 객체라 "이미 지운 항목을 참조" 크래시가 나기 쉽고, 수십~수백 규모에서
 /// 전체 리로드 비용은 무시할 만하다.
 final class LibraryNode {
-    enum Kind { case folder(ScriptFolder), script(ScriptMeta) }
+    /// 사이드바 최상위를 가르는 그룹 머리 행. 보드가 0개여도 남겨 둔다 —
+    /// 빈 `보드` 머리가 "여기서 만든다" 를 알려 주는 유일한 표면이기 때문이다.
+    enum Section { case boards, scripts }
+
+    enum Kind {
+        case section(Section)
+        case folder(ScriptFolder)
+        case script(ScriptMeta)
+        case board(ScriptBoard)
+        /// 보드 안의 한 자리. 대본 자체가 아니라 **보드가 그 대본을 가리키는 참조**다.
+        case boardEntry(boardID: String, script: ScriptMeta)
+    }
+
     let kind: Kind
     var children: [LibraryNode] = []
     weak var parent: LibraryNode?
 
     init(_ kind: Kind) { self.kind = kind }
 
+    /// **행 정체성** — 아웃라인이 펼침·선택을 추적하는 키.
+    ///
+    /// ⚠️ 같은 대본이 폴더 트리와 여러 보드에 동시에 나타나므로 `scriptID` 를 그대로 쓰면
+    /// `refreshTree` 의 복원 사전에서 행들이 서로를 덮어쓴다. 보드 자리는 반드시 보드 id 로
+    /// 한정한다. 문서를 가리켜야 하는 곳(활성 표시·편집기·파일 경로)은 `scriptID` 를 쓸 것.
     var id: String {
         switch kind {
+        case .section(let s): return s == .boards ? "section:boards" : "section:scripts"
         case .folder(let f): return f.id
         case .script(let s): return s.id
+        case .board(let b): return b.id
+        case .boardEntry(let boardID, let script): return "\(boardID)/\(script.id)"
         }
     }
+
+    /// **문서 정체성** — 이 행이 가리키는 대본. 폴더·보드·머리 행은 nil.
+    var scriptID: String? {
+        switch kind {
+        case .script(let s): return s.id
+        case .boardEntry(_, let script): return script.id
+        case .section, .folder, .board: return nil
+        }
+    }
+
+    /// 이 행이 속한 보드. 보드 자신과 그 안의 자리만 non-nil.
+    var boardID: String? {
+        switch kind {
+        case .board(let b): return b.id
+        case .boardEntry(let boardID, _): return boardID
+        case .section, .folder, .script: return nil
+        }
+    }
+
     var title: String {
         switch kind {
+        case .section(let s): return s == .boards ? "보드" : "대본"
         case .folder(let f): return f.name
         case .script(let s): return s.title
+        case .board(let b): return b.name
+        case .boardEntry(_, let script): return script.title
         }
     }
+
+    /// **의미를 바꾸지 않는다** — "폴더인가" 그대로다(호출부가 많다).
+    /// 자식을 가질 수 있는지는 `isExpandable` 로 따로 묻는다.
     var isFolder: Bool { if case .folder = kind { return true }; return false }
+    var isBoard: Bool { if case .board = kind { return true }; return false }
+    var isBoardEntry: Bool { if case .boardEntry = kind { return true }; return false }
+    var isSection: Bool { if case .section = kind { return true }; return false }
+    var isExpandable: Bool { isFolder || isBoard || isSection }
+
     var sortIndex: Int {
         switch kind {
+        case .section(let s): return s == .boards ? 0 : 1
         case .folder(let f): return f.sortIndex
         case .script(let s): return s.sortIndex
+        case .board(let b): return b.sortIndex
+        // 보드 안 순서는 배열 순서 자체이므로 정렬에 쓰지 않는다(빌더가 순서대로 넣는다).
+        case .boardEntry: return 0
         }
     }
 }
@@ -5926,6 +5980,41 @@ enum LibraryTree {
     /// 트리 전체 노드 수. 유실 검출용.
     static func count(_ roots: [LibraryNode]) -> Int {
         roots.reduce(0) { $0 + 1 + count($1.children) }
+    }
+
+    /// 사이드바가 실제로 그리는 형태 — `보드` / `대본` 두 머리 행 아래에 각각.
+    ///
+    /// **`build(from:)` 을 감싸기만 한다.** 고아 승격·순환 방어·정렬 규칙은 전부 그쪽에
+    /// 그대로 있고 그쪽에서 따로 검사한다. 여기서 다시 구현하면 두 벌이 어긋난다.
+    static func buildSections(from library: ScriptLibrary) -> [LibraryNode] {
+        let boardsSection = LibraryNode(.section(.boards))
+        let scriptsSection = LibraryNode(.section(.scripts))
+
+        let metaByID = Dictionary(library.scripts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for board in library.boards.sorted(by: {
+            $0.sortIndex != $1.sortIndex
+                ? $0.sortIndex < $1.sortIndex
+                : $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }) {
+            let node = LibraryNode(.board(board))
+            node.parent = boardsSection
+            // 배열 순서가 곧 촬영 순서다 — 여기서 다시 정렬하지 않는다.
+            // 지워진 대본을 가리키는 자리는 **건너뛰기만** 한다(색인에서는 살아 있다,
+            // ScriptStore.resolvedScriptIDs 주석 참조).
+            for scriptID in board.scriptIDs {
+                guard let meta = metaByID[scriptID] else { continue }
+                let entry = LibraryNode(.boardEntry(boardID: board.id, script: meta))
+                entry.parent = node
+                node.children.append(entry)
+            }
+            boardsSection.children.append(node)
+        }
+
+        let scriptRoots = build(from: library)
+        for node in scriptRoots { node.parent = scriptsSection }
+        scriptsSection.children = scriptRoots
+
+        return [boardsSection, scriptsSection]
     }
 }
 
