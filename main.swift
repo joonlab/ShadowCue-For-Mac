@@ -983,6 +983,127 @@ final class PrompterOverlayView: NSView {
     }
 }
 
+// MARK: - Prompter Control Strip (호버 시 나타나는 조작 바)
+
+/// 단축키를 외우지 않아도, 설정 창을 열지 않아도 기본 조작이 되게 한다.
+/// 오버레이(PrompterOverlayView)는 이벤트를 통과시키므로 클릭을 받으려면 별도 뷰여야 한다.
+final class PrompterControlStrip: NSView {
+    var onTogglePlay: (() -> Void)?
+    var onSlower: (() -> Void)?
+    var onFaster: (() -> Void)?
+    var onSmaller: (() -> Void)?
+    var onBigger: (() -> Void)?
+    var onTop: (() -> Void)?
+    var onSettings: (() -> Void)?
+
+    private var playButton: NSButton?
+    private var hideWork: DispatchWorkItem?
+    private var buttons: [NSButton] = []
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    private func setup() {
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+        alphaValue = 0
+
+        playButton = addButton("▶︎") { [weak self] in self?.onTogglePlay?() }
+        _ = addButton("느리게") { [weak self] in self?.onSlower?() }
+        _ = addButton("빠르게") { [weak self] in self?.onFaster?() }
+        _ = addButton("가")     { [weak self] in self?.onSmaller?() }
+        _ = addButton("가+")    { [weak self] in self?.onBigger?() }
+        _ = addButton("처음")   { [weak self] in self?.onTop?() }
+        _ = addButton("설정")   { [weak self] in self?.onSettings?() }
+    }
+
+    private func addButton(_ title: String, action: @escaping () -> Void) -> NSButton {
+        let button = ClosureButton(title: title, handler: action)
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        button.contentTintColor = .white
+        button.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: NSColor.white,
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium)
+        ])
+        addSubview(button)
+        buttons.append(button)
+        return button
+    }
+
+    func setPlaying(_ playing: Bool) {
+        let title = playing ? "⏸" : "▶︎"
+        playButton?.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: NSColor.white,
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium)
+        ])
+    }
+
+    override func layout() {
+        super.layout()
+        var x: CGFloat = 8
+        for button in buttons {
+            let width = max(34, button.attributedTitle.size().width + 16)
+            button.frame = NSRect(x: x, y: 4, width: width, height: bounds.height - 8)
+            x += width + 4
+        }
+    }
+
+    /// 버튼 폭 합계에 맞는 크기.
+    var fittingWidth: CGFloat {
+        var total: CGFloat = 12
+        for button in buttons { total += max(34, button.attributedTitle.size().width + 16) + 4 }
+        return total
+    }
+
+    func show() {
+        hideWork?.cancel()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            animator().alphaValue = 1
+        }
+    }
+
+    func scheduleHide() {
+        hideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                self.animator().alphaValue = 0
+            }
+        }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+}
+
+/// 타깃-액션 대신 클로저를 쓰기 위한 최소 버튼.
+final class ClosureButton: NSButton {
+    private let handler: () -> Void
+
+    init(title: String, handler: @escaping () -> Void) {
+        self.handler = handler
+        super.init(frame: .zero)
+        self.title = title
+        self.target = self
+        self.action = #selector(fire)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) 미지원") }
+
+    @objc private func fire() { handler() }
+}
+
 // MARK: - Prompter View (Optimized with NSTextView)
 class PrompterView: NSView {
     private var scrollView: NSScrollView!
@@ -990,6 +1111,7 @@ class PrompterView: NSView {
     private var cachedTotalHeight: CGFloat = 0
     private var scrollerHideTimer: Timer?
     let overlay = PrompterOverlayView()
+    let controlStrip = PrompterControlStrip()
 
     /// 스크롤 정책(맨 위로 갈지 읽던 자리를 지킬지)은 호출자가 정한다.
     /// 새 대본을 여는 것과, 보고 있는 대본을 편집하는 것은 다르게 다뤄야 한다.
@@ -1105,6 +1227,36 @@ class PrompterView: NSView {
         overlay.autoresizingMask = [.width, .height]
         overlay.accentColor = textColor
         addSubview(overlay)
+
+        // 조작 바는 오버레이보다 위. 이건 클릭을 받아야 하므로 hitTest 를 막지 않는다.
+        addSubview(controlStrip)
+        layoutControlStrip()
+    }
+
+    private func layoutControlStrip() {
+        let height: CGFloat = 32
+        let width = min(controlStrip.fittingWidth, bounds.width - 24)
+        controlStrip.frame = NSRect(x: (bounds.width - width) / 2, y: 12, width: width, height: height)
+        controlStrip.needsLayout = true
+    }
+
+    // MARK: 호버 감지
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        // .activeAlways 여야 앱이 비활성일 때도(=다른 앱으로 촬영 중일 때도) 반응한다.
+        addTrackingArea(NSTrackingArea(rect: .zero,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        controlStrip.show()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        controlStrip.scheduleHide()
     }
 
     // MARK: - Markdown Parser
@@ -1431,6 +1583,7 @@ class PrompterView: NSView {
         // (실측상 비용의 대부분은 정규식이 아니라 setAttributedString + ensureLayout 이다)
         let widthChanged = abs(newSize.width - frame.width) > 0.5
         super.setFrameSize(newSize)
+        layoutControlStrip()
         guard let textView = textView else { return }
         textView.frame.size.width = newSize.width
         if widthChanged {
@@ -1482,6 +1635,13 @@ class FineUndoTextView: NSTextView {
 class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
     var prompterController: PrompterWindowController?
     var hotkeyRecorders: [HotkeyAction: HotkeyRecorderField] = [:]
+    // viewWithTag 조회 대신 직접 참조를 들고 있는다.
+    // 태그 조회는 뷰 계층이 바뀌면 조용히 nil 이 되어 "슬라이더는 움직이는데 숫자가 안 바뀌는"
+    // 회귀를 만든다(그때 컴파일러는 아무 말도 해주지 않는다).
+    var fontSlider: NSSlider?
+    var fontValueLabel: NSTextField?
+    var opacitySlider: NSSlider?
+    var opacityValueLabel: NSTextField?
     var speedSlider: NSSlider?
     var speedValueLabel: NSTextField?
     var prompterTextView: FineUndoTextView?  // 텍스트 입력창 참조
@@ -1610,11 +1770,12 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         let fontSlider = NSSlider(value: Double(prompterController.prompterView.fontSize), minValue: 16, maxValue: 72, target: self, action: #selector(fontSizeChanged(_:)))
         fontSlider.frame = NSRect(x: controlX, y: yOffset, width: controlWidth - 60, height: 20)
         contentView.addSubview(fontSlider)
+        self.fontSlider = fontSlider
 
         let fontValueLabel = NSTextField(labelWithString: "\(Int(prompterController.prompterView.fontSize))pt")
         fontValueLabel.frame = NSRect(x: controlX + controlWidth - 55, y: yOffset, width: 50, height: 20)
-        fontValueLabel.tag = 1
         contentView.addSubview(fontValueLabel)
+        self.fontValueLabel = fontValueLabel
         yOffset -= 30
 
         // Background opacity
@@ -1625,11 +1786,12 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         let opacitySlider = NSSlider(value: Double(prompterController.backgroundOpacity), minValue: 0.1, maxValue: 1.0, target: self, action: #selector(opacityChanged(_:)))
         opacitySlider.frame = NSRect(x: controlX, y: yOffset, width: controlWidth - 60, height: 20)
         contentView.addSubview(opacitySlider)
+        self.opacitySlider = opacitySlider
 
         let opacityValueLabel = NSTextField(labelWithString: "\(Int(prompterController.backgroundOpacity * 100))%")
         opacityValueLabel.frame = NSRect(x: controlX + controlWidth - 55, y: yOffset, width: 50, height: 20)
-        opacityValueLabel.tag = 2
         contentView.addSubview(opacityValueLabel)
+        self.opacityValueLabel = opacityValueLabel
         yOffset -= 30
 
         // Scroll speed
@@ -1644,7 +1806,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
 
         let valueLabel = NSTextField(labelWithString: "\(Int(prompterController.scrollSpeed))")
         valueLabel.frame = NSRect(x: controlX + controlWidth - 55, y: yOffset, width: 50, height: 20)
-        valueLabel.tag = 3
+
         contentView.addSubview(valueLabel)
         self.speedValueLabel = valueLabel
         yOffset -= 35
@@ -1843,27 +2005,18 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
 
     @objc func fontSizeChanged(_ sender: NSSlider) {
         prompterController?.prompterView.fontSize = CGFloat(sender.doubleValue)
-
-        if let label = window?.contentView?.viewWithTag(1) as? NSTextField {
-            label.stringValue = "\(Int(sender.doubleValue))pt"
-        }
+        fontValueLabel?.stringValue = "\(Int(sender.doubleValue))pt"
     }
 
     @objc func opacityChanged(_ sender: NSSlider) {
         // 화면 반영과 저장은 backgroundOpacity 의 didSet 이 함께 처리한다.
         prompterController?.backgroundOpacity = CGFloat(sender.doubleValue)
-
-        if let label = window?.contentView?.viewWithTag(2) as? NSTextField {
-            label.stringValue = "\(Int(sender.doubleValue * 100))%"
-        }
+        opacityValueLabel?.stringValue = "\(Int(sender.doubleValue * 100))%"
     }
 
     @objc func speedChanged(_ sender: NSSlider) {
         prompterController?.scrollSpeed = CGFloat(sender.doubleValue)
-
-        if let label = window?.contentView?.viewWithTag(3) as? NSTextField {
-            label.stringValue = "\(Int(sender.doubleValue))"
-        }
+        speedValueLabel?.stringValue = "\(Int(sender.doubleValue))"
     }
 
     @objc func textColorChanged(_ sender: NSColorWell) {
@@ -1878,6 +2031,14 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         speedSlider?.doubleValue = Double(speed)
         speedValueLabel?.stringValue = "\(Int(speed))"
     }
+
+    /// 프롬프터 조작 바에서 값을 바꿨을 때 설정 창의 컨트롤도 따라가게 한다.
+    func syncAppearanceControls() {
+        guard let controller = prompterController else { return }
+        let size = controller.prompterView.fontSize
+        fontSlider?.doubleValue = Double(size)
+        fontValueLabel?.stringValue = "\(Int(size))pt"
+    }
 }
 
 // MARK: - Prompter Window Controller
@@ -1885,6 +2046,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
     var prompterView: PrompterView!
     var scrollTimer: Timer?
     private var lastTick: CFTimeInterval = 0
+    private var snapWorkItem: DispatchWorkItem?
     var isPlaying = false
 
     var scrollSpeed: CGFloat = 50 {  // pixels per second
@@ -1971,6 +2133,26 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         window.delegate = self   // NSWindowController 가 자동으로 잡아주지 않는다
         setupPrompterView()
         setupScrollWheel()
+        wireControlStrip()
+    }
+
+    private func wireControlStrip() {
+        let strip = prompterView.controlStrip
+        strip.onTogglePlay = { [weak self] in self?.togglePlay() }
+        strip.onSlower = { [weak self] in self?.speedDown() }
+        strip.onFaster = { [weak self] in self?.speedUp() }
+        strip.onSmaller = { [weak self] in self?.adjustFontSize(by: -2) }
+        strip.onBigger = { [weak self] in self?.adjustFontSize(by: 2) }
+        strip.onTop = { [weak self] in self?.scrollToTop() }
+        strip.onSettings = { [weak self] in self?.showSettings() }
+    }
+
+    func adjustFontSize(by delta: CGFloat) {
+        let newSize = min(72, max(16, prompterView.fontSize + delta))
+        guard newSize != prompterView.fontSize else { return }
+        prompterView.fontSize = newSize
+        settingsController?.syncAppearanceControls()
+        prompterView.overlay.showToast("글자 \(Int(newSize))pt")
     }
 
     // MARK: 설정 복원
@@ -2195,6 +2377,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
             prompterView.overlay.remainingSeconds = nil
             prompterView.overlay.showToast("⏸ 일시정지")
         }
+        prompterView.controlStrip.setPlaying(isPlaying)
     }
 
     /// 남은 분량을 현재 속도로 나눈 값. 자동 스크롤이 균일 속도이므로 정확하다.
@@ -2237,6 +2420,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
             prompterView.scrollOffset = limit
             stopScrolling()
             isPlaying = false
+            prompterView.controlStrip.setPlaying(false)
             prompterView.overlay.remainingSeconds = nil
             prompterView.overlay.showToast("대본 끝")
         } else {
@@ -2322,8 +2506,85 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: NSWindowDelegate
 
-    func windowDidMove(_ notification: Notification) { saveWindowFrame() }
+    func windowDidMove(_ notification: Notification) {
+        saveWindowFrame()
+        scheduleEdgeSnap()
+    }
+
     func windowDidResize(_ notification: Notification) { saveWindowFrame() }
+
+    // MARK: 창 배치
+
+    /// 화면 가장자리에 가까우면 딱 붙인다.
+    ///
+    /// windowDidMove 는 드래그 내내 연속으로 오므로 그 자리에서 프레임을 고치면 사용자의 드래그와
+    /// 싸우게 된다. 움직임이 멈춘 뒤(150ms)에만 스냅하도록 디바운스한다.
+    private func scheduleEdgeSnap() {
+        snapWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.snapToEdges() }
+        snapWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    private func snapToEdges() {
+        guard let window = window, let screen = window.screen ?? NSScreen.main else { return }
+        let threshold: CGFloat = 20
+        let visible = screen.visibleFrame
+        var frame = window.frame
+
+        if abs(frame.minX - visible.minX) < threshold { frame.origin.x = visible.minX }
+        if abs(frame.maxX - visible.maxX) < threshold { frame.origin.x = visible.maxX - frame.width }
+        if abs(frame.minY - visible.minY) < threshold { frame.origin.y = visible.minY }
+        if abs(frame.maxY - visible.maxY) < threshold { frame.origin.y = visible.maxY - frame.height }
+
+        guard frame != window.frame else { return }
+        window.setFrame(frame, display: true, animate: false)
+    }
+
+    enum WindowPreset: String, CaseIterable {
+        case small = "작게"
+        case medium = "보통"
+        case large = "크게"
+        case bottomStrip = "하단 띠"
+        case center = "화면 중앙"
+
+        var size: NSSize? {
+            switch self {
+            case .small: return NSSize(width: 480, height: 280)
+            case .medium: return NSSize(width: 720, height: 420)
+            case .large: return NSSize(width: 1024, height: 560)
+            case .bottomStrip, .center: return nil   // 화면에 따라 계산
+            }
+        }
+    }
+
+    /// 촬영 세팅마다 창 크기를 손으로 맞추는 수고를 없앤다.
+    /// 특히 '하단 띠'는 카메라를 보면서 화면 아래쪽만 훑는 배치라 시선 이동이 가장 적다.
+    func applyWindowPreset(_ preset: WindowPreset) {
+        guard let window = window, let screen = window.screen ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        var frame = window.frame
+
+        switch preset {
+        case .bottomStrip:
+            frame.size = NSSize(width: visible.width * 0.8, height: 240)
+            frame.origin = NSPoint(x: visible.minX + (visible.width - frame.width) / 2,
+                                   y: visible.minY + 40)
+        case .center:
+            frame.origin = NSPoint(x: visible.midX - frame.width / 2,
+                                   y: visible.midY - frame.height / 2)
+        default:
+            if let size = preset.size {
+                frame.size = size
+                frame.origin = NSPoint(x: visible.midX - size.width / 2,
+                                       y: visible.midY - size.height / 2)
+            }
+        }
+
+        window.setFrame(frame, display: true, animate: true)
+        saveWindowFrame()
+        prompterView.overlay.showToast(preset.rawValue)
+    }
 
     func showSettings() {
         if settingsController == nil {
@@ -2480,6 +2741,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(playMenuItem!)
         menu.addItem(clickThroughMenuItem!)
         menu.addItem(NSMenuItem(title: "처음으로", action: #selector(scrollToTop), keyEquivalent: ""))
+
+        let presetItem = NSMenuItem(title: "창 크기", action: nil, keyEquivalent: "")
+        let presetMenu = NSMenu()
+        for preset in PrompterWindowController.WindowPreset.allCases {
+            let item = NSMenuItem(title: preset.rawValue, action: #selector(applyPreset(_:)), keyEquivalent: "")
+            item.representedObject = preset.rawValue
+            item.target = self
+            presetMenu.addItem(item)
+        }
+        presetItem.submenu = presetMenu
+        menu.addItem(presetItem)
         menu.addItem(NSMenuItem.separator())
 
         scriptMenuItem = NSMenuItem(title: "대본", action: nil, keyEquivalent: "")
@@ -2550,6 +2822,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func pasteClipboardAsScript() {
         prompterController?.replaceScriptFromClipboard()
+    }
+
+    @objc func applyPreset(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let preset = PrompterWindowController.WindowPreset(rawValue: raw) else { return }
+        prompterController?.applyWindowPreset(preset)
     }
 
     /// 단축키가 안 먹는 이유를 사용자가 알 수 있게 한다.
