@@ -686,6 +686,360 @@ enum ScriptStore {
         return "복구된 대본 \(fallbackIndex)"
     }
 
+    // MARK: 구조 변경 (폴더·대본 CRUD)
+
+    /// **모든 구조 변경은 이 한 곳을 통과한다.**
+    ///
+    /// - 쓰기 차단 상태에서 조용히 성공하지 않는다(false 를 돌려준다).
+    /// - `body` 가 false 를 돌려주면 아무것도 쓰지 않는다(검증 실패 = 무변경).
+    /// - 성공 시 형제끼리 sortIndex 를 0..n-1 로 재정규화한다. 순서가 항상 정칙이라
+    ///   테스트가 `[1,2,0]` 같은 기대값을 그대로 쓸 수 있고, 중복 인덱스가 쌓이지 않는다.
+    @discardableResult
+    private static func mutate(_ body: (inout ScriptLibrary) -> Bool) -> Bool {
+        guard !isWriteBlocked else { return false }
+        var library = loadLibrary()
+        guard body(&library) else { return false }
+        normalizeOrder(&library)
+        return saveLibrary(library)
+    }
+
+    private static func normalizeOrder(_ library: inout ScriptLibrary) {
+        // 폴더와 대본은 같은 부모 안에서 각각 0..n-1 을 갖는다(트리 빌더가 폴더를 앞에 놓는다).
+        func renumberFolders(parent: String?) {
+            let ids = library.folders
+                .filter { $0.parentID == parent }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            for (order, id) in ids.enumerated() {
+                if let i = library.folders.firstIndex(where: { $0.id == id }) {
+                    library.folders[i].sortIndex = order
+                }
+            }
+        }
+        func renumberScripts(folder: String?) {
+            let ids = library.scripts
+                .filter { $0.folderID == folder }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            for (order, id) in ids.enumerated() {
+                if let i = library.scripts.firstIndex(where: { $0.id == id }) {
+                    library.scripts[i].sortIndex = order
+                }
+            }
+        }
+        var parents: [String?] = [nil]
+        parents.append(contentsOf: library.folders.map { Optional($0.id) })
+        for parent in parents { renumberFolders(parent: parent); renumberScripts(folder: parent) }
+    }
+
+    /// 같은 부모 안에서 뒤쪽으로 옮길 때의 인덱스 보정.
+    ///
+    /// **`at:` 은 "최종 위치" 가 아니라 "원래 목록 기준 삽입 지점" 이다** —
+    /// `NSOutlineView` 의 `acceptDrop(item:childIndex:)` 이 주는 좌표계에 맞춘 것이다.
+    /// `[A,B,C]` 에서 A 를 `at: 2` 로 옮기면 "B 와 C 사이" 라는 뜻이므로 `[B,A,C]` 가 되고,
+    /// 맨 끝은 `at: 3` 이다. 두 규약을 헷갈리면 드래그가 항상 한 칸씩 어긋난다.
+    ///
+    /// 보정이 필요한 이유: 옮길 원소를 목록에서 먼저 빼면, 그 원소보다 뒤에 있던 삽입 지점이
+    /// 한 칸 당겨진다. 앞쪽으로 옮길 때(`target <= old`)는 당겨지지 않으므로 보정하지 않는다.
+    private static func adjustedIndex(_ target: Int, movingFrom old: Int, sameParent: Bool) -> Int {
+        (sameParent && target > old) ? target - 1 : target
+    }
+
+    /// 대상 폴더의 조상 사슬에 `id` 가 있는지. 순환 이동을 막는다.
+    private static func isDescendant(_ candidate: String?, of ancestorID: String,
+                                     in library: ScriptLibrary) -> Bool {
+        var cursor = candidate
+        var guardCount = 0
+        while let current = cursor, guardCount < 1000 {
+            if current == ancestorID { return true }
+            cursor = library.folders.first(where: { $0.id == current })?.parentID
+            guardCount += 1
+        }
+        return false
+    }
+
+    // ── 폴더 ────────────────────────────────────────────────────────
+
+    @discardableResult
+    static func createFolder(name: String, parentID: String? = nil) -> ScriptFolder? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var created: ScriptFolder?
+        let ok = mutate { library in
+            if let parent = parentID,
+               !library.folders.contains(where: { $0.id == parent }) { return false }
+            let now = Date()
+            let next = library.folders.filter { $0.parentID == parentID }.count
+            let folder = ScriptFolder(id: UUID().uuidString, name: trimmed, parentID: parentID,
+                                      sortIndex: next, createdAt: now, updatedAt: now)
+            library.folders.append(folder)
+            created = folder
+            return true
+        }
+        return ok ? created : nil
+    }
+
+    @discardableResult
+    static func renameFolder(id: String, to name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }       // 빈 이름은 목록에서 사라진 것처럼 보인다
+        return mutate { library in
+            guard let i = library.folders.firstIndex(where: { $0.id == id }) else { return false }
+            library.folders[i].name = trimmed
+            library.folders[i].updatedAt = Date()
+            return true
+        }
+    }
+
+    /// `at` 이 nil 이면 맨 끝.
+    @discardableResult
+    static func moveFolder(id: String, toParent parentID: String?, at index: Int? = nil) -> Bool {
+        mutate { library in
+            guard let current = library.folders.first(where: { $0.id == id }) else { return false }
+            if let parent = parentID,
+               !library.folders.contains(where: { $0.id == parent }) { return false }
+            // 자기 자신이나 자손 안으로 넣으면 트리가 끊겨 대본이 통째로 사라진 것처럼 보인다.
+            guard !isDescendant(parentID, of: id, in: library) else { return false }
+
+            let sameParent = current.parentID == parentID
+            let siblings = library.folders
+                .filter { $0.parentID == parentID && $0.id != id }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            let oldIndex = library.folders
+                .filter { $0.parentID == parentID }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .firstIndex(of: current) ?? siblings.count
+            var order = siblings
+            let target = min(max(0, adjustedIndex(index ?? order.count, movingFrom: oldIndex,
+                                                  sameParent: sameParent)), order.count)
+            order.insert(id, at: target)
+
+            guard let i = library.folders.firstIndex(where: { $0.id == id }) else { return false }
+            library.folders[i].parentID = parentID
+            library.folders[i].updatedAt = Date()
+            for (position, folderID) in order.enumerated() {
+                if let j = library.folders.firstIndex(where: { $0.id == folderID }) {
+                    library.folders[j].sortIndex = position
+                }
+            }
+            return true
+        }
+    }
+
+    enum FolderDeleteStrategy {
+        /// 안에 있던 것을 부모로 끌어올린다(기본 — 실수로 지워도 내용은 남는다).
+        case promoteChildren
+        /// 안에 있던 대본까지 휴지통으로.
+        case deleteContents
+    }
+
+    @discardableResult
+    static func deleteFolder(id: String, strategy: FolderDeleteStrategy = .promoteChildren) -> DeletedBundle? {
+        var bundle: DeletedBundle?
+        let ok = mutate { library in
+            guard let target = library.folders.first(where: { $0.id == id }) else { return false }
+            let descendants = descendantFolderIDs(of: id, in: library)
+            let affected = descendants.union([id])
+
+            switch strategy {
+            case .promoteChildren:
+                for i in library.folders.indices where library.folders[i].parentID == id {
+                    library.folders[i].parentID = target.parentID
+                }
+                for i in library.scripts.indices where library.scripts[i].folderID == id {
+                    library.scripts[i].folderID = target.parentID
+                }
+                library.folders.removeAll { $0.id == id }
+                bundle = DeletedBundle(folders: [target], scripts: [], deletedAt: Date())
+
+            case .deleteContents:
+                let doomedFolders = library.folders.filter { affected.contains($0.id) }
+                let doomedScripts = library.scripts.filter { affected.contains($0.folderID ?? "") }
+                var moved: [(ScriptMeta, URL?)] = []
+                for meta in doomedScripts {
+                    moved.append((meta, moveToTrash(id: meta.id)))
+                }
+                library.folders.removeAll { affected.contains($0.id) }
+                library.scripts.removeAll { affected.contains($0.folderID ?? "") }
+                bundle = DeletedBundle(folders: doomedFolders, scripts: moved, deletedAt: Date())
+            }
+            return true
+        }
+        if !ok, let pending = bundle {
+            // 색인 저장이 실패했으면 옮긴 파일을 되돌린다(파일과 색인이 어긋나면 안 된다).
+            for (_, url) in pending.scripts { restoreFromTrash(url) }
+            return nil
+        }
+        return ok ? bundle : nil
+    }
+
+    private static func descendantFolderIDs(of id: String, in library: ScriptLibrary) -> Set<String> {
+        var result: Set<String> = []
+        var queue = [id]
+        while let current = queue.popLast() {
+            for child in library.folders where child.parentID == current && !result.contains(child.id) {
+                result.insert(child.id)
+                queue.append(child.id)
+            }
+        }
+        return result
+    }
+
+    // ── 대본 ────────────────────────────────────────────────────────
+
+    @discardableResult
+    static func createScript(title: String, in folderID: String? = nil, text: String = "") -> String? {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let id = UUID().uuidString
+        guard write(id: id, text: text) else { return nil }
+        let ok = mutate { library in
+            if let folder = folderID,
+               !library.folders.contains(where: { $0.id == folder }) { return false }
+            let now = Date()
+            let next = library.scripts.filter { $0.folderID == folderID }.count
+            library.scripts.append(ScriptMeta(id: id, title: trimmed.isEmpty ? "새 대본" : trimmed,
+                                              createdAt: now, updatedAt: now,
+                                              folderID: folderID, sortIndex: next))
+            return true
+        }
+        if !ok {
+            // 색인에 못 넣었으면 방금 만든 파일을 남기지 않는다(목록에 없는 유령 파일 방지).
+            try? FileManager.default.removeItem(at: url(for: id))
+            return nil
+        }
+        return id
+    }
+
+    @discardableResult
+    static func renameScript(id: String, to title: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return mutate { library in
+            guard let i = library.scripts.firstIndex(where: { $0.id == id }) else { return false }
+            library.scripts[i].title = trimmed
+            library.scripts[i].updatedAt = Date()
+            return true
+        }
+    }
+
+    @discardableResult
+    static func moveScript(id: String, toFolder folderID: String?, at index: Int? = nil) -> Bool {
+        mutate { library in
+            guard let current = library.scripts.first(where: { $0.id == id }) else { return false }
+            if let folder = folderID,
+               !library.folders.contains(where: { $0.id == folder }) { return false }
+
+            let sameParent = current.folderID == folderID
+            let siblings = library.scripts
+                .filter { $0.folderID == folderID && $0.id != id }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            let oldIndex = library.scripts
+                .filter { $0.folderID == folderID }
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .firstIndex(where: { $0.id == id }) ?? siblings.count
+            var order = siblings
+            let target = min(max(0, adjustedIndex(index ?? order.count, movingFrom: oldIndex,
+                                                  sameParent: sameParent)), order.count)
+            order.insert(id, at: target)
+
+            guard let i = library.scripts.firstIndex(where: { $0.id == id }) else { return false }
+            library.scripts[i].folderID = folderID
+            library.scripts[i].updatedAt = Date()
+            for (position, scriptID) in order.enumerated() {
+                if let j = library.scripts.firstIndex(where: { $0.id == scriptID }) {
+                    library.scripts[j].sortIndex = position
+                }
+            }
+            return true
+        }
+    }
+
+    @discardableResult
+    static func deleteScript(id: String) -> DeletedBundle? {
+        guard !isWriteBlocked else { return nil }
+        var meta: ScriptMeta?
+        var trashed: URL?
+        // 파일을 먼저 옮기고 색인을 고친다. 순서가 반대면 색인에서 사라진 뒤 파일 이동이 실패해
+        // 목록에 없는 유령 파일이 남는다.
+        guard let existing = loadLibrary().scripts.first(where: { $0.id == id }) else { return nil }
+        meta = existing
+        trashed = moveToTrash(id: id)
+
+        let ok = mutate { library in
+            library.scripts.removeAll { $0.id == id }
+            return true
+        }
+        guard ok, let m = meta else {
+            restoreFromTrash(trashed)      // 색인 저장 실패 → 파일 원위치
+            return nil
+        }
+        return DeletedBundle(folders: [], scripts: [(m, trashed)], deletedAt: Date())
+    }
+
+    @discardableResult
+    static func duplicateScript(id: String) -> String? {
+        guard let source = loadLibrary().scripts.first(where: { $0.id == id }) else { return nil }
+        return createScript(title: source.title + " 사본", in: source.folderID,
+                            text: read(id: id) ?? "")
+    }
+
+    @discardableResult
+    static func restore(_ bundle: DeletedBundle) -> Bool {
+        guard !isWriteBlocked else { return false }
+        let library = loadLibrary()
+        // 같은 id 가 이미 있으면 되살리지 않는다(중복 생성 방지).
+        guard !bundle.scripts.contains(where: { entry in
+            library.scripts.contains { $0.id == entry.meta.id }
+        }) else { return false }
+
+        for (_, url) in bundle.scripts { restoreFromTrash(url) }
+        return mutate { lib in
+            for folder in bundle.folders where !lib.folders.contains(where: { $0.id == folder.id }) {
+                lib.folders.append(folder)
+            }
+            for (meta, _) in bundle.scripts where !lib.scripts.contains(where: { $0.id == meta.id }) {
+                lib.scripts.append(meta)
+            }
+            return true
+        }
+    }
+
+    /// 되돌리기 스냅샷. 본문을 메모리에 들고 있지 않고 **휴지통 파일 URL 만** 들고 있는다.
+    struct DeletedBundle {
+        var folders: [ScriptFolder]
+        var scripts: [(meta: ScriptMeta, trashedFile: URL?)]
+        var deletedAt: Date
+    }
+
+    /// 지우지 않고 옮긴다(rename 이라 원자적이고, 복사와 달리 중간 상태가 없다).
+    private static func moveToTrash(id: String) -> URL? {
+        prepare()
+        let source = url(for: id)
+        guard FileManager.default.fileExists(atPath: source.path) else { return nil }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let dest = trashURL.appendingPathComponent("\(id)-\(stamp).md")
+        try? FileManager.default.removeItem(at: dest)
+        do {
+            try FileManager.default.moveItem(at: source, to: dest)
+            try? FileManager.default.removeItem(at: source.appendingPathExtension("bak"))
+            return dest
+        } catch { return nil }
+    }
+
+    private static func restoreFromTrash(_ trashed: URL?) {
+        guard let trashed, FileManager.default.fileExists(atPath: trashed.path) else { return }
+        // 파일명이 <id>-<epoch>.md 이므로 마지막 하이픈 앞이 id 다.
+        let base = trashed.deletingPathExtension().lastPathComponent
+        guard let cut = base.lastIndex(of: "-") else { return }
+        let id = String(base[base.startIndex..<cut])
+        prepare()
+        let dest = url(for: id)
+        try? FileManager.default.removeItem(at: dest)
+        try? FileManager.default.moveItem(at: trashed, to: dest)
+    }
+
     /// 휴지통이 무한히 커지지 않게 기동 때 한 번 솎는다.
     /// 되돌리기는 며칠 안에 하는 행동이므로 30일이면 넉넉하고, 개수 상한을 함께 두어
     /// 하루에 수십 개를 지운 경우에도 디스크가 계속 불어나지 않게 한다.
@@ -4297,6 +4651,112 @@ func runSupportDirIsolationSelfTest() -> Bool {
     return ok
 }
 
+// MARK: - 라이브러리 트리
+
+/// 아웃라인 뷰 전용 참조 래퍼.
+///
+/// `NSOutlineView` 는 항목을 **객체 동일성**으로 추적하므로 값 타입 배열을 그대로 줄 수 없다.
+/// 색인을 읽을 때마다 새로 만들고 전체 `reloadData` 로 간다 — 증분 API(`insertItems`)는
+/// 매번 새 객체라 "이미 지운 항목을 참조" 크래시가 나기 쉽고, 수십~수백 규모에서
+/// 전체 리로드 비용은 무시할 만하다.
+final class LibraryNode {
+    enum Kind { case folder(ScriptFolder), script(ScriptMeta) }
+    let kind: Kind
+    var children: [LibraryNode] = []
+    weak var parent: LibraryNode?
+
+    init(_ kind: Kind) { self.kind = kind }
+
+    var id: String {
+        switch kind {
+        case .folder(let f): return f.id
+        case .script(let s): return s.id
+        }
+    }
+    var title: String {
+        switch kind {
+        case .folder(let f): return f.name
+        case .script(let s): return s.title
+        }
+    }
+    var isFolder: Bool { if case .folder = kind { return true }; return false }
+    var sortIndex: Int {
+        switch kind {
+        case .folder(let f): return f.sortIndex
+        case .script(let s): return s.sortIndex
+        }
+    }
+}
+
+enum LibraryTree {
+    /// 색인을 트리로 만든다. **순수 함수** — 창 없이 테스트할 수 있다.
+    ///
+    /// 세 가지를 반드시 지킨다:
+    /// 1. 없는 폴더를 가리키는 항목은 **최상위로 승격**한다. 버리면 대본이 사라진 것처럼 보인다.
+    /// 2. `parentID` 순환이 파일에 들어 있어도 방문 집합으로 끊어 유한 트리를 만든다.
+    /// 3. 같은 부모 안에서 폴더가 대본보다 앞에 온다.
+    static func build(from library: ScriptLibrary) -> [LibraryNode] {
+        let validFolderIDs = Set(library.folders.map(\.id))
+
+        // 순환 검출 — 조상 사슬을 따라가다 자기 자신을 만나면 그 폴더는 최상위로 올린다.
+        func rootedParent(of folder: ScriptFolder) -> String? {
+            guard let parent = folder.parentID, validFolderIDs.contains(parent) else { return nil }
+            var seen: Set<String> = [folder.id]
+            var cursor: String? = parent
+            while let current = cursor {
+                if seen.contains(current) { return nil }     // 순환 → 최상위로
+                seen.insert(current)
+                cursor = library.folders.first(where: { $0.id == current })?.parentID
+            }
+            return parent
+        }
+
+        var nodes: [String: LibraryNode] = [:]
+        var effectiveParent: [String: String?] = [:]
+        for folder in library.folders {
+            nodes[folder.id] = LibraryNode(.folder(folder))
+            effectiveParent[folder.id] = rootedParent(of: folder)
+        }
+
+        var roots: [LibraryNode] = []
+        for folder in library.folders {
+            guard let node = nodes[folder.id] else { continue }
+            if let parentID = effectiveParent[folder.id] ?? nil, let parent = nodes[parentID] {
+                node.parent = parent
+                parent.children.append(node)
+            } else {
+                roots.append(node)
+            }
+        }
+        for script in library.scripts {
+            let node = LibraryNode(.script(script))
+            // 고아 대본은 버리지 않고 최상위로 올린다.
+            if let folderID = script.folderID, let parent = nodes[folderID] {
+                node.parent = parent
+                parent.children.append(node)
+            } else {
+                roots.append(node)
+            }
+        }
+
+        func sort(_ list: inout [LibraryNode]) {
+            list.sort { a, b in
+                if a.isFolder != b.isFolder { return a.isFolder }       // 폴더 먼저
+                if a.sortIndex != b.sortIndex { return a.sortIndex < b.sortIndex }
+                return a.title.localizedStandardCompare(b.title) == .orderedAscending
+            }
+            for node in list { sort(&node.children) }
+        }
+        sort(&roots)
+        return roots
+    }
+
+    /// 트리 전체 노드 수. 유실 검출용.
+    static func count(_ roots: [LibraryNode]) -> Int {
+        roots.reduce(0) { $0 + 1 + count($1.children) }
+    }
+}
+
 // MARK: - 대본 라이브러리 셀프테스트
 
 /// 지원 디렉터리를 초기 상태로 되돌린다.
@@ -4519,6 +4979,186 @@ func runSettingsDecoderCoverageSelfTest() -> Bool {
     return ok
 }
 
+/// C. 폴더·대본 CRUD.
+func runFolderCRUDSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 폴더·대본 CRUD (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL CRUD: \(label)") }
+    }
+
+    // 폴더 생성·중첩·이름 변경
+    guard let a = ScriptStore.createFolder(name: "LG AX") else {
+        print("FAIL CRUD: 폴더 생성"); return false
+    }
+    guard let b = ScriptStore.createFolder(name: "1차수", parentID: a.id) else {
+        print("FAIL CRUD: 중첩 폴더 생성"); return false
+    }
+    guard let c = ScriptStore.createFolder(name: "손자", parentID: b.id) else {
+        print("FAIL CRUD: 3단 폴더 생성"); return false
+    }
+    check("빈 이름 폴더 거부", ScriptStore.createFolder(name: "   ") == nil)
+    check("없는 부모 거부", ScriptStore.createFolder(name: "x", parentID: "없는폴더") == nil)
+    check("이름 변경", ScriptStore.renameFolder(id: a.id, to: "LG 인화원"))
+    check("빈 이름 변경 거부", ScriptStore.renameFolder(id: a.id, to: "  ") == false)
+    check("이름 반영", ScriptStore.loadLibrary().folders.first { $0.id == a.id }?.name == "LG 인화원")
+
+    // ★ 순환 이동 거부 — 이걸 놓치면 트리가 끊겨 대본이 통째로 사라진 것처럼 보인다
+    let snapshot = ScriptStore.loadLibrary()
+    check("자기 자신을 부모로 거부", ScriptStore.moveFolder(id: a.id, toParent: a.id) == false)
+    check("자식을 부모로 거부", ScriptStore.moveFolder(id: a.id, toParent: b.id) == false)
+    check("손자를 부모로 거부", ScriptStore.moveFolder(id: a.id, toParent: c.id) == false)
+    check("거부 시 라이브러리 무변경", ScriptStore.loadLibrary() == snapshot)
+    check("정상 이동은 허용", ScriptStore.moveFolder(id: c.id, toParent: nil))
+
+    // 대본 생성·이동
+    guard let s1 = ScriptStore.createScript(title: "오프닝", in: a.id, text: "본문1"),
+          let s2 = ScriptStore.createScript(title: "데모", in: a.id, text: "본문2"),
+          let s3 = ScriptStore.createScript(title: "마무리", in: a.id, text: "본문3") else {
+        print("FAIL CRUD: 대본 생성"); return false
+    }
+    func orderIn(_ folder: String?) -> [String] {
+        ScriptStore.loadLibrary().scripts
+            .filter { $0.folderID == folder }
+            .sorted { $0.sortIndex < $1.sortIndex }
+            .map(\.title)
+    }
+    check("생성 순서", orderIn(a.id) == ["오프닝", "데모", "마무리"])
+
+    // ★★ 오프바이원 — at: 은 **원래 목록 기준 삽입 지점**이다(NSOutlineView 드롭 좌표계).
+    //     [오프닝,데모,마무리] 에서 0번을 at:2 로= "데모와 마무리 사이" → [데모,오프닝,마무리].
+    //     보정을 빼면 한 칸 밀려 [데모,마무리,오프닝] 이 된다.
+    check("at:2 = 사이에 끼움", ScriptStore.moveScript(id: s1, toFolder: a.id, at: 2))
+    check("결과 [데모,오프닝,마무리]", orderIn(a.id) == ["데모", "오프닝", "마무리"])
+    check("sortIndex 재정규화",
+          ScriptStore.loadLibrary().scripts.filter { $0.folderID == a.id }
+              .map(\.sortIndex).sorted() == [0, 1, 2])
+
+    // 맨 끝으로 = 원소 개수와 같은 인덱스
+    check("at:3 = 맨 끝", ScriptStore.moveScript(id: s1, toFolder: a.id, at: 3))
+    check("결과 [데모,마무리,오프닝]", orderIn(a.id) == ["데모", "마무리", "오프닝"])
+    // 앞쪽으로 옮길 때는 보정하지 않는다(당겨지지 않으므로)
+    check("at:0 = 맨 앞", ScriptStore.moveScript(id: s1, toFolder: a.id, at: 0))
+    check("결과 [오프닝,데모,마무리]", orderIn(a.id) == ["오프닝", "데모", "마무리"])
+
+    // 폴더 간 이동 / 루트 복귀
+    check("다른 폴더로 이동", ScriptStore.moveScript(id: s2, toFolder: b.id))
+    check("이동 반영", orderIn(b.id) == ["데모"])
+    check("루트로 이동", ScriptStore.moveScript(id: s3, toFolder: nil))
+    check("루트 반영", orderIn(nil).contains("마무리"))
+    check("없는 폴더로 이동 거부", ScriptStore.moveScript(id: s3, toFolder: "없음") == false)
+
+    // 삭제 → 복원 왕복 (본문 바이트까지)
+    let bodyBefore = ScriptStore.read(id: s3)
+    guard let bundle = ScriptStore.deleteScript(id: s3) else {
+        print("FAIL CRUD: 대본 삭제"); return false
+    }
+    check("색인에서 제거", ScriptStore.loadLibrary().scripts.contains { $0.id == s3 } == false)
+    check("scripts/ 에서 사라짐", ScriptStore.exists(id: s3) == false)
+    check("휴지통에 존재", bundle.scripts.first?.trashedFile
+        .map { FileManager.default.fileExists(atPath: $0.path) } == true)
+    check("복원 성공", ScriptStore.restore(bundle))
+    check("복원 후 본문 동일", ScriptStore.read(id: s3) == bodyBefore)
+    check("복원 후 색인 복귀", ScriptStore.loadLibrary().scripts.contains { $0.id == s3 })
+    check("중복 복원 거부", ScriptStore.restore(bundle) == false)
+
+    // 폴더 삭제 — 승격
+    let promoted = ScriptStore.deleteFolder(id: b.id, strategy: .promoteChildren)
+    check("승격 삭제 성공", promoted != nil)
+    check("자식 대본이 부모로 승격",
+          ScriptStore.loadLibrary().scripts.first { $0.id == s2 }?.folderID == a.id)
+    check("승격 시 본문 유지", ScriptStore.exists(id: s2))
+
+    // 폴더 삭제 — 내용까지
+    guard let d = ScriptStore.createFolder(name: "버릴 폴더"),
+          let s4 = ScriptStore.createScript(title: "버려질 대본", in: d.id, text: "x") else {
+        print("FAIL CRUD: 삭제용 폴더 구성"); return false
+    }
+    check("내용 삭제 성공", ScriptStore.deleteFolder(id: d.id, strategy: .deleteContents) != nil)
+    check("폴더 제거", ScriptStore.loadLibrary().folders.contains { $0.id == d.id } == false)
+    check("대본도 제거", ScriptStore.loadLibrary().scripts.contains { $0.id == s4 } == false)
+    check("파일도 이동됨", ScriptStore.exists(id: s4) == false)
+
+    // 복제
+    let dup = ScriptStore.duplicateScript(id: s1)
+    check("복제 성공", dup != nil)
+    check("복제 본문 동일", dup.flatMap { ScriptStore.read(id: $0) } == ScriptStore.read(id: s1))
+
+    // ★ 쓰기 차단 상태에서 모든 CRUD 가 거부되는가
+    resetSupportDirForTest()
+    _ = ScriptStore.createFolder(name: "before")
+    try? "{{{".data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+    _ = ScriptStore.loadLibraryDetailed()               // 래치 켜짐
+    let frozen = try? Data(contentsOf: ScriptStore.libraryURL)
+    check("차단: createFolder", ScriptStore.createFolder(name: "n") == nil)
+    check("차단: createScript", ScriptStore.createScript(title: "n") == nil)
+    check("차단: renameFolder", ScriptStore.renameFolder(id: "x", to: "y") == false)
+    check("차단: moveScript", ScriptStore.moveScript(id: "x", toFolder: nil) == false)
+    check("차단: deleteScript", ScriptStore.deleteScript(id: "x") == nil)
+    check("차단: deleteFolder", ScriptStore.deleteFolder(id: "x") == nil)
+    check("차단 중 파일 무변경", (try? Data(contentsOf: ScriptStore.libraryURL)) == frozen)
+
+    print("\(ok ? "PASS" : "FAIL") 폴더·대본 CRUD (순환거부·오프바이원·삭제복원·차단)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// E. 트리 빌더 — 순수 함수라 파일도 창도 필요 없다.
+func runLibraryTreeSelfTest() -> Bool {
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 트리: \(label)") }
+    }
+    let now = Date()
+    func folder(_ id: String, _ parent: String?, _ order: Int = 0) -> ScriptFolder {
+        ScriptFolder(id: id, name: "F-\(id)", parentID: parent, sortIndex: order,
+                     createdAt: now, updatedAt: now)
+    }
+    func script(_ id: String, _ folder: String?, _ order: Int = 0) -> ScriptMeta {
+        ScriptMeta(id: id, title: "S-\(id)", createdAt: now, updatedAt: now,
+                   folderID: folder, sortIndex: order)
+    }
+
+    // 3단 중첩
+    var lib = ScriptLibrary()
+    lib.folders = [folder("a", nil), folder("b", "a"), folder("c", "b")]
+    lib.scripts = [script("s1", "c"), script("s2", nil)]
+    var roots = LibraryTree.build(from: lib)
+    check("최상위 2개(a + s2)", roots.count == 2)
+    check("총 노드 5개", LibraryTree.count(roots) == 5)
+    check("폴더가 대본보다 앞", roots.first?.isFolder == true)
+    check("3단 깊이", roots.first?.children.first?.children.first?.id == "c")
+
+    // ★ 고아 대본 — 없는 폴더를 가리켜도 버리지 않는다
+    lib = ScriptLibrary()
+    lib.folders = [folder("a", nil)]
+    lib.scripts = [script("orphan", "사라진폴더"), script("normal", "a")]
+    roots = LibraryTree.build(from: lib)
+    check("고아 대본 최상위 승격", roots.contains { $0.id == "orphan" })
+    check("총 노드 수 보존(3)", LibraryTree.count(roots) == 3)
+
+    // ★ 폴더 순환 — 파일에 A→B→A 가 들어 있어도 무한루프 없이 유한 트리
+    lib = ScriptLibrary()
+    lib.folders = [folder("x", "y"), folder("y", "x")]
+    lib.scripts = [script("s", "x")]
+    roots = LibraryTree.build(from: lib)
+    check("순환에도 노드 3개 유지", LibraryTree.count(roots) == 3)
+    check("순환 폴더가 최상위로", roots.contains { $0.id == "x" } || roots.contains { $0.id == "y" })
+
+    // 정렬 규칙
+    lib = ScriptLibrary()
+    lib.folders = [folder("f2", nil, 1), folder("f1", nil, 0)]
+    lib.scripts = [script("s2", nil, 1), script("s1", nil, 0)]
+    roots = LibraryTree.build(from: lib)
+    check("정렬: 폴더(순서) 뒤 대본(순서)", roots.map(\.id) == ["f1", "f2", "s1", "s2"])
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 트리 (중첩·고아승격·순환방어·정렬)")
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -4533,6 +5173,8 @@ if CommandLine.arguments.contains("--selftest") {
     let migrationOK = runLibraryMigrationSelfTest()
     let corruptionOK = runLibraryCorruptionGuardSelfTest()
     let decoderOK = runSettingsDecoderCoverageSelfTest()
+    let crudOK = runFolderCRUDSelfTest()
+    let treeOK = runLibraryTreeSelfTest()
 
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
@@ -4542,7 +5184,7 @@ if CommandLine.arguments.contains("--selftest") {
     let cheatOK = runCheatSheetSelfTest()
     exit(persistenceOK && layoutOK && mirrorOK && mirrorLayoutOK
          && buttonsOK && cheatOK && supportDirOK
-         && migrationOK && corruptionOK && decoderOK ? 0 : 1)
+         && migrationOK && corruptionOK && decoderOK && crudOK && treeOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
