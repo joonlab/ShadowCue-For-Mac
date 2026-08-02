@@ -2697,7 +2697,7 @@ final class EditKeyFallback {
 }
 
 // MARK: - Settings Window Controller
-class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
+class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var prompterController: PrompterWindowController?
     var hotkeyRecorders: [HotkeyAction: HotkeyRecorderField] = [:]
     // viewWithTag 조회 대신 직접 참조를 들고 있는다.
@@ -2713,9 +2713,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     var kernValueLabel: NSTextField?
     var maxLineWidthValueLabel: NSTextField?
     var targetMinutesField: NSTextField?
-    var prompterTextView: FineUndoTextView?  // 텍스트 입력창 참조
     private var editKeyFallback: EditKeyFallback?
-    private var livePreviewWorkItem: DispatchWorkItem?
 
     convenience init(prompterController: PrompterWindowController) {
         let window = NSWindow(
@@ -2744,13 +2742,6 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
 
     /// 대본이 밖(메뉴 전환·클립보드 투입)에서 바뀌면 편집 상자도 따라가야 한다.
     /// 안 그러면 설정창에 옛 대본이 남아 다음 타이핑이 그걸 되살린다.
-    func reloadScriptText() {
-        guard let textView = prompterTextView, let controller = prompterController else { return }
-        let current = controller.prompterView.text
-        guard textView.string != current else { return }
-        livePreviewWorkItem?.cancel()
-        textView.setupInitialText(current)
-    }
 
     private func setupUI() {
         guard let window = window, let prompterController = prompterController else { return }
@@ -2784,44 +2775,20 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         contentView.addSubview(subtitleLabel)
         yOffset -= 50
 
-        // Text input
-        let textLabel = NSTextField(labelWithString: "프롬프터 텍스트:")
-        textLabel.frame = NSRect(x: leftMargin, y: yOffset, width: labelWidth, height: 20)
-        contentView.addSubview(textLabel)
-        yOffset -= 25
+        // 대본 편집은 라이브러리 창으로 옮겼다. 여기 있던 410×100 상자로는
+        // 강의 대본 한 편도 화면에 안 들어왔다. 이 창은 외관·단축키만 담당한다.
+        let libraryButton = NSButton(title: "대본 라이브러리 열기...", target: self,
+                                     action: #selector(openLibrary))
+        libraryButton.frame = NSRect(x: leftMargin, y: yOffset - 4, width: 190, height: 28)
+        libraryButton.bezelStyle = .rounded
+        contentView.addSubview(libraryButton)
 
-        let textScrollView = NSScrollView(frame: NSRect(x: leftMargin, y: yOffset - 80, width: 410, height: 100))
-        let textView = FineUndoTextView(frame: textScrollView.bounds)
-        textView.isEditable = true
-        textView.isRichText = false
-        textView.font = NSFont.systemFont(ofSize: 14)
-        textView.allowsUndo = true
-        textView.autoresizingMask = [.width, .height]
-        textView.delegate = self   // 실시간 반영
-        textScrollView.documentView = textView
-        textScrollView.hasVerticalScroller = true
-        textScrollView.borderType = .bezelBorder
-        contentView.addSubview(textScrollView)
-
-        // Store reference to text view as instance variable
-        self.prompterTextView = textView
-
-        // Set text and clear undo history
-        textView.setupInitialText(prompterController.prompterView.text)
-        yOffset -= 115
-
-        // Apply text button
-        // 타이핑하면 자동 반영되므로 이 버튼은 "지금 즉시 파일에 확정"이라는 의미로 남긴다.
-        let applyTextButton = NSButton(title: "지금 저장", target: self, action: #selector(applyText(_:)))
-        applyTextButton.frame = NSRect(x: leftMargin, y: yOffset, width: 100, height: 28)
-        applyTextButton.bezelStyle = .rounded
-        contentView.addSubview(applyTextButton)
-
-        let autoApplyHint = NSTextField(labelWithString: "입력하면 자동으로 반영·저장됩니다")
-        autoApplyHint.font = NSFont.systemFont(ofSize: 11)
-        autoApplyHint.textColor = .secondaryLabelColor
-        autoApplyHint.frame = NSRect(x: leftMargin + 110, y: yOffset + 4, width: 260, height: 18)
-        contentView.addSubview(autoApplyHint)
+        let libraryHint = NSTextField(labelWithString:
+            "대본 작성·정리는 여기서 (\(HotkeyAction.showLibrary.defaultDisplayString))")
+        libraryHint.font = NSFont.systemFont(ofSize: 11)
+        libraryHint.textColor = .secondaryLabelColor
+        libraryHint.frame = NSRect(x: leftMargin + 200, y: yOffset, width: 230, height: 18)
+        contentView.addSubview(libraryHint)
         yOffset -= 45
 
         // === Appearance Section ===
@@ -3079,15 +3046,18 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         resetButton.bezelStyle = .rounded
         contentView.addSubview(resetButton)
 
-        // 내용이 고정 높이를 넘으면 아래쪽 컨트롤이 잘려 나간다.
-        // (단축키 행이 7개에서 11개로 늘면서 실제로 넘쳤다)
-        // 부족한 만큼 컨테이너를 키우고 전체를 위로 밀어 항상 들어맞게 한다.
+        // 내용이 고정 높이와 안 맞으면 컨테이너를 맞춘다.
+        //
+        // 원래는 "넘칠 때 늘리기" 만 했다(단축키 행이 7개에서 11개로 늘며 실제로 잘렸다).
+        // 그런데 대본 편집 상자(185pt)를 라이브러리 창으로 옮기면서 반대 방향이 생겼다 —
+        // 남는 만큼 줄이지 않으면 창 아래에 빈 공간이 남아 성기게 보인다.
+        // 좌표계가 좌하단 원점이라 두 경우 모두 subview 를 delta 만큼 밀면 된다(부호만 다름).
         let bottomPadding: CGFloat = 20
-        if yOffset < bottomPadding {
-            let deficit = bottomPadding - yOffset
-            contentView.frame.size.height += deficit
+        let delta = bottomPadding - yOffset          // 양수 = 부족, 음수 = 남음
+        if abs(delta) > 0.5 {
+            contentView.frame.size.height += delta
             for subview in contentView.subviews {
-                subview.frame.origin.y += deficit
+                subview.frame.origin.y += delta
             }
         }
 
@@ -3153,32 +3123,8 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         }
     }
 
-    @objc func applyText(_ sender: NSButton) {
-        guard let textView = prompterTextView, let controller = prompterController else { return }
-        controller.updateScript(textView.string, immediate: true)
-        if !controller.flushScript() {
-            // 조용히 삼키면 사용자는 저장된 줄 안다.
-            let alert = NSAlert()
-            alert.messageText = "대본을 저장하지 못했습니다"
-            alert.informativeText = "화면에는 반영됐지만 파일 쓰기에 실패했습니다.\n\n\(ScriptStore.baseURL.path)"
-            alert.alertStyle = .warning
-            alert.window.sharingType = .none
-            alert.runModal()
-        }
-    }
-
-    // MARK: NSTextViewDelegate — 실시간 반영
-
-    func textDidChange(_ notification: Notification) {
-        guard let textView = prompterTextView, notification.object as? NSTextView === textView else { return }
-        // 화면 반영은 0.3초, 파일 쓰기는 updateScript 안에서 다시 1.5초로 묶인다.
-        livePreviewWorkItem?.cancel()
-        let snapshot = textView.string
-        let work = DispatchWorkItem { [weak self] in
-            self?.prompterController?.updateScript(snapshot)
-        }
-        livePreviewWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    @objc func openLibrary() {
+        prompterController?.showLibrary()
     }
 
     @objc func fontSizeChanged(_ sender: NSSlider) {
@@ -3336,6 +3282,8 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
     private var editKeyFallback: EditKeyFallback?
     /// 컨텍스트 메뉴에서 "새 …" 를 만들 위치. menuNeedsUpdate 가 정하고 액션이 읽는다.
     private var newItemDestination: String?
+    /// refreshTree 재진입 차단(위 주석 참조).
+    private var isRefreshingTree = false
 
     private static let sidebarColumnID = NSUserInterfaceItemIdentifier("name")
 
@@ -3544,6 +3492,17 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
     /// 증분 갱신을 쓰지 않는 이유는 `LibraryNode` 주석 참조 — 매번 새 객체라 증분 API 와
     /// 조합하면 "이미 지운 항목 참조" 크래시가 나기 쉽다.
     func refreshTree() {
+        // ⚠️ **재진입 금지.** NSOutlineView 는 reloadData 재진입을 지원하지 않는다
+        // ("NSOutlineView Warning: Reentrant call to reloadData detected").
+        //
+        // 재진입 경로가 실제로 있다: reloadData 가 편집 중인 셀의 필드 에디터를 정리하면서
+        // controlTextDidEndEditing 을 부르고, 거기서 다시 refreshTree 를 부른다.
+        // 그러면 아웃라인이 뒤엉켜 알 수 없는 상태로 멈춘다 — 셀프테스트가 5회 중 5회
+        // NSAlert 안에서 정지했고, 원인이 이 경고였다(2026-08-02).
+        guard !isRefreshingTree else { return }
+        isRefreshingTree = true
+        defer { isRefreshingTree = false }
+
         // 창을 막 만든 시점에는 아웃라인에 행이 하나도 없어서 "지금 펼쳐진 폴더" 를 물어봐야 답이 없다.
         // 그 빈 답을 그대로 저장하면 **지난 실행의 펼침 상태가 통째로 지워지고**,
         // 폴더가 다 접힌 채로 뜨니 그 안의 대본은 행 자체가 없어 선택 복원까지 조용히 실패한다.
@@ -4060,14 +4019,22 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
     }
 
     private func reportWriteFailure() {
+        updateWarningBar()
+
+        // ⚠️ **저장이 잠긴 상태에서는 모달을 띄우지 않는다.**
+        //
+        // 잠김은 기동 시 한 번 알렸고 창 상단 경고 바가 계속 떠 있다. 여기서 또 띄우면
+        // 실패할 때마다 모달이 쌓인다. 특히 색인을 못 읽는 상태에서는 "현재 이름" 조회도
+        // 실패해 이름이 안 바뀐 편집까지 저장 시도로 분류되므로, **사이드바를 클릭하는 것만으로**
+        // 모달이 뜬다. 셀프테스트가 여기서 반복해 멈춰 발견했다(2026-08-02).
+        guard !ScriptStore.isWriteBlocked else { return }
+
+        // 여기까지 왔으면 예상 밖의 쓰기 실패다(권한·디스크). 조용히 삼키면 사용자는 저장된 줄 안다.
         let alert = NSAlert()
         alert.window.sharingType = .none
         alert.messageText = "대본 목록을 저장하지 못했습니다"
-        alert.informativeText = ScriptStore.isWriteBlocked
-            ? "목록 파일이 손상되어 저장이 잠겨 있습니다. 앱을 다시 실행하면 복구를 안내합니다."
-            : "저장 경로에 쓸 수 없습니다:\n\(ScriptStore.baseURL.path)"
+        alert.informativeText = "저장 경로에 쓸 수 없습니다:\n\(ScriptStore.baseURL.path)"
         alert.runModal()
-        updateWarningBar()
     }
 
     // MARK: 인라인 이름 변경
@@ -4197,6 +4164,18 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
             if isDescendant(target, of: node) { return false }
         }
         return true
+    }
+
+    /// 셀프테스트용 — refreshTree 안에서 refreshTree 를 다시 부르면 튕겨 나오는지 본다.
+    /// true = 재진입이 차단됨.
+    func refreshTreeReentrancyProbeForTest() -> Bool {
+        var nestedRan = false
+        isRefreshingTree = true          // "지금 갱신 중" 상태를 만든 뒤
+        let before = roots.count
+        refreshTree()                    // 재진입 시도 — 아무것도 하지 않아야 한다
+        nestedRan = (roots.count != before) || outlineView.numberOfRows < 0
+        isRefreshingTree = false
+        return !nestedRan
     }
 
     /// 셀프테스트용 — 셀의 이름 편집이 끝난 상황을 재현한다.
@@ -4486,7 +4465,6 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 
         let title = ScriptStore.loadLibrary().scripts.first { $0.id == id }?.title ?? "대본"
         prompterView.overlay.showToast(title)
-        settingsController?.reloadScriptText()
         libraryController?.prompterDidSwitchScript(to: id)
     }
 
@@ -4510,7 +4488,6 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         prompterView.setText(text, preserveScroll: false)
         updateScript(text, immediate: true)
         prompterView.overlay.showToast("클립보드에서 대본 교체")
-        settingsController?.reloadScriptText()
         libraryController?.prompterDidSwitchScript(to: activeScriptID)
     }
 
@@ -5510,10 +5487,18 @@ func runSettingsLayoutSelfTest() -> Bool {
     }
     let lowest = document.subviews.map { $0.frame.minY }.min() ?? 0
     let highest = document.subviews.map { $0.frame.maxY }.max() ?? 0
-    let ok = lowest >= 0 && highest <= document.frame.height + 0.5
+    let fits = lowest >= 0 && highest <= document.frame.height + 0.5
+
+    // 컨트롤을 **빼도** 맞아야 한다. 예전 보정은 "넘칠 때 늘리기" 만 해서,
+    // 대본 편집 상자(185pt)를 라이브러리 창으로 옮기자 창 아래에 그만큼 빈 공간이 남았다.
+    // 위아래 여백의 합이 이 정도를 넘으면 보정이 한쪽 방향으로만 도는 것이다.
+    let slack = document.frame.height - (highest - lowest)
+    let tight = slack <= 90
+
+    let ok = fits && tight
     print("\(ok ? "PASS" : "FAIL") 설정 창 레이아웃 "
           + "(높이 \(Int(document.frame.height)), 컨트롤 \(document.subviews.count)개, "
-          + "최하단 y=\(Int(lowest)), 최상단 y=\(Int(highest)))")
+          + "최하단 y=\(Int(lowest)), 최상단 y=\(Int(highest)), 여백 \(Int(slack)))")
     return ok
 }
 
@@ -6431,10 +6416,23 @@ func runLibraryContextMenuSelfTest() -> Bool {
         let create = locked.items.first { $0.title == "새 대본" }
         check("잠긴 상태에서 '새 대본' 비활성", create?.isEnabled == false)
     }
-    // 잠긴 상태에서 같은 이름으로 편집이 끝나도 모달이 뜨면 안 된다.
-    // (뜨면 이 줄에서 테스트가 영영 멈추므로, 통과 자체가 검증이다)
-    library.simulateEndEditingForTest(id: script, text: "바뀐 이름")
-    check("잠긴 상태 + 동일 이름 → 멈추지 않음", true)
+    // ★★ 잠긴 상태에서는 **어떤 편집 종료도 모달을 띄우면 안 된다.**
+    //
+    // 색인을 못 읽으면 "현재 이름" 조회도 실패해서, 이름이 안 바뀐 편집까지 저장 시도로
+    // 분류된다. 그때 모달을 띄우면 **사이드바를 클릭하는 것만으로** 모달이 뜨고,
+    // 실사용자는 색인이 깨진 상태에서 창을 쓸 수 없게 된다.
+    // 모달이 뜨면 이 줄에서 테스트가 영영 멈추므로, **통과 자체가 검증이다.**
+    library.simulateEndEditingForTest(id: script, text: "바뀐 이름")     // 같은 이름
+    library.simulateEndEditingForTest(id: script, text: "아주 다른 이름")  // 다른 이름
+    library.simulateEndEditingForTest(id: "존재하지 않는 id", text: "x")
+    check("잠긴 상태에서 편집 종료가 모달로 멈추지 않음", true)
+
+    // ★ refreshTree 재진입 — reloadData 안에서 다시 reloadData 를 부르면
+    //   NSOutlineView 가 "Reentrant call to reloadData detected" 를 내고 뒤엉킨다.
+    resetSupportDirForTest()
+    _ = ScriptStore.createScript(title: "재진입", text: "x")
+    let reentrant = ScriptLibraryWindowController(prompterController: prompter)
+    check("재진입 호출이 튕겨 나옴", reentrant.refreshTreeReentrancyProbeForTest())
 
     print("\(ok ? "PASS" : "FAIL") 라이브러리 우클릭 메뉴 (구성·이동·생성·복제·잠금)")
     resetSupportDirForTest()
