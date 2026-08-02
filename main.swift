@@ -3419,6 +3419,11 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         let contextMenu = NSMenu()
         contextMenu.delegate = self       // 열릴 때마다 재구성(선택 상태에 따라 항목이 달라진다)
         outlineView.menu = contextMenu
+
+        outlineView.registerForDraggedTypes([Self.nodePasteboardType])
+        outlineView.setDraggingSourceOperationMask(.move, forLocal: true)
+        outlineView.setDraggingSourceOperationMask([], forLocal: false)   // 앱 밖으로는 안 나간다
+        outlineView.draggingDestinationFeedbackStyle = .regular
         outlineScroll.documentView = outlineView
 
         // ── 우: 헤더 + 편집기 + 상태줄 ──────────────────
@@ -3734,6 +3739,99 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         if let work = previewWork { work.cancel(); previewWork = nil; work.perform() }
         if let work = inactiveWriteWork { work.cancel(); inactiveWriteWork = nil; work.perform() }
         prompterController?.flushScript()
+    }
+
+    // MARK: 드래그앤드롭
+
+    /// 사설 타입 하나만 싣는다.
+    ///
+    /// `.fileURL` 이나 `.string` 을 함께 실으면 다른 앱으로 실수로 끌어 놓았을 때
+    /// **대본 파일 경로가 새어 나간다**(스텔스 앱에서 그건 곧 대본 유출이다).
+    /// 외부 드롭을 받을 계획도 없으므로 걸러야 할 케이스를 아예 만들지 않는다.
+    static let nodePasteboardType = NSPasteboard.PasteboardType("com.shadowcue.library-node")
+
+    func outlineView(_ ov: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
+        guard let node = item as? LibraryNode, !ScriptStore.isWriteBlocked else { return nil }
+        let entry = NSPasteboardItem()
+        entry.setString(node.id, forType: Self.nodePasteboardType)
+        return entry
+    }
+
+    private func draggedNodes(from info: NSDraggingInfo) -> [LibraryNode] {
+        guard let items = info.draggingPasteboard.pasteboardItems else { return [] }
+        let ids = items.compactMap { $0.string(forType: Self.nodePasteboardType) }
+        var byID: [String: LibraryNode] = [:]
+        func index(_ nodes: [LibraryNode]) { for n in nodes { byID[n.id] = n; index(n.children) } }
+        index(roots)
+        return ids.compactMap { byID[$0] }
+    }
+
+    private func isDescendant(_ candidate: LibraryNode?, of ancestor: LibraryNode) -> Bool {
+        var cursor = candidate
+        while let current = cursor {
+            if current === ancestor { return true }
+            cursor = current.parent
+        }
+        return false
+    }
+
+    func outlineView(_ ov: NSOutlineView, validateDrop info: NSDraggingInfo,
+                     proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
+        // 앱 안에서 시작한 드래그만 받는다.
+        guard info.draggingSource as? NSOutlineView === ov, !ScriptStore.isWriteBlocked else { return [] }
+        let dragged = draggedNodes(from: info)
+        guard !dragged.isEmpty else { return [] }
+
+        // 대본 "위에" 떨어뜨리는 건 의미가 없다(대본은 자식을 가질 수 없다).
+        // 거부하는 대신 그 대본이 있는 폴더로 재조준한다 — 사용자 의도는 대개 그쪽이다.
+        if let target = item as? LibraryNode, !target.isFolder, index == NSOutlineViewDropOnItemIndex {
+            ov.setDropItem(target.parent, dropChildIndex: NSOutlineViewDropOnItemIndex)
+            return .move
+        }
+
+        // 폴더를 자기 자신이나 자손 안으로 넣으면 트리가 끊겨 **대본이 통째로 사라진 것처럼 보인다.**
+        // 저장 계층의 moveFolder 도 거부하지만, 여기서 막아야 드롭 표시가 안 뜬다.
+        if let target = item as? LibraryNode {
+            for node in dragged where node.isFolder {
+                if isDescendant(target, of: node) { return [] }
+            }
+        }
+        return .move
+    }
+
+    func outlineView(_ ov: NSOutlineView, acceptDrop info: NSDraggingInfo,
+                     item: Any?, childIndex index: Int) -> Bool {
+        let dragged = draggedNodes(from: info)
+        guard !dragged.isEmpty else { return false }
+        let destination = (item as? LibraryNode)?.id      // nil = 최상위
+
+        flushPendingEdits()
+        // 여러 개를 끌었으면 **화면에 보이던 순서대로** 처리해야 최종 배치가 눈과 일치한다.
+        var cursor = index
+        var moved = false
+        for node in dragged {
+            let ok = node.isFolder
+                ? ScriptStore.moveFolder(id: node.id, toParent: destination,
+                                         at: index == NSOutlineViewDropOnItemIndex ? nil : cursor)
+                : ScriptStore.moveScript(id: node.id, toFolder: destination,
+                                         at: index == NSOutlineViewDropOnItemIndex ? nil : cursor)
+            if ok {
+                moved = true
+                if index != NSOutlineViewDropOnItemIndex { cursor += 1 }
+            }
+        }
+        guard moved else { return false }
+        refreshTree()
+        // 옮긴 항목을 다시 고른다 — 안 그러면 사용자가 방금 옮긴 게 어디 갔는지 눈으로 찾아야 한다.
+        let ids = Set(dragged.map(\.id))
+        var rows: [Int] = []
+        for row in 0..<outlineView.numberOfRows {
+            if let node = outlineView.item(atRow: row) as? LibraryNode, ids.contains(node.id) {
+                rows.append(row)
+            }
+        }
+        outlineView.selectRowIndexes(IndexSet(rows), byExtendingSelection: false)
+        return true
     }
 
     // MARK: 컨텍스트 메뉴
@@ -4083,6 +4181,22 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
     func performMenuItemForTest(_ item: NSMenuItem) {
         guard let action = item.action else { return }
         _ = (item.target as AnyObject).perform(action, with: item)
+    }
+
+    /// 셀프테스트용 — 드래그 검증/수락을 창 없이 태운다.
+    /// (NSDraggingInfo 는 AppKit 이 만들어 주는 타입이라 흉내낼 수 없어, 노드 id 로 대신 받는다)
+    func validateDropForTest(dragging ids: [String], onto targetID: String?,
+                             childIndex: Int = NSOutlineViewDropOnItemIndex) -> Bool {
+        var byID: [String: LibraryNode] = [:]
+        func index(_ nodes: [LibraryNode]) { for n in nodes { byID[n.id] = n; index(n.children) } }
+        index(roots)
+        let dragged = ids.compactMap { byID[$0] }
+        guard !dragged.isEmpty, !ScriptStore.isWriteBlocked else { return false }
+        let target = targetID.flatMap { byID[$0] }
+        for node in dragged where node.isFolder {
+            if isDescendant(target, of: node) { return false }
+        }
+        return true
     }
 
     /// 셀프테스트용 — 셀의 이름 편집이 끝난 상황을 재현한다.
@@ -6327,6 +6441,53 @@ func runLibraryContextMenuSelfTest() -> Bool {
     return ok
 }
 
+/// I. 드래그앤드롭 가드.
+///
+/// 폴더를 자기 자신이나 자손 안으로 떨어뜨리면 트리가 끊겨 **대본이 통째로 사라진 것처럼 보인다.**
+/// 저장 계층(moveFolder)이 2차 방어를 하지만, 드롭 표시가 뜨는 것 자체를 막아야 한다.
+func runLibraryDragDropSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 라이브러리 드래그앤드롭 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 드래그앤드롭: \(label)") }
+    }
+
+    guard let parent = ScriptStore.createFolder(name: "부모"),
+          let child = ScriptStore.createFolder(name: "자식", parentID: parent.id),
+          let grand = ScriptStore.createFolder(name: "손자", parentID: child.id),
+          let other = ScriptStore.createFolder(name: "남남"),
+          let script = ScriptStore.createScript(title: "대본", in: parent.id, text: "본문") else {
+        print("FAIL 드래그앤드롭: 구성"); return false
+    }
+    SettingsStore.shared.update {
+        $0.libraryWindowFrame = nil
+        $0.libraryExpandedFolderIDs = [parent.id, child.id, grand.id, other.id]
+    }
+    let prompter = PrompterWindowController()
+    let library = ScriptLibraryWindowController(prompterController: prompter)
+
+    // ★ 순환 드롭 거부
+    check("자기 자신 위로 거부", library.validateDropForTest(dragging: [parent.id], onto: parent.id) == false)
+    check("자식 안으로 거부", library.validateDropForTest(dragging: [parent.id], onto: child.id) == false)
+    check("손자 안으로 거부", library.validateDropForTest(dragging: [parent.id], onto: grand.id) == false)
+    // 정상 드롭은 허용
+    check("남 폴더로 허용", library.validateDropForTest(dragging: [parent.id], onto: other.id))
+    check("최상위로 허용", library.validateDropForTest(dragging: [child.id], onto: nil))
+    check("대본은 어디로든 허용", library.validateDropForTest(dragging: [script], onto: grand.id))
+
+    // 쓰기가 잠기면 드래그 자체를 시작하지 않는다
+    try? "{{{".data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+    _ = ScriptStore.loadLibraryDetailed()
+    check("잠긴 상태에서 드롭 거부", library.validateDropForTest(dragging: [script], onto: other.id) == false)
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 드래그앤드롭 (순환거부·정상허용·잠금)")
+    resetSupportDirForTest()
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -6346,6 +6507,7 @@ if CommandLine.arguments.contains("--selftest") {
     let libWindowOK = runLibraryWindowLayoutSelfTest()
     let deleteSyncOK = runScriptDeletionSyncSelfTest()
     let ctxMenuOK = runLibraryContextMenuSelfTest()
+    let dragDropOK = runLibraryDragDropSelfTest()
 
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
@@ -6356,7 +6518,7 @@ if CommandLine.arguments.contains("--selftest") {
     exit(persistenceOK && layoutOK && mirrorOK && mirrorLayoutOK
          && buttonsOK && cheatOK && supportDirOK
          && migrationOK && corruptionOK && decoderOK && crudOK && treeOK
-         && libWindowOK && deleteSyncOK && ctxMenuOK ? 0 : 1)
+         && libWindowOK && deleteSyncOK && ctxMenuOK && dragDropOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
