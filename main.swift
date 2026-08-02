@@ -157,6 +157,14 @@ struct Settings: Codable, Equatable {
     var mirrorHorizontal: Bool = false
     var mirrorVertical: Bool = false
 
+    // 대본 라이브러리 창 — 문서가 아니라 UI 상태이므로 library.json 이 아니라 여기에 둔다.
+    var libraryWindowFrame: [Double]?
+    var librarySidebarWidth: Double = 260
+    var libraryExpandedFolderIDs: [String] = []
+    /// 사이드바 선택 복원용. **`activeScriptID` 와 의도적으로 별개다** —
+    /// 라이브러리에서 대본을 골라 보는 것과 그 대본을 프롬프터에 올리는 것은 다른 행동이다.
+    var libraryLastSelectedID: String?
+
     init() {}
 
     /// **전방호환 디코더 — 자동 합성에 맡기면 안 된다.**
@@ -189,6 +197,10 @@ struct Settings: Codable, Equatable {
         countdownEnabled  = value(.countdownEnabled, fallback.countdownEnabled)
         mirrorHorizontal  = value(.mirrorHorizontal, fallback.mirrorHorizontal)
         mirrorVertical    = value(.mirrorVertical, fallback.mirrorVertical)
+        libraryWindowFrame       = value(.libraryWindowFrame, fallback.libraryWindowFrame)
+        librarySidebarWidth      = value(.librarySidebarWidth, fallback.librarySidebarWidth)
+        libraryExpandedFolderIDs = value(.libraryExpandedFolderIDs, fallback.libraryExpandedFolderIDs)
+        libraryLastSelectedID    = value(.libraryLastSelectedID, fallback.libraryLastSelectedID)
     }
 }
 
@@ -283,17 +295,167 @@ final class SettingsStore {
 
 // MARK: - Script Storage
 
+/// 배열 원소 하나가 깨져도 나머지를 살리는 래퍼.
+///
+/// `[ScriptMeta].self` 로 한 번에 디코드하면 원소 하나 때문에 배열 전체가 throw 되고,
+/// 그러면 대본 300개짜리 라이브러리가 메타 하나 깨졌다고 통째로 사라진다.
+private struct Lenient<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws { value = try? T(from: decoder) }
+}
+
+/// 모델 타입들은 **전부 손으로 쓴 `init(from:)`** 을 갖는다.
+///
+/// 합성 디코더는 프로퍼티 기본값을 쓰지 않아서, 필드를 하나만 추가해도 그 키가 없는 기존 파일이
+/// `keyNotFound` 로 통째로 디코드 실패한다. `Settings`(위쪽)가 같은 이유로 이미 손으로 쓴
+/// 디코더를 갖고 있는데, 대본 쪽은 합성 디코더라 v2 필드를 추가하는 순간 v1 파일이 전부
+/// "읽기 실패 → 빈 라이브러리" 로 떨어졌을 것이다. 그 경로의 끝은 색인 전소다(ScriptStore 주석 참조).
 struct ScriptMeta: Codable, Equatable {
     var id: String
     var title: String
     var createdAt: Date
     var updatedAt: Date
     var lastScrollOffset: Double = 0
+    /// nil = 최상위. **없는 폴더를 가리켜도 버리지 않는다** — 트리 빌더가 최상위로 승격시킨다.
+    var folderID: String? = nil
+    /// 같은 부모 안에서의 순서. 이동·삭제 후 형제끼리 0..n-1 로 재정규화한다.
+    var sortIndex: Int = 0
+
+    init(id: String, title: String, createdAt: Date, updatedAt: Date,
+         lastScrollOffset: Double = 0, folderID: String? = nil, sortIndex: Int = 0) {
+        self.id = id; self.title = title
+        self.createdAt = createdAt; self.updatedAt = updatedAt
+        self.lastScrollOffset = lastScrollOffset
+        self.folderID = folderID; self.sortIndex = sortIndex
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // id 와 title 은 없으면 이 항목을 살릴 수 없다 — 여기서만 throw 하고(= Lenient 가 이 원소만 버림),
+        // 나머지 필드는 개별 폴백한다.
+        id = try c.decode(String.self, forKey: .id)
+        title = ((try? c.decodeIfPresent(String.self, forKey: .title)) ?? nil) ?? "제목 없음"
+        createdAt = ((try? c.decodeIfPresent(Date.self, forKey: .createdAt)) ?? nil) ?? Date()
+        updatedAt = ((try? c.decodeIfPresent(Date.self, forKey: .updatedAt)) ?? nil) ?? createdAt
+        lastScrollOffset = ((try? c.decodeIfPresent(Double.self, forKey: .lastScrollOffset)) ?? nil) ?? 0
+        folderID = (try? c.decodeIfPresent(String.self, forKey: .folderID)) ?? nil
+        sortIndex = ((try? c.decodeIfPresent(Int.self, forKey: .sortIndex)) ?? nil) ?? 0
+    }
+}
+
+/// 폴더 = 대본 분류(중첩 가능).
+///
+/// **파일시스템 디렉터리와 대응시키지 않는다.** 본문은 계속 `scripts/<uuid>.md` 평면 구조로 두고
+/// 폴더는 색인에만 존재한다. 실제 디렉터리로 만들면 이름 변경·이동마다 파일 이동이 따라붙고,
+/// 그 도중에 프로세스가 죽으면 색인과 디스크가 어긋나 복구가 어려워진다.
+struct ScriptFolder: Codable, Equatable {
+    var id: String
+    var name: String
+    var parentID: String? = nil
+    var sortIndex: Int = 0
+    var createdAt: Date
+    var updatedAt: Date
+
+    init(id: String, name: String, parentID: String? = nil, sortIndex: Int = 0,
+         createdAt: Date, updatedAt: Date) {
+        self.id = id; self.name = name; self.parentID = parentID
+        self.sortIndex = sortIndex; self.createdAt = createdAt; self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = ((try? c.decodeIfPresent(String.self, forKey: .name)) ?? nil) ?? "이름 없는 폴더"
+        parentID = (try? c.decodeIfPresent(String.self, forKey: .parentID)) ?? nil
+        sortIndex = ((try? c.decodeIfPresent(Int.self, forKey: .sortIndex)) ?? nil) ?? 0
+        createdAt = ((try? c.decodeIfPresent(Date.self, forKey: .createdAt)) ?? nil) ?? Date()
+        updatedAt = ((try? c.decodeIfPresent(Date.self, forKey: .updatedAt)) ?? nil) ?? createdAt
+    }
+}
+
+/// 보드 = 촬영용 묶음(대본 여러 개를 순서대로). **이 버전에는 UI 도 CRUD API 도 없다.**
+///
+/// 그런데도 지금 필드를 넣는 이유는 하나다: 이 버전 코드가 `library.json` 을 디코드-재인코드 하는
+/// 순간, 모르는 최상위 키는 조용히 사라진다. 지금 자리를 비워 두어야 다음 버전에서 만든 보드가
+/// 이 버전으로 한 번 되돌아가도 살아남고, 마이그레이션을 v3 로 또 하지 않아도 된다.
+///
+/// `scriptIDs` 가 소유가 아니라 **참조**인 것도 의도다 — 같은 대본이 여러 보드에 들어갈 수 있다.
+struct ScriptBoard: Codable, Equatable {
+    var id: String
+    var name: String
+    var scriptIDs: [String] = []
+    var sortIndex: Int = 0
+    var createdAt: Date
+    var updatedAt: Date
+    var notes: String = ""
+
+    init(id: String, name: String, scriptIDs: [String] = [], sortIndex: Int = 0,
+         createdAt: Date, updatedAt: Date, notes: String = "") {
+        self.id = id; self.name = name; self.scriptIDs = scriptIDs
+        self.sortIndex = sortIndex; self.createdAt = createdAt
+        self.updatedAt = updatedAt; self.notes = notes
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = ((try? c.decodeIfPresent(String.self, forKey: .name)) ?? nil) ?? "이름 없는 보드"
+        scriptIDs = ((try? c.decodeIfPresent([String].self, forKey: .scriptIDs)) ?? nil) ?? []
+        sortIndex = ((try? c.decodeIfPresent(Int.self, forKey: .sortIndex)) ?? nil) ?? 0
+        createdAt = ((try? c.decodeIfPresent(Date.self, forKey: .createdAt)) ?? nil) ?? Date()
+        updatedAt = ((try? c.decodeIfPresent(Date.self, forKey: .updatedAt)) ?? nil) ?? createdAt
+        notes = ((try? c.decodeIfPresent(String.self, forKey: .notes)) ?? nil) ?? ""
+    }
 }
 
 struct ScriptLibrary: Codable, Equatable {
-    var version: Int = 1
+    /// v1: scripts 만. v2: folders/boards + ScriptMeta.folderID/sortIndex.
+    static let currentVersion = 2
+
+    var version: Int = ScriptLibrary.currentVersion
     var scripts: [ScriptMeta] = []
+    var folders: [ScriptFolder] = []
+    var boards: [ScriptBoard] = []
+
+    init() {}
+
+    init(version: Int, scripts: [ScriptMeta], folders: [ScriptFolder] = [], boards: [ScriptBoard] = []) {
+        self.version = version; self.scripts = scripts
+        self.folders = folders; self.boards = boards
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // 버전 키가 없으면 v1 이다(v1 파일에는 version 이 있지만, 없어도 v1 로 보는 게 안전하다).
+        version = ((try? c.decodeIfPresent(Int.self, forKey: .version)) ?? nil) ?? 1
+        scripts = (((try? c.decodeIfPresent([Lenient<ScriptMeta>].self, forKey: .scripts)) ?? nil) ?? [])
+            .compactMap(\.value)
+        folders = (((try? c.decodeIfPresent([Lenient<ScriptFolder>].self, forKey: .folders)) ?? nil) ?? [])
+            .compactMap(\.value)
+        boards = (((try? c.decodeIfPresent([Lenient<ScriptBoard>].self, forKey: .boards)) ?? nil) ?? [])
+            .compactMap(\.value)
+    }
+}
+
+/// `library.json` 을 읽은 결과의 신뢰도.
+///
+/// **최초 실행과 로드 실패를 반드시 구분해야 한다.** 둘 다 "빈 라이브러리" 로 보이지만,
+/// 전자는 써도 되고 후자는 쓰면 안 된다. 구분은 파일 존재 여부로만 한다
+/// (`ensureActiveScript()` 가 이미 같은 원칙을 쓴다).
+enum LibraryLoadState: Equatable {
+    case fresh                                  // 파일 없음 = 진짜 최초 실행. 쓰기 허용
+    case ok
+    case repaired(dropped: Int)                 // 원소 일부만 버림. 쓰기 허용
+    case corruptTopLevel(preserved: URL?)       // 통째로 못 읽음. 쓰기 차단
+    case futureVersion(Int)                     // 이 빌드보다 새 포맷. 쓰기 차단
+
+    /// 이 상태에서 색인을 덮어쓰면 데이터가 사라지는가.
+    var blocksWrites: Bool {
+        switch self {
+        case .corruptTopLevel, .futureVersion: return true
+        case .fresh, .ok, .repaired: return false
+        }
+    }
 }
 
 /// 대본은 설정이 아니라 **문서**다. 그래서 UserDefaults 가 아니라 파일로 둔다.
@@ -348,10 +510,33 @@ enum ScriptStore {
     }
     static var scriptsURL: URL { baseURL.appendingPathComponent("scripts", isDirectory: true) }
     static var libraryURL: URL { baseURL.appendingPathComponent("library.json") }
+    /// 삭제한 대본이 잠시 머무는 곳. 지우는 게 아니라 옮기는 것이라 되돌릴 수 있다.
+    static var trashURL: URL { baseURL.appendingPathComponent("trash", isDirectory: true) }
 
     static func prepare() {
         try? FileManager.default.createDirectory(at: scriptsURL, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: trashURL, withIntermediateDirectories: true)
     }
+
+    // MARK: 색인 신뢰도
+
+    /// 색인을 신뢰할 수 없을 때 래치된다. 한 번 켜지면 어떤 경로로도 `library.json` 을 쓰지 않는다.
+    ///
+    /// **이 래치가 없으면 "대본을 열어 보기만 해도" 목록이 날아간다.** 경로는 이렇다:
+    ///   디코드 실패 → 빈 라이브러리 → `saveScrollOffset`(스크롤 1pt만 움직여도 불린다)의
+    ///   read-modify-write → `saveLibrary(빈 것)` → 색인 전소.
+    /// `.md` 본문은 남지만 목록에서 전부 사라지므로 사용자 입장에선 대본을 잃은 것과 같다.
+    private(set) static var isWriteBlocked = false
+    private(set) static var lastLoadState: LibraryLoadState = .fresh
+
+    /// 셀프테스트 전용 — 격리 디렉터리를 갈아엎은 뒤 래치를 푼다.
+    static func resetWriteBlockForTest() {
+        isWriteBlocked = false
+        lastLoadState = .fresh
+    }
+
+    /// 사용자가 "디스크에서 복구" 를 선택했을 때만 부른다.
+    static func unblockWritesAfterRecovery() { isWriteBlocked = false }
 
     static func url(for id: String) -> URL {
         scriptsURL.appendingPathComponent("\(id).md")
@@ -383,18 +568,175 @@ enum ScriptStore {
         }
     }
 
-    static func loadLibrary() -> ScriptLibrary {
-        guard let data = try? Data(contentsOf: libraryURL),
-              let library = try? JSONDecoder().decode(ScriptLibrary.self, from: data) else {
-            return ScriptLibrary()
+    /// 색인을 읽고 **얼마나 믿을 수 있는지까지** 돌려준다. 부작용으로 쓰기 래치를 갱신한다.
+    @discardableResult
+    static func loadLibraryDetailed() -> (library: ScriptLibrary, state: LibraryLoadState) {
+        func finish(_ library: ScriptLibrary, _ state: LibraryLoadState) -> (ScriptLibrary, LibraryLoadState) {
+            lastLoadState = state
+            // 래치는 켜지기만 하고 스스로 꺼지지 않는다. 한 번 의심스러운 파일을 본 실행에서는
+            // 이후 어떤 로드가 성공해도 쓰지 않는다(부분 성공에 속아 덮어쓰는 걸 막는다).
+            if state.blocksWrites { isWriteBlocked = true }
+            return (library, state)
         }
-        return library
+
+        guard FileManager.default.fileExists(atPath: libraryURL.path) else {
+            return finish(ScriptLibrary(), .fresh)      // 최초 실행 — 쓰기 허용
+        }
+        guard let data = try? Data(contentsOf: libraryURL) else {
+            return finish(ScriptLibrary(), .corruptTopLevel(preserved: preserveCorruptLibrary()))
+        }
+        guard let library = try? JSONDecoder().decode(ScriptLibrary.self, from: data) else {
+            return finish(ScriptLibrary(), .corruptTopLevel(preserved: preserveCorruptLibrary()))
+        }
+        if library.version > ScriptLibrary.currentVersion {
+            // 최신 버전에서 만든 파일이다. 이 빌드가 모르는 키(보드 등)를 지우지 않도록 쓰지 않는다.
+            return finish(library, .futureVersion(library.version))
+        }
+
+        // 최상위는 읽혔지만 원소가 버려졌는지 본다. 모델에 개수를 담지 않고 여기서 원본과 대조한다
+        // (모델을 순수하게 유지하려고 — Equatable/Codable 에 진단용 필드가 섞이면 왕복 비교가 깨진다).
+        let dropped = droppedElementCount(rawData: data, decoded: library)
+        if dropped > 0 {
+            _ = preserveCorruptLibrary()                // 버려진 원소를 되살릴 수 있게 원본 보존
+            return finish(library, .repaired(dropped: dropped))
+        }
+        return finish(library, .ok)
     }
 
-    static func saveLibrary(_ library: ScriptLibrary) {
+    /// 기존 호출부를 그대로 두기 위해 시그니처를 유지한다.
+    static func loadLibrary() -> ScriptLibrary { loadLibraryDetailed().library }
+
+    /// 원본 JSON 의 배열 길이와 디코드 결과 길이를 비교해 버려진 원소 수를 센다.
+    private static func droppedElementCount(rawData: Data, decoded: ScriptLibrary) -> Int {
+        guard let root = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any] else { return 0 }
+        func rawCount(_ key: String) -> Int { (root[key] as? [Any])?.count ?? 0 }
+        let d = (rawCount("scripts") - decoded.scripts.count)
+              + (rawCount("folders") - decoded.folders.count)
+              + (rawCount("boards")  - decoded.boards.count)
+        return max(0, d)
+    }
+
+    /// 의심스러운 색인을 타임스탬프 붙여 **복사**한다(원본은 그대로 둔다 — 손으로 고칠 수 있게).
+    @discardableResult
+    private static func preserveCorruptLibrary() -> URL? {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let dest = baseURL.appendingPathComponent("library.corrupt-\(stamp).json")
+        guard !FileManager.default.fileExists(atPath: dest.path) else { return dest }
+        do {
+            try FileManager.default.copyItem(at: libraryURL, to: dest)
+            return dest
+        } catch { return nil }
+    }
+
+    @discardableResult
+    static func saveLibrary(_ library: ScriptLibrary) -> Bool {
+        guard !isWriteBlocked else { return false }     // ← 색인 소실을 막는 단 하나의 가드
         prepare()
-        guard let data = try? JSONEncoder().encode(library) else { return }
-        try? data.write(to: libraryURL, options: .atomic)
+        // 본문(`write(id:text:)`)과 같은 규칙으로 직전 세대를 하나 남긴다.
+        if FileManager.default.fileExists(atPath: libraryURL.path) {
+            let backup = libraryURL.appendingPathExtension("bak")
+            try? FileManager.default.removeItem(at: backup)
+            try? FileManager.default.copyItem(at: libraryURL, to: backup)
+        }
+        guard let data = try? JSONEncoder().encode(library) else { return false }
+        do {
+            try data.write(to: libraryURL, options: .atomic)
+            return true
+        } catch { return false }
+    }
+
+    /// 최종 안전망 — `scripts/*.md` 를 훑어 색인을 재구성한다.
+    ///
+    /// 폴더 구조는 잃지만 **대본은 하나도 잃지 않는다.** 이 함수가 있기 때문에
+    /// 마이그레이션이 `.md` 를 건드리지 않는 한, 최악의 경우에도 되돌릴 수 있다.
+    static func rebuildLibraryFromDisk() -> ScriptLibrary {
+        prepare()
+        let fm = FileManager.default
+        let urls = (try? fm.contentsOfDirectory(at: scriptsURL,
+                                                includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey]))
+            ?? []
+        var metas: [ScriptMeta] = []
+        for url in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+        where url.pathExtension == "md" {
+            let id = url.deletingPathExtension().lastPathComponent
+            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+            let created = values?.creationDate ?? Date()
+            metas.append(ScriptMeta(id: id,
+                                    title: derivedTitle(from: text, fallbackIndex: metas.count + 1),
+                                    createdAt: created,
+                                    updatedAt: values?.contentModificationDate ?? created,
+                                    sortIndex: metas.count))
+        }
+        return ScriptLibrary(version: ScriptLibrary.currentVersion, scripts: metas)
+    }
+
+    /// 본문에서 제목을 유추한다: 첫 `# ` 헤딩 → 첫 비어 있지 않은 줄 → "복구된 대본 N".
+    static func derivedTitle(from text: String, fallbackIndex: Int) -> String {
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("#") {
+                let stripped = line.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces)
+                if !stripped.isEmpty { return String(stripped.prefix(40)) }
+            }
+            return String(line.prefix(40))
+        }
+        return "복구된 대본 \(fallbackIndex)"
+    }
+
+    /// 휴지통이 무한히 커지지 않게 기동 때 한 번 솎는다.
+    /// 되돌리기는 며칠 안에 하는 행동이므로 30일이면 넉넉하고, 개수 상한을 함께 두어
+    /// 하루에 수십 개를 지운 경우에도 디스크가 계속 불어나지 않게 한다.
+    static func pruneTrash(keepDays: Int = 30, keepCount: Int = 50) {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(at: trashURL,
+                                                     includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        let dated = urls.map { url -> (URL, Date) in
+            let d = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            return (url, d ?? .distantPast)
+        }.sorted { $0.1 > $1.1 }        // 최신 먼저
+
+        let cutoff = Date().addingTimeInterval(-Double(keepDays) * 86_400)
+        for (index, entry) in dated.enumerated() where index >= keepCount || entry.1 < cutoff {
+            try? fm.removeItem(at: entry.0)
+        }
+    }
+
+    // MARK: 마이그레이션
+
+    /// v1 → v2. **`library.json` 에만 손댄다. `scripts/*.md` 는 읽지도 쓰지도 않는다.**
+    ///
+    /// 반드시 `loadActiveScript()` 보다 **먼저** 불러야 한다. 그 경로가
+    /// `ensureActiveScript → touch → saveLibrary` 로 이어져 v1 파일 위에 v2 를 얹어 버리기 때문이다.
+    @discardableResult
+    static func migrateIfNeeded() -> Bool {
+        let (library, state) = loadLibraryDetailed()
+        // 의심스러운 파일은 건드리지 않는다. 마이그레이션이야말로 덮어쓰기이므로 가장 위험하다.
+        guard !state.blocksWrites else { return false }
+        guard state != .fresh else { return false }         // 쓸 게 없다
+        guard library.version < ScriptLibrary.currentVersion else { return false }   // 멱등
+
+        // v1 원본을 한 번만 남긴다(이미 있으면 덮어쓰지 않는다 — 두 번째 실행이 첫 백업을 지우면 안 된다).
+        let v1Backup = baseURL.appendingPathComponent("library.v\(library.version).json")
+        if !FileManager.default.fileExists(atPath: v1Backup.path) {
+            try? FileManager.default.copyItem(at: libraryURL, to: v1Backup)
+        }
+
+        var migrated = library
+        migrated.version = ScriptLibrary.currentVersion
+        migrated.folders = []
+        migrated.boards = []
+        // 기존 배열 순서를 그대로 순서로 굳힌다(그 전엔 순서 개념 자체가 없었다).
+        for index in migrated.scripts.indices {
+            migrated.scripts[index].folderID = nil
+            migrated.scripts[index].sortIndex = index
+        }
+        // 실패해도 차단하지 않는다 — v1 파일이 그대로 남아 있고 v2 디코더가 v1 을 읽을 수 있어
+        // 기능적 손실이 없다. 다음 실행에 다시 시도한다.
+        return saveLibrary(migrated)
     }
 
     /// 어디까지 읽었는지 기억한다(재실행 후 이어읽기).
@@ -429,9 +771,25 @@ enum ScriptStore {
     static func ensureActiveScript() -> (id: String, text: String) {
         prepare()
         let storedID = SettingsStore.shared.settings.activeScriptID
+
+        // ① 저장된 대본이 아직 있으면 그것
         if let id = storedID, exists(id: id) {
             return (id, read(id: id) ?? "")
         }
+
+        // ② 없으면 **남아 있는 대본 중 최신**으로 넘어간다.
+        //    라이브러리에서 활성 대본을 지우면 여기로 오는데, 곧장 ③으로 가면 멀쩡한 대본 옆에
+        //    데모 대본이 새로 생긴다. 격리 도메인으로 테스트를 돌릴 때마다 내용이 똑같은
+        //    "기본 대본" 이 다섯 개 쌓였던 것과 같은 종류의 사고다(build.sh 주석 참조).
+        let survivors = loadLibrary().scripts
+            .filter { exists(id: $0.id) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+        if let next = survivors.first {
+            SettingsStore.shared.update { $0.activeScriptID = next.id }
+            return (next.id, read(id: next.id) ?? "")
+        }
+
+        // ③ 하나도 없을 때만 새로 만든다
         let id = storedID ?? UUID().uuidString
         write(id: id, text: demoScript)
         touch(id: id, title: "기본 대본")
@@ -3185,6 +3543,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 스텔스 가드를 창 생성보다 먼저 건다.
         installStealthGuard()
 
+        // 대본 색인을 v2 로 올린다. **반드시 loadActiveScript() 보다 먼저.**
+        // 그 경로가 ensureActiveScript → touch → saveLibrary 로 이어져,
+        // 정규화되지 않은 v1 파일 위에 v2 를 얹어 버린다.
+        ScriptStore.migrateIfNeeded()
+        ScriptStore.pruneTrash()
+        reportLibraryProblemIfNeeded()
+
         // Create prompter window
         prompterController = PrompterWindowController()
 
@@ -3243,6 +3608,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let window = note.object as? NSWindow else { return }
             if window.sharingType != .none {
                 window.sharingType = .none
+            }
+        }
+    }
+
+    /// 색인을 신뢰할 수 없을 때만 사용자에게 알린다.
+    ///
+    /// 조용히 넘어가면 안 된다 — 쓰기가 차단된 상태에서는 새 대본을 만들어도, 이름을 바꿔도
+    /// 다음 실행에 사라진다. "저장이 안 되는데 아무 말도 없는" 상태가 가장 나쁘다.
+    private func reportLibraryProblemIfNeeded() {
+        switch ScriptStore.lastLoadState {
+        case .fresh, .ok, .repaired:
+            return      // repaired 는 이미 살릴 건 다 살렸고 쓰기도 열려 있다
+        case .futureVersion(let version):
+            let alert = NSAlert()
+            alert.window.sharingType = .none
+            alert.messageText = "대본 목록이 더 새로운 버전에서 만들어졌습니다"
+            alert.informativeText = """
+                목록 형식 v\(version) 은 이 버전(v\(ScriptLibrary.currentVersion))이 모릅니다.
+                여기서 저장하면 새 버전이 기록한 정보가 지워지므로, 대본 목록을 읽기 전용으로 둡니다.
+                최신 ShadowCue 로 여시면 정상 동작합니다.
+                """
+            alert.addButton(withTitle: "읽기 전용으로 계속")
+            alert.runModal()
+        case .corruptTopLevel(let preserved):
+            let alert = NSAlert()
+            alert.window.sharingType = .none
+            alert.messageText = "대본 목록 파일을 읽지 못했습니다"
+            alert.informativeText = """
+                대본 본문(\(ScriptStore.scriptsURL.path))은 그대로 있습니다. 목록만 손상됐습니다.
+                덮어쓰지 않도록 저장을 잠가 두었습니다.
+
+                '목록 다시 만들기' 를 누르면 대본 파일을 훑어 목록을 새로 만듭니다.
+                폴더 구성은 사라지지만 대본은 하나도 잃지 않습니다.
+                \(preserved.map { "\n손상된 원본은 \($0.lastPathComponent) 로 남겨 두었습니다." } ?? "")
+                """
+            alert.addButton(withTitle: "목록 다시 만들기")
+            alert.addButton(withTitle: "읽기 전용으로 계속")
+            if alert.runModal() == .alertFirstButtonReturn {
+                let rebuilt = ScriptStore.rebuildLibraryFromDisk()
+                ScriptStore.unblockWritesAfterRecovery()
+                _ = ScriptStore.saveLibrary(rebuilt)
             }
         }
     }
@@ -3891,6 +4297,228 @@ func runSupportDirIsolationSelfTest() -> Bool {
     return ok
 }
 
+// MARK: - 대본 라이브러리 셀프테스트
+
+/// 지원 디렉터리를 초기 상태로 되돌린다.
+///
+/// **`SHADOWCUE_SUPPORT_DIR` 이 없으면 아무것도 하지 않는다.** 이 가드가 없으면 실수 한 번에
+/// 사용자의 진짜 대본 라이브러리가 통째로 지워진다. build.sh 는 항상 훅을 주지만 누군가
+/// 바이너리를 손으로 실행할 수 있으므로 코드에서 막는다. 훅이 없으면 호출부가 테스트를 건너뛴다.
+@discardableResult
+func resetSupportDirForTest() -> Bool {
+    guard let dir = ProcessInfo.processInfo.environment["SHADOWCUE_SUPPORT_DIR"],
+          !dir.isEmpty else { return false }
+    try? FileManager.default.removeItem(atPath: dir)
+    ScriptStore.resetWriteBlockForTest()
+    ScriptStore.prepare()
+    return true
+}
+
+private func writeLibraryJSONForTest(_ json: String) {
+    ScriptStore.prepare()
+    try? json.data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+}
+
+/// A. v1 → v2 마이그레이션.
+func runLibraryMigrationSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 라이브러리 마이그레이션 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 마이그레이션: \(label)") }
+    }
+
+    // 스크롤 위치까지 담긴 실제 v1 형태
+    writeLibraryJSONForTest("""
+    {"version":1,"scripts":[
+      {"id":"aaa","title":"첫 대본","createdAt":100,"updatedAt":200,"lastScrollOffset":42.5},
+      {"id":"bbb","title":"둘째 대본","createdAt":300,"updatedAt":400}
+    ]}
+    """)
+    let before = try? Data(contentsOf: ScriptStore.libraryURL)
+
+    check("마이그레이션 성공", ScriptStore.migrateIfNeeded())
+    let lib = ScriptStore.loadLibrary()
+    check("version==2", lib.version == 2)
+    check("대본 2개 보존", lib.scripts.count == 2)
+    check("id 순서 보존", lib.scripts.map(\.id) == ["aaa", "bbb"])
+    check("title 보존", lib.scripts.map(\.title) == ["첫 대본", "둘째 대본"])
+    check("스크롤 위치 보존", lib.scripts.first?.lastScrollOffset == 42.5)
+    check("folderID 전부 nil", lib.scripts.allSatisfy { $0.folderID == nil })
+    check("sortIndex 0..n-1", lib.scripts.map(\.sortIndex) == [0, 1])
+    check("folders/boards 비어 있음", lib.folders.isEmpty && lib.boards.isEmpty)
+
+    let backup = ScriptStore.baseURL.appendingPathComponent("library.v1.json")
+    let backupData = try? Data(contentsOf: backup)
+    check("v1 백업 존재", backupData != nil)
+    check("v1 백업 바이트 동일", backupData == before)
+
+    // 멱등성 — 두 번째 호출은 아무것도 하지 않고, 첫 백업을 덮어쓰지도 않는다
+    check("두 번째 호출은 no-op", ScriptStore.migrateIfNeeded() == false)
+    check("백업이 덮어써지지 않음", (try? Data(contentsOf: backup)) == before)
+    check("재호출 후에도 대본 2개", ScriptStore.loadLibrary().scripts.count == 2)
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 마이그레이션 (v1→v2, 대본 \(lib.scripts.count)개, sortIndex \(lib.scripts.map(\.sortIndex)))")
+    return ok
+}
+
+/// B. 손상된 색인 방어 — **이 테스트가 이번 커밋의 핵심이다.**
+///
+/// 수정 전 코드에서는 `loadLibrary()` 가 디코드 실패 시 조용히 빈 라이브러리를 돌려주고,
+/// 그 뒤 `touch`/`saveScrollOffset` 의 read-modify-write 가 멀쩡한 색인을 덮어썼다.
+func runLibraryCorruptionGuardSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 색인 손상 방어 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 색인 방어: \(label)") }
+    }
+
+    // (1) 파일 없음 = 최초 실행. 쓰기 허용.
+    check("파일 없음 → .fresh", ScriptStore.loadLibraryDetailed().state == .fresh)
+    check(".fresh 는 쓰기 허용", ScriptStore.saveLibrary(ScriptLibrary()))
+
+    // (2) 정상 왕복
+    resetSupportDirForTest()
+    var good = ScriptLibrary()
+    good.scripts = [ScriptMeta(id: "x", title: "정상", createdAt: Date(), updatedAt: Date())]
+    check("정상 저장", ScriptStore.saveLibrary(good))
+    check("정상 → .ok", ScriptStore.loadLibraryDetailed().state == .ok)
+
+    // (3) 최상위 손상 → 차단
+    resetSupportDirForTest()
+    ScriptStore.saveLibrary(good)
+    writeLibraryJSONForTest("{{{ 이건 JSON 이 아니다")
+    let corruptBytes = try? Data(contentsOf: ScriptStore.libraryURL)
+    let corruptState = ScriptStore.loadLibraryDetailed().state
+    if case .corruptTopLevel = corruptState {} else { ok = false; print("FAIL 색인 방어: 손상 판정") }
+    check("쓰기 래치 켜짐", ScriptStore.isWriteBlocked)
+    check("손상 원본 사본 생성", (try? FileManager.default.contentsOfDirectory(atPath: ScriptStore.baseURL.path))?
+        .contains { $0.hasPrefix("library.corrupt-") } == true)
+
+    // ★ 직접 저장이 막히는가
+    check("saveLibrary 거부", ScriptStore.saveLibrary(ScriptLibrary()) == false)
+    check("파일 바이트 무변경(직접)", (try? Data(contentsOf: ScriptStore.libraryURL)) == corruptBytes)
+
+    // ★★ **간접 경로**가 막히는가 — 실제 사고 경로 재현.
+    //    touch 와 saveScrollOffset 은 사용자가 대본을 열어 보기만 해도 불린다.
+    ScriptStore.touch(id: "x", title: "덮어쓰기 시도")
+    ScriptStore.saveScrollOffset(id: "x", offset: 999)
+    check("파일 바이트 무변경(touch/scroll 경유)",
+          (try? Data(contentsOf: ScriptStore.libraryURL)) == corruptBytes)
+    check("마이그레이션도 거부", ScriptStore.migrateIfNeeded() == false)
+
+    // (4) 원소 일부만 손상 → 나머지 생존 + 쓰기 허용
+    resetSupportDirForTest()
+    writeLibraryJSONForTest("""
+    {"version":2,"scripts":[
+      {"id":"ok1","title":"살아남음","createdAt":100,"updatedAt":200},
+      {"title":"id 가 없어 못 살림","createdAt":100,"updatedAt":200}
+    ],"folders":[],"boards":[]}
+    """)
+    let repaired = ScriptStore.loadLibraryDetailed()
+    check("일부 손상 → .repaired(1)", repaired.state == .repaired(dropped: 1))
+    check("정상 원소 생존", repaired.library.scripts.map(\.id) == ["ok1"])
+    check(".repaired 는 쓰기 허용", ScriptStore.isWriteBlocked == false)
+
+    // (5) 미래 버전 → 차단 (다운그레이드한 사용자의 보드를 날리지 않는다)
+    resetSupportDirForTest()
+    writeLibraryJSONForTest("""
+    {"version":99,"scripts":[{"id":"z","title":"미래","createdAt":1,"updatedAt":1}]}
+    """)
+    check("미래 버전 판정", ScriptStore.loadLibraryDetailed().state == .futureVersion(99))
+    check("미래 버전은 쓰기 차단", ScriptStore.saveLibrary(ScriptLibrary()) == false)
+
+    // (6) 디스크에서 복구 — 최종 안전망
+    resetSupportDirForTest()
+    ScriptStore.write(id: "r1", text: "# 복구된 제목\n본문")
+    ScriptStore.write(id: "r2", text: "헤딩 없는 첫 줄\n둘째 줄")
+    ScriptStore.write(id: "r3", text: "")
+    let rebuilt = ScriptStore.rebuildLibraryFromDisk()
+    check("3개 전부 복구", rebuilt.scripts.count == 3)
+    check("헤딩에서 제목", rebuilt.scripts.contains { $0.title == "복구된 제목" })
+    check("첫 줄에서 제목", rebuilt.scripts.contains { $0.title == "헤딩 없는 첫 줄" })
+    check("빈 본문도 제목 부여", rebuilt.scripts.allSatisfy { !$0.title.isEmpty })
+
+    print("\(ok ? "PASS" : "FAIL") 색인 손상 방어 (차단 래치·간접경로·부분복구·디스크재구성)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// G. `Settings` 전방호환 디코더 나열 누락 자동 검출.
+///
+/// 필드를 추가하면서 `init(from:)` 의 나열 블록에 한 줄을 빠뜨리는 실수는 반드시 재발한다.
+/// 컴파일은 되고 "저장은 되는데 다음 실행에 항상 기본값" 이 되므로 눈으로는 안 잡힌다.
+/// 인코딩한 JSON 의 값을 기계적으로 바꿔 넣고 되읽어, 바뀐 값이 하나도 빠짐없이 반영되는지 본다.
+func runSettingsDecoderCoverageSelfTest() -> Bool {
+    guard let baseData = try? JSONEncoder().encode(Settings()),
+          var root = try? JSONSerialization.jsonObject(with: baseData) as? [String: Any] else {
+        print("FAIL 설정 디코더 커버리지 — 인코딩 실패")
+        return false
+    }
+
+    // 기본값과 확실히 다른 값으로 전부 덮는다.
+    var mutatedKeys: [String] = []
+    for (key, value) in root {
+        switch value {
+        case let n as NSNumber:
+            // Bool 과 숫자를 구분한다(NSNumber 는 둘 다 담는다).
+            if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                root[key] = !n.boolValue
+            } else {
+                root[key] = n.doubleValue + 7
+            }
+            mutatedKeys.append(key)
+        case let s as String:
+            root[key] = s + "-변경"
+            mutatedKeys.append(key)
+        case is [Any]:
+            // 배열은 타입을 몰라 안전하게 못 바꾼다. 아래 Optional 왕복에서 따로 검사한다.
+            continue
+        default:
+            continue
+        }
+    }
+
+    guard let mutatedData = try? JSONSerialization.data(withJSONObject: root),
+          let decoded = try? JSONDecoder().decode(Settings.self, from: mutatedData),
+          let roundTrip = try? JSONEncoder().encode(decoded),
+          let after = try? JSONSerialization.jsonObject(with: roundTrip) as? [String: Any] else {
+        print("FAIL 설정 디코더 커버리지 — 왕복 실패")
+        return false
+    }
+
+    // 나열에서 빠진 필드는 기본값으로 남으므로, 바꾼 값과 다르게 나온다.
+    var missing: [String] = []
+    for key in mutatedKeys {
+        let expected = root[key] as? NSObject
+        let actual = after[key] as? NSObject
+        if expected != actual { missing.append(key) }
+    }
+
+    // Optional 필드는 기본 인코딩에 키가 없어 위 방식으로 못 덮는다 → 값을 채워 왕복.
+    var s = Settings()
+    s.windowFrame = [1, 2, 3, 4]
+    s.activeScriptID = "AID"
+    s.fontName = "Menlo"
+    s.libraryWindowFrame = [5, 6, 7, 8]
+    s.libraryLastSelectedID = "LID"
+    s.libraryExpandedFolderIDs = ["f1", "f2"]
+    let optionalOK = (try? JSONEncoder().encode(s))
+        .flatMap { try? JSONDecoder().decode(Settings.self, from: $0) } == s
+
+    let ok = missing.isEmpty && optionalOK
+    print("\(ok ? "PASS" : "FAIL") 설정 디코더 커버리지 "
+          + "(검사 \(mutatedKeys.count)개"
+          + (missing.isEmpty ? "" : ", 나열 누락: \(missing.sorted().joined(separator: ", "))")
+          + ", 옵셔널 왕복=\(optionalOK))")
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -3900,15 +4528,21 @@ if CommandLine.arguments.contains("--selftest") {
         print("HOTKEY \(action.name): \(action.defaultDisplayString)")
     }
     print("")
+    // 격리 확인을 **먼저** 한다 — 격리가 깨진 상태에서 파괴적 테스트가 도는 최악의 순서를 피한다.
+    let supportDirOK = runSupportDirIsolationSelfTest()
+    let migrationOK = runLibraryMigrationSelfTest()
+    let corruptionOK = runLibraryCorruptionGuardSelfTest()
+    let decoderOK = runSettingsDecoderCoverageSelfTest()
+
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
     let mirrorOK = runMirrorSelfTest()
     let mirrorLayoutOK = runMirrorPersistsLayoutSelfTest()
     let buttonsOK = runWindowButtonsSelfTest()
     let cheatOK = runCheatSheetSelfTest()
-    let supportDirOK = runSupportDirIsolationSelfTest()
     exit(persistenceOK && layoutOK && mirrorOK && mirrorLayoutOK
-         && buttonsOK && cheatOK && supportDirOK ? 0 : 1)
+         && buttonsOK && cheatOK && supportDirOK
+         && migrationOK && corruptionOK && decoderOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
