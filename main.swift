@@ -2630,6 +2630,43 @@ class FineUndoTextView: NSTextView {
     }
 }
 
+/// `.accessory` 앱은 메뉴바를 띄우지 않아 Edit 메뉴의 키 등가물(⌘C/V/X/A/Z)이 동작하지 않을 수 있다.
+///
+/// 대본을 붙여넣는 창에서 ⌘V 가 안 먹으면 앱이 통째로 쓸모없어지므로, 우리 창이 키 윈도우일 때만
+/// 도는 로컬 모니터로 폴백한다. **설정 창과 라이브러리 창이 공용으로 쓴다** — 복붙하면 두 벌이 되고,
+/// 한쪽만 고치는 사고가 난다.
+final class EditKeyFallback {
+    private var monitor: Any?
+
+    /// `window` 를 클로저로 받는 이유: 컨트롤러가 창을 나중에 만들거나 교체해도 따라가야 한다.
+    init(window: @escaping () -> NSWindow?) {
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard let target = window(), target.isKeyWindow,
+                  !HotkeyRecorderField.isRecordingActive else { return event }
+
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags == .command || flags == [.command, .shift] else { return event }
+
+            let shift = flags.contains(.shift)
+            let selector: Selector?
+            switch event.charactersIgnoringModifiers?.lowercased() ?? "" {
+            case "c": selector = #selector(NSText.copy(_:))
+            case "v": selector = #selector(NSText.paste(_:))
+            case "x": selector = #selector(NSText.cut(_:))
+            case "a": selector = #selector(NSText.selectAll(_:))
+            case "z": selector = shift ? Selector(("redo:")) : Selector(("undo:"))
+            default:  selector = nil
+            }
+            guard let sel = selector else { return event }
+            return NSApp.sendAction(sel, to: nil, from: nil) ? nil : event
+        }
+    }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+}
+
 // MARK: - Settings Window Controller
 class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
     var prompterController: PrompterWindowController?
@@ -2648,7 +2685,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     var maxLineWidthValueLabel: NSTextField?
     var targetMinutesField: NSTextField?
     var prompterTextView: FineUndoTextView?  // 텍스트 입력창 참조
-    private var editKeyMonitor: Any?
+    private var editKeyFallback: EditKeyFallback?
     private var livePreviewWorkItem: DispatchWorkItem?
 
     convenience init(prompterController: PrompterWindowController) {
@@ -3041,31 +3078,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     /// 동작하지 않을 수 있다. 대본을 붙여넣는 창에서 붙여넣기가 안 되면 앱이 무용지물이므로
     /// 설정창이 키 윈도우일 때만 도는 로컬 폴백을 둔다. 메뉴 경로가 살아 있어도 결과는 같다.
     private func installEditKeyFallback() {
-        editKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self = self,
-                  let window = self.window, window.isKeyWindow,
-                  !HotkeyRecorderField.isRecordingActive else { return event }
-
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            guard flags == .command || flags == [.command, .shift] else { return event }
-
-            let shift = flags.contains(.shift)
-            let selector: Selector?
-            switch event.charactersIgnoringModifiers?.lowercased() ?? "" {
-            case "c": selector = #selector(NSText.copy(_:))
-            case "v": selector = #selector(NSText.paste(_:))
-            case "x": selector = #selector(NSText.cut(_:))
-            case "a": selector = #selector(NSText.selectAll(_:))
-            case "z": selector = shift ? Selector(("redo:")) : Selector(("undo:"))
-            default:  selector = nil
-            }
-            guard let sel = selector else { return event }
-            return NSApp.sendAction(sel, to: nil, from: nil) ? nil : event
-        }
-    }
-
-    deinit {
-        if let monitor = editKeyMonitor { NSEvent.removeMonitor(monitor) }
+        editKeyFallback = EditKeyFallback(window: { [weak self] in self?.window })
     }
 
     private func handleHotkeyChange(action: HotkeyAction, keyCode: UInt32, modifiers: UInt32) -> Bool {
@@ -3258,6 +3271,488 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     }
 }
 
+// MARK: - Script Library Window Controller
+
+/// 대본을 폴더로 정리하고 큰 편집기에서 고치는 창.
+///
+/// **이 창은 촬영 중에 열린다.** 그래서 프롬프터 창과 같은 급으로 다룬다 —
+/// 캡처 제외, 전체화면 위로 뜨는 창 레벨, 최소화 차단.
+///
+/// 한 가지 규칙이 UI 전체를 지배한다: **선택은 전환이 아니다.**
+/// 사이드바에서 대본을 클릭하는 것이 라이브 프롬퍼터를 바꿔 버리면 카메라 앞에서 사고가 난다.
+/// 전환은 더블클릭 / ⌘Return / 명시적 버튼으로만 일어난다.
+final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate, NSSplitViewDelegate,
+                                           NSOutlineViewDataSource, NSOutlineViewDelegate,
+                                           NSTextViewDelegate {
+    /// **weak 이어야 한다.** 프롬프터가 settingsController 를 strong 으로 잡고 있어 이미 순환이 있고
+    /// (AppDelegate 가 프롬프터를 영구 보유해서 증상이 안 났을 뿐이다), 라이브러리 창은 닫혔다
+    /// 열렸다 하므로 같은 실수를 반복하면 실제로 샌다.
+    weak var prompterController: PrompterWindowController?
+
+    private var splitView: NSSplitView!
+    private var outlineView: NSOutlineView!
+    private var editorTextView: FineUndoTextView!
+    private var editorScrollView: NSScrollView!
+    private var titleField: NSTextField!
+    private var loadButton: NSButton!
+    private var statusLabel: NSTextField!
+    private var warningLabel: NSTextField!
+
+    private var roots: [LibraryNode] = []
+    private var editingScriptID: String?
+    /// 프로그램적으로 텍스트를 대입하는 구간. 이 사이의 textDidChange 는 사용자 입력이 아니다.
+    private var isApplyingExternalChange = false
+    private var previewWork: DispatchWorkItem?
+    private var inactiveWriteWork: DispatchWorkItem?
+    private var editKeyFallback: EditKeyFallback?
+
+    private static let sidebarColumnID = NSUserInterfaceItemIdentifier("name")
+
+    // MARK: 생성
+
+    convenience init(prompterController: PrompterWindowController) {
+        let stored = SettingsStore.shared.settings.libraryWindowFrame
+        let frame = (stored?.count == 4)
+            ? NSRect(x: stored![0], y: stored![1], width: stored![2], height: stored![3])
+            : NSRect(x: 0, y: 0, width: 960, height: 640)
+
+        let window = NSWindow(contentRect: frame,
+                              styleMask: [.titled, .closable, .resizable],
+                              backing: .buffered, defer: false)
+        window.title = "대본 라이브러리"
+        window.minSize = NSSize(width: 640, height: 420)
+
+        // 촬영 중에 여는 창이다. 스텔스는 여기서 직접 건다 —
+        // installStealthGuard 의 didUpdate 감시는 창이 처음 표시된 **뒤에** 오므로 백스톱일 뿐이다.
+        window.sharingType = .none
+
+        // 일반 레벨이면 전체화면 Zoom/OBS 뒤로 숨어 "단축키를 눌렀는데 아무 일도 안 일어난다" 로 보인다.
+        // 프롬프터(statusWindow+1000)보다는 낮게 둬서 대본을 가리지 않는다.
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isReleasedWhenClosed = false
+
+        // 최소화는 styleMask 에 `.miniaturizable` 을 **넣지 않는 것**으로 막는다(버튼은 흐리게 남는다).
+        // 막아야 하는 이유는 둘이다: `.accessory` 앱이라 Dock 에 되돌릴 자리가 없고,
+        // Dock 축소판은 sharingType 보호를 못 받아 녹화에 대본 제목이 찍힌다.
+        //
+        // ⚠️ 버튼을 `isHidden` 으로 감추면 안 된다 — 그 자리가 비면서 macOS 26 의 좌측 정렬
+        // 창 제목이 확대 버튼 위로 겹쳐 그려진다(실기기 확인, 2026-08-02).
+        // 프롬프터 창은 창 자체가 안 보이므로 감춰도 되지만 여기는 보이는 창이다.
+
+        if stored == nil { window.center() }
+
+        self.init(window: window)
+        self.prompterController = prompterController
+        window.delegate = self
+        setupUI()
+        editKeyFallback = EditKeyFallback(window: { [weak self] in self?.window })
+        refreshTree()
+        restoreSelection()
+    }
+
+    // MARK: 레이아웃 (오토레이아웃을 쓰지 않는다 — 파일 전체가 스프링&스트럿이다)
+
+    private func setupUI() {
+        guard let window = window, let content = window.contentView else { return }
+
+        splitView = NSSplitView(frame: content.bounds)
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.autoresizingMask = [.width, .height]
+        splitView.delegate = self
+
+        // ── 좌: 폴더 트리 ──────────────────────────────
+        let sidebarWidth = CGFloat(SettingsStore.shared.settings.librarySidebarWidth)
+        let outlineScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: sidebarWidth,
+                                                       height: content.bounds.height))
+        outlineScroll.hasVerticalScroller = true
+        outlineScroll.autohidesScrollers = true
+        outlineScroll.borderType = .noBorder
+
+        outlineView = NSOutlineView(frame: outlineScroll.bounds)
+        let column = NSTableColumn(identifier: Self.sidebarColumnID)
+        column.width = sidebarWidth - 8
+        column.resizingMask = .autoresizingMask
+        outlineView.addTableColumn(column)
+        // ⚠️ 이 대입을 빠뜨리면 화면이 통째로 비어 보인다(데이터 소스는 정상인데 아무것도 안 그림).
+        outlineView.outlineTableColumn = column
+        outlineView.headerView = nil
+        outlineView.rowSizeStyle = .default
+        outlineView.style = .sourceList
+        outlineView.allowsMultipleSelection = true
+        outlineView.dataSource = self
+        outlineView.delegate = self
+        outlineView.target = self
+        outlineView.doubleAction = #selector(loadSelectedIntoPrompter)
+        outlineScroll.documentView = outlineView
+
+        // ── 우: 헤더 + 편집기 + 상태줄 ──────────────────
+        let rightWidth = content.bounds.width - sidebarWidth - splitView.dividerThickness
+        let right = NSView(frame: NSRect(x: 0, y: 0, width: rightWidth, height: content.bounds.height))
+
+        let headerHeight: CGFloat = 44
+        let footerHeight: CGFloat = 28
+
+        titleField = NSTextField(frame: NSRect(x: 12, y: right.bounds.height - headerHeight + 10,
+                                               width: rightWidth - 160, height: 24))
+        titleField.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        titleField.isBordered = false
+        titleField.drawsBackground = false
+        titleField.isEditable = false          // 이름 변경은 커밋 5에서
+        titleField.stringValue = ""
+        titleField.autoresizingMask = [.width, .minYMargin]
+        right.addSubview(titleField)
+
+        loadButton = NSButton(title: "프롬프터에 올리기", target: self,
+                              action: #selector(loadSelectedIntoPrompter))
+        loadButton.bezelStyle = .rounded
+        loadButton.frame = NSRect(x: rightWidth - 148, y: right.bounds.height - headerHeight + 8,
+                                  width: 136, height: 26)
+        loadButton.keyEquivalent = "\r"
+        loadButton.keyEquivalentModifierMask = [.command]
+        loadButton.autoresizingMask = [.minXMargin, .minYMargin]
+        right.addSubview(loadButton)
+
+        warningLabel = NSTextField(labelWithString: "")
+        warningLabel.frame = NSRect(x: 12, y: right.bounds.height - headerHeight - 2,
+                                    width: rightWidth - 24, height: 16)
+        warningLabel.font = NSFont.systemFont(ofSize: 11)
+        warningLabel.textColor = .systemOrange
+        warningLabel.autoresizingMask = [.width, .minYMargin]
+        warningLabel.isHidden = true
+        right.addSubview(warningLabel)
+
+        editorScrollView = NSScrollView(frame: NSRect(x: 0, y: footerHeight,
+                                                      width: rightWidth,
+                                                      height: right.bounds.height - headerHeight - footerHeight))
+        editorScrollView.hasVerticalScroller = true
+        editorScrollView.borderType = .noBorder
+        editorScrollView.autoresizingMask = [.width, .height]
+
+        editorTextView = FineUndoTextView(frame: editorScrollView.bounds)
+        editorTextView.minSize = NSSize(width: 0, height: 0)
+        editorTextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                        height: CGFloat.greatestFiniteMagnitude)
+        editorTextView.isVerticallyResizable = true
+        editorTextView.isHorizontallyResizable = false
+        editorTextView.autoresizingMask = [.width]
+        editorTextView.isEditable = false        // 선택 전에는 비활성
+        editorTextView.isRichText = false
+        editorTextView.allowsUndo = true
+        editorTextView.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        editorTextView.textContainerInset = NSSize(width: 12, height: 12)
+        // 스마트 따옴표가 들어가면 마크다운 파서가 흔들린다(`**굵게**` 의 별표와 달리 눈에 안 띈다).
+        editorTextView.isAutomaticQuoteSubstitutionEnabled = false
+        editorTextView.isAutomaticDashSubstitutionEnabled = false
+        editorTextView.isAutomaticTextReplacementEnabled = false
+        editorTextView.delegate = self
+        editorScrollView.documentView = editorTextView
+        right.addSubview(editorScrollView)
+
+        statusLabel = NSTextField(labelWithString: "대본을 선택하세요")
+        statusLabel.frame = NSRect(x: 12, y: 6, width: rightWidth - 24, height: 16)
+        statusLabel.font = NSFont.systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.autoresizingMask = [.width, .maxYMargin]
+        right.addSubview(statusLabel)
+
+        splitView.addSubview(outlineScroll)
+        splitView.addSubview(right)
+        content.addSubview(splitView)
+
+        updateWarningBar()
+    }
+
+    /// 색인을 못 써서 저장이 안 되는 상태를 상시 표시한다. 조용히 넘어가면
+    /// 사용자는 "고쳤는데 다음에 열면 원래대로" 를 반복하게 된다.
+    private func updateWarningBar() {
+        guard ScriptStore.isWriteBlocked else {
+            warningLabel.isHidden = true
+            return
+        }
+        warningLabel.stringValue = "⚠︎ 대본 목록이 손상되어 저장이 잠겨 있습니다. 편집 내용이 유지되지 않습니다."
+        warningLabel.isHidden = false
+    }
+
+    // MARK: NSSplitViewDelegate
+
+    /// 기본 비례 분배면 창을 키울 때 사이드바도 같이 넓어진다. 사이드바는 고정, 편집기가 흡수한다.
+    func splitView(_ sv: NSSplitView, resizeSubviewsWithOldSize oldSize: NSSize) {
+        guard sv.subviews.count == 2 else { return }
+        let width = max(0, min(sv.subviews[0].frame.width, sv.bounds.width - 200))
+        let divider = sv.dividerThickness
+        sv.subviews[0].frame = NSRect(x: 0, y: 0, width: width, height: sv.bounds.height)
+        sv.subviews[1].frame = NSRect(x: width + divider, y: 0,
+                                      width: max(0, sv.bounds.width - width - divider),
+                                      height: sv.bounds.height)
+    }
+
+    func splitView(_ sv: NSSplitView, constrainMinCoordinate proposed: CGFloat,
+                   ofSubviewAt index: Int) -> CGFloat { 180 }
+    func splitView(_ sv: NSSplitView, constrainMaxCoordinate proposed: CGFloat,
+                   ofSubviewAt index: Int) -> CGFloat { 420 }
+
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard let first = splitView?.subviews.first else { return }
+        SettingsStore.shared.update { $0.librarySidebarWidth = Double(first.frame.width) }
+    }
+
+    // MARK: 트리 갱신
+
+    /// 펼침/선택을 보존하며 통째로 다시 그린다.
+    ///
+    /// 증분 갱신을 쓰지 않는 이유는 `LibraryNode` 주석 참조 — 매번 새 객체라 증분 API 와
+    /// 조합하면 "이미 지운 항목 참조" 크래시가 나기 쉽다.
+    func refreshTree() {
+        // 창을 막 만든 시점에는 아웃라인에 행이 하나도 없어서 "지금 펼쳐진 폴더" 를 물어봐야 답이 없다.
+        // 그 빈 답을 그대로 저장하면 **지난 실행의 펼침 상태가 통째로 지워지고**,
+        // 폴더가 다 접힌 채로 뜨니 그 안의 대본은 행 자체가 없어 선택 복원까지 조용히 실패한다.
+        // 그래서 첫 빌드에서는 반드시 설정에 남아 있는 값을 씨앗으로 삼는다.
+        let expanded = outlineView.numberOfRows > 0
+            ? expandedFolderIDs()
+            : SettingsStore.shared.settings.libraryExpandedFolderIDs
+        let selected = selectedNodeIDs()
+
+        roots = LibraryTree.build(from: ScriptStore.loadLibrary())
+        outlineView.reloadData()
+
+        var byID: [String: LibraryNode] = [:]
+        func index(_ nodes: [LibraryNode]) {
+            for node in nodes { byID[node.id] = node; index(node.children) }
+        }
+        index(roots)
+
+        for id in expanded {
+            if let node = byID[id] { outlineView.expandItem(node) }
+        }
+        let rows = selected.compactMap { byID[$0] }.map { outlineView.row(forItem: $0) }.filter { $0 >= 0 }
+        outlineView.selectRowIndexes(IndexSet(rows), byExtendingSelection: false)
+
+        SettingsStore.shared.update { $0.libraryExpandedFolderIDs = expandedFolderIDs() }
+        updateWarningBar()
+    }
+
+    /// **화면에 지금 펼쳐져 있는** 폴더. 아웃라인이 비어 있으면 빈 배열이다(설정값이 아니다) —
+    /// 호출부가 그 차이를 알고 써야 한다.
+    private func expandedFolderIDs() -> [String] {
+        guard outlineView != nil else { return [] }
+        var result: [String] = []
+        for row in 0..<outlineView.numberOfRows {
+            if let node = outlineView.item(atRow: row) as? LibraryNode,
+               node.isFolder, outlineView.isItemExpanded(node) {
+                result.append(node.id)
+            }
+        }
+        return result
+    }
+
+    private func selectedNodeIDs() -> [String] {
+        outlineView.selectedRowIndexes.compactMap {
+            (outlineView.item(atRow: $0) as? LibraryNode)?.id
+        }
+    }
+
+    private func restoreSelection() {
+        // 저장된 선택이 없으면 활성 대본을 고른다 — 창을 열면 지금 쓰는 대본이 바로 보이게.
+        let wanted = SettingsStore.shared.settings.libraryLastSelectedID
+            ?? prompterController?.activeScriptID
+        guard let wanted else { return }
+        for row in 0..<outlineView.numberOfRows {
+            if let node = outlineView.item(atRow: row) as? LibraryNode, node.id == wanted {
+                outlineView.selectRowIndexes([row], byExtendingSelection: false)
+                return
+            }
+        }
+    }
+
+    // MARK: NSOutlineViewDataSource
+
+    func outlineView(_ ov: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        (item as? LibraryNode)?.children.count ?? roots.count
+    }
+
+    func outlineView(_ ov: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        (item as? LibraryNode)?.children[index] ?? roots[index]
+    }
+
+    func outlineView(_ ov: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        (item as? LibraryNode)?.isFolder ?? false
+    }
+
+    // MARK: NSOutlineViewDelegate
+
+    func outlineView(_ ov: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard let node = item as? LibraryNode else { return nil }
+
+        let cell = NSTableCellView()
+        let image = NSImageView(frame: NSRect(x: 2, y: 2, width: 16, height: 16))
+        image.imageScaling = .scaleProportionallyDown
+        let symbol = node.isFolder ? "folder" : "doc.plaintext"
+        image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        image.contentTintColor = node.isFolder ? .secondaryLabelColor : .tertiaryLabelColor
+        cell.addSubview(image)
+        cell.imageView = image
+
+        let isActive = !node.isFolder && node.id == prompterController?.activeScriptID
+        let label = NSTextField(labelWithString: (isActive ? "● " : "") + node.title)
+        label.frame = NSRect(x: 22, y: 1, width: 400, height: 18)
+        label.lineBreakMode = .byTruncatingTail
+        label.autoresizingMask = [.width]
+        // 지금 카메라에 나가는 대본을 구분하는 유일한 신호다.
+        label.font = isActive ? NSFont.boldSystemFont(ofSize: 13) : NSFont.systemFont(ofSize: 13)
+        cell.addSubview(label)
+        cell.textField = label
+        return cell
+    }
+
+    func outlineViewSelectionDidChange(_ notification: Notification) {
+        // 선택이 바뀌기 전에 예약된 쓰기를 확정한다 — 안 그러면 1.5초 뒤 디바운스가
+        // 이미 떠난 대본에 지금 편집기 내용을 쓴다.
+        flushPendingEdits()
+
+        let selected = outlineView.selectedRowIndexes.compactMap {
+            outlineView.item(atRow: $0) as? LibraryNode
+        }
+        guard selected.count == 1, let node = selected.first, !node.isFolder else {
+            showEditor(for: nil)
+            return
+        }
+        showEditor(for: node.id)
+        SettingsStore.shared.update { $0.libraryLastSelectedID = node.id }
+    }
+
+    func outlineViewItemDidExpand(_ notification: Notification) {
+        SettingsStore.shared.update { $0.libraryExpandedFolderIDs = expandedFolderIDs() }
+    }
+
+    func outlineViewItemDidCollapse(_ notification: Notification) {
+        SettingsStore.shared.update { $0.libraryExpandedFolderIDs = expandedFolderIDs() }
+    }
+
+    // MARK: 편집기
+
+    private func showEditor(for id: String?) {
+        editingScriptID = id
+        isApplyingExternalChange = true
+        defer { isApplyingExternalChange = false }
+
+        guard let id, let meta = ScriptStore.loadLibrary().scripts.first(where: { $0.id == id }) else {
+            editorTextView.setupInitialText("")
+            editorTextView.isEditable = false
+            titleField.stringValue = ""
+            statusLabel.stringValue = "대본을 선택하세요"
+            loadButton.isEnabled = false
+            return
+        }
+        let text = ScriptStore.read(id: id) ?? ""
+        editorTextView.setupInitialText(text)
+        editorTextView.isEditable = true
+        titleField.stringValue = meta.title
+        loadButton.isEnabled = true
+        updateStatus(charCount: text.count, saved: nil)
+    }
+
+    private func updateStatus(charCount: Int, saved: Date?) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let savedText = saved.map { " · 저장 \(formatter.string(from: $0))" } ?? ""
+        let active = editingScriptID == prompterController?.activeScriptID ? " · 프롬프터에 표시 중" : ""
+        statusLabel.stringValue = "\(charCount)자\(savedText)\(active)"
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard !isApplyingExternalChange, let id = editingScriptID else { return }
+        let snapshot = editorTextView.string
+        previewWork?.cancel()
+        inactiveWriteWork?.cancel()
+
+        if id == prompterController?.activeScriptID {
+            // 활성 대본 — 설정 창이 하던 것과 완전히 같은 경로.
+            // 0.3초 뒤 화면 반영, updateScript 안에서 다시 1.5초 뒤 파일 쓰기.
+            let work = DispatchWorkItem { [weak self] in
+                self?.prompterController?.updateScript(snapshot)
+                self?.updateStatus(charCount: snapshot.count, saved: Date())
+            }
+            previewWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        } else {
+            // 비활성 대본 — 미리보기 대상이 없으므로 0.3초 단계가 무의미하다. 한 단계만.
+            // **id 를 캡처**해야 쓰기 직전에 선택이 바뀌어도 엉뚱한 대본에 쓰지 않는다.
+            let work = DispatchWorkItem { [weak self] in
+                ScriptStore.write(id: id, text: snapshot)
+                ScriptStore.touch(id: id)
+                self?.updateStatus(charCount: snapshot.count, saved: Date())
+            }
+            inactiveWriteWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+        }
+        updateStatus(charCount: snapshot.count, saved: nil)
+    }
+
+    /// 예약된 쓰기를 즉시 확정한다. 선택 변경·창 닫기·앱 전환·삭제 직전에 부른다.
+    func flushPendingEdits() {
+        if let work = previewWork { work.cancel(); previewWork = nil; work.perform() }
+        if let work = inactiveWriteWork { work.cancel(); inactiveWriteWork = nil; work.perform() }
+        prompterController?.flushScript()
+    }
+
+    // MARK: 액션
+
+    @objc func loadSelectedIntoPrompter() {
+        guard let node = outlineView.item(atRow: outlineView.selectedRow) as? LibraryNode,
+              !node.isFolder else { return }
+        flushPendingEdits()
+        prompterController?.switchToScript(id: node.id)
+        refreshTree()       // 활성 표시(볼드 + ●) 갱신
+    }
+
+    // MARK: 프롬퍼터 → 라이브러리 (한 방향)
+
+    /// 프롬프터 쪽에서 대본이 바뀌었다. **선택은 건드리지 않는다** — 사용자가 보고 있던 자리를
+    /// 뺏지 않기 위해서다. 활성 표시만 갱신하고, 같은 대본을 편집 중이면 텍스트를 다시 읽는다.
+    func prompterDidSwitchScript(to id: String?) {
+        refreshTree()
+        guard let id, id == editingScriptID else { return }
+        let incoming = ScriptStore.read(id: id) ?? ""
+        // 실제로 루프를 끊는 건 이 동등성 검사다.
+        guard editorTextView.string != incoming else { return }
+        isApplyingExternalChange = true
+        editorTextView.setupInitialText(incoming)
+        isApplyingExternalChange = false
+        updateStatus(charCount: incoming.count, saved: nil)
+    }
+
+    // MARK: NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        flushPendingEdits()
+        saveWindowFrame()
+        SettingsStore.shared.flushNow()
+    }
+
+    func windowDidMove(_ notification: Notification) { saveWindowFrame() }
+    func windowDidResize(_ notification: Notification) { saveWindowFrame() }
+
+    private func saveWindowFrame() {
+        guard let frame = window?.frame else { return }
+        SettingsStore.shared.update {
+            $0.libraryWindowFrame = [Double(frame.origin.x), Double(frame.origin.y),
+                                     Double(frame.width), Double(frame.height)]
+        }
+    }
+
+    // MARK: 셀프테스트 프로브
+
+    /// 창을 띄우지 않고 핵심 뷰를 꺼낸다. 중첩 뷰를 재귀 탐색하는 방식은 취약해서 쓰지 않는다.
+    var layoutProbeForTest: (split: NSSplitView, outline: NSOutlineView, editor: NSTextView)? {
+        guard let splitView, let outlineView, let editorTextView else { return nil }
+        return (splitView, outlineView, editorTextView)
+    }
+
+    var editorScrollFrameForTest: NSRect { editorScrollView?.frame ?? .zero }
+}
+
 // MARK: - Prompter Window Controller
 class PrompterWindowController: NSWindowController, NSWindowDelegate {
     var prompterView: PrompterView!
@@ -3301,6 +3796,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
     }
 
     var settingsController: SettingsWindowController?
+    var libraryController: ScriptLibraryWindowController?
 
     convenience init() {
         // Create panel that is invisible to screen capture
@@ -3507,6 +4003,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         let title = ScriptStore.loadLibrary().scripts.first { $0.id == id }?.title ?? "대본"
         prompterView.overlay.showToast(title)
         settingsController?.reloadScriptText()
+        libraryController?.prompterDidSwitchScript(to: id)
     }
 
     func createNewScript() {
@@ -3530,6 +4027,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         updateScript(text, immediate: true)
         prompterView.overlay.showToast("클립보드에서 대본 교체")
         settingsController?.reloadScriptText()
+        libraryController?.prompterDidSwitchScript(to: activeScriptID)
     }
 
     private func restoreReadingPosition(for id: String, announce: Bool) {
@@ -3878,6 +4376,19 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         settingsController?.showWindow(nil)
         settingsController?.window?.makeKeyAndOrderFront(nil)
         settingsController?.showRegistrationFailures()
+    }
+
+    /// 대본 라이브러리를 연다. 이미 떠 있으면 앞으로 가져오고 트리를 최신으로 맞춘다
+    /// (창을 닫아 두는 동안 다른 경로로 대본이 바뀌었을 수 있다).
+    func showLibrary() {
+        if libraryController == nil {
+            libraryController = ScriptLibraryWindowController(prompterController: self)
+        } else {
+            libraryController?.refreshTree()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        libraryController?.showWindow(nil)
+        libraryController?.window?.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -5159,6 +5670,117 @@ func runLibraryTreeSelfTest() -> Bool {
     return ok
 }
 
+/// D. 라이브러리 창 — 창을 화면에 띄우지 않고 레이아웃과 창 정책을 검사한다.
+func runLibraryWindowLayoutSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 라이브러리 창 레이아웃 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 라이브러리 창: \(label)") }
+    }
+
+    // 창 프레임 복원이 검사를 흔들지 않도록 저장값을 비운다.
+    SettingsStore.shared.update {
+        $0.libraryWindowFrame = nil
+        $0.librarySidebarWidth = 260
+    }
+    _ = ScriptStore.createScript(title: "테스트 대본", text: "본문")
+
+    let prompter = PrompterWindowController()
+    let library = ScriptLibraryWindowController(prompterController: prompter)
+    guard let window = library.window else {
+        print("FAIL 라이브러리 창: 창 없음"); return false
+    }
+    window.setFrame(NSRect(x: 0, y: 0, width: 960, height: 640), display: false)
+    window.contentView?.layoutSubtreeIfNeeded()
+
+    guard let probe = library.layoutProbeForTest else {
+        print("FAIL 라이브러리 창: 프로브 없음"); return false
+    }
+
+    // ★ 스텔스 — 이 창은 촬영 중에 열린다. 회귀하면 대본이 통째로 녹화에 찍힌다.
+    check("sharingType == .none", window.sharingType == .none)
+    check("floating 레벨", window.level == .floating)
+    check("모든 스페이스", window.collectionBehavior.contains(.canJoinAllSpaces))
+    check("전체화면 보조", window.collectionBehavior.contains(.fullScreenAuxiliary))
+    // 최소화 차단은 styleMask 로 한다. 버튼을 감추면 제목이 확대 버튼과 겹치므로
+    // "감춰졌는지" 가 아니라 "동작하지 않는지" 를 본다.
+    check("styleMask 에 miniaturizable 없음", !window.styleMask.contains(.miniaturizable))
+    check("최소화 버튼 비활성",
+          window.standardWindowButton(.miniaturizeButton)?.isEnabled != true)
+    check("최소화 버튼을 감추지 않음(제목 겹침 방지)",
+          window.standardWindowButton(.miniaturizeButton)?.isHidden != true)
+
+    // 레이아웃
+    let contentWidth = window.contentView?.bounds.width ?? 0
+    check("pane 2개", probe.split.subviews.count == 2)
+    let sidebarWidth = probe.split.subviews[0].frame.width
+    let editorPaneWidth = probe.split.subviews[1].frame.width
+    let sum = sidebarWidth + editorPaneWidth + probe.split.dividerThickness
+    check("pane 폭 합 == 콘텐츠 폭", abs(sum - contentWidth) < 1.5)
+    // ★ "큰 편집기" 요구의 회귀 방지 — 설정 창의 410×100 상자보다 확실히 크다는 걸 수치로 못 박는다.
+    check("편집기 폭 > 500", library.editorScrollFrameForTest.width > 500)
+    check("편집기 높이 > 400", library.editorScrollFrameForTest.height > 400)
+    check("편집기가 FineUndoTextView", probe.editor is FineUndoTextView)
+    // 셀을 실제로 만들어 내는지 본다. 데이터 소스가 멀쩡해도 viewFor 가 nil 을 돌려주면
+    // 행 수만 맞고 화면은 비어 보인다 — 행 수 단정만으로는 안 잡히는 실패다.
+    if let first = probe.outline.item(atRow: 0) {
+        let cell = library.outlineView(probe.outline,
+                                       viewFor: probe.outline.outlineTableColumn,
+                                       item: first) as? NSTableCellView
+        check("셀 뷰 생성됨", cell != nil)
+        check("셀에 제목 표시", (cell?.textField?.stringValue.isEmpty == false))
+    } else {
+        check("행이 하나 이상", false)
+    }
+
+    // 리사이즈 후 — 사이드바는 고정, 편집기가 흡수해야 한다
+    window.setFrame(NSRect(x: 0, y: 0, width: 1280, height: 800), display: false)
+    window.contentView?.layoutSubtreeIfNeeded()
+    let widerSidebar = probe.split.subviews[0].frame.width
+    let widerEditor = probe.split.subviews[1].frame.width
+    check("리사이즈 후 사이드바 유지", abs(widerSidebar - sidebarWidth) < 1.5)
+    check("리사이즈 후 편집기 확장", widerEditor > editorPaneWidth + 200)
+
+    // 트리에 대본이 보이는가
+    check("대본이 트리에 나타남", probe.outline.numberOfRows >= 1)
+
+    // ★ 펼침·선택 복원 — 창을 만드는 시점에 아웃라인이 비어 있어서, 거기서 읽은 빈 값을
+    //   그대로 저장하면 지난 실행의 펼침이 지워지고 폴더 안 대본은 선택 복원까지 실패한다.
+    //   (실기기에서 그대로 재현됐다 — 폴더가 다 접힌 채 뜨고 편집기가 비어 있었다)
+    guard let folder = ScriptStore.createFolder(name: "복원폴더"),
+          let nested = ScriptStore.createScript(title: "폴더 안 대본", in: folder.id, text: "안쪽") else {
+        print("FAIL 라이브러리 창: 복원 테스트용 구성"); return false
+    }
+    SettingsStore.shared.update {
+        $0.libraryExpandedFolderIDs = [folder.id]
+        $0.libraryLastSelectedID = nested
+    }
+    let reopened = ScriptLibraryWindowController(prompterController: prompter)
+    guard let reprobe = reopened.layoutProbeForTest else {
+        print("FAIL 라이브러리 창: 재생성 프로브 없음"); return false
+    }
+    let expandedNow = (0..<reprobe.outline.numberOfRows).compactMap {
+        reprobe.outline.item(atRow: $0) as? LibraryNode
+    }.filter { $0.isFolder && reprobe.outline.isItemExpanded($0) }.map(\.id)
+    check("폴더 펼침 복원", expandedNow.contains(folder.id))
+    check("설정의 펼침 상태가 지워지지 않음",
+          SettingsStore.shared.settings.libraryExpandedFolderIDs.contains(folder.id))
+    let selectedNow = reprobe.outline.selectedRowIndexes.compactMap {
+        (reprobe.outline.item(atRow: $0) as? LibraryNode)?.id
+    }
+    check("폴더 안 대본 선택 복원", selectedNow == [nested])
+    check("선택된 대본 본문이 편집기에", reprobe.editor.string == "안쪽")
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 창 레이아웃 "
+          + "(사이드바 \(Int(sidebarWidth)) / 편집기 \(Int(library.editorScrollFrameForTest.width))"
+          + "×\(Int(library.editorScrollFrameForTest.height)), 스텔스=\(window.sharingType == .none))")
+    resetSupportDirForTest()
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -5175,6 +5797,7 @@ if CommandLine.arguments.contains("--selftest") {
     let decoderOK = runSettingsDecoderCoverageSelfTest()
     let crudOK = runFolderCRUDSelfTest()
     let treeOK = runLibraryTreeSelfTest()
+    let libWindowOK = runLibraryWindowLayoutSelfTest()
 
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
@@ -5184,7 +5807,8 @@ if CommandLine.arguments.contains("--selftest") {
     let cheatOK = runCheatSheetSelfTest()
     exit(persistenceOK && layoutOK && mirrorOK && mirrorLayoutOK
          && buttonsOK && cheatOK && supportDirOK
-         && migrationOK && corruptionOK && decoderOK && crudOK && treeOK ? 0 : 1)
+         && migrationOK && corruptionOK && decoderOK && crudOK && treeOK
+         && libWindowOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
