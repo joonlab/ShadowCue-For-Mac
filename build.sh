@@ -46,18 +46,28 @@ vtool -show-build "$BUILD_DIR/ShadowCue-universal" 2>/dev/null | grep -E "archit
 
 echo
 echo "==> 셀프테스트 (번들 밖 독립 바이너리로 — 위 ② 참조)"
-# 실제 환경설정을 건드리지 않도록 격리 도메인 사용
+# 격리는 **설정과 대본 양쪽**에 걸어야 한다.
+#   SHADOWCUE_DEFAULTS_SUITE : 환경설정(UserDefaults)
+#   SHADOWCUE_SUPPORT_DIR    : 대본 라이브러리
+# 도메인만 격리했더니, 그 도메인엔 activeScriptID 가 없어서 실행할 때마다 사용자의 진짜
+# ~/Library/Application Support/ShadowCue 에 "기본 대본" 이 하나씩 새로 쌓였다(2026-08-02).
 SUITE="com.shadowcue.buildcheck.$$"
-if SHADOWCUE_DEFAULTS_SUITE="$SUITE" "$BUILD_DIR/ShadowCue-arm64" --selftest > "$BUILD_DIR/selftest.log" 2>&1; then
+SUPPORT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shadowcue-selftest.XXXXXX")"
+cleanup_selftest_env() {
+    defaults delete "$SUITE" 2>/dev/null || true
+    [[ -n "${SUPPORT_DIR:-}" && "$SUPPORT_DIR" == *shadowcue-selftest.* ]] && rm -rf "$SUPPORT_DIR"
+}
+trap cleanup_selftest_env EXIT
+
+if SHADOWCUE_DEFAULTS_SUITE="$SUITE" SHADOWCUE_SUPPORT_DIR="$SUPPORT_DIR" \
+       "$BUILD_DIR/ShadowCue-arm64" --selftest > "$BUILD_DIR/selftest.log" 2>&1; then
     grep -cE '^PASS' "$BUILD_DIR/selftest.log" | sed 's/^/  PASS /'
     echo "  셀프테스트 통과"
 else
     echo "  ❌ 셀프테스트 실패:"
     grep -E '^FAIL' "$BUILD_DIR/selftest.log" || cat "$BUILD_DIR/selftest.log"
-    defaults delete "$SUITE" 2>/dev/null || true
     exit 1
 fi
-defaults delete "$SUITE" 2>/dev/null || true
 
 if [[ "$INSTALL" -eq 0 ]]; then
     echo

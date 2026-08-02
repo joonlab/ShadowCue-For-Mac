@@ -332,7 +332,17 @@ enum ScriptStore {
 > 설정 창에서 원하는 텍스트를 입력하세요. 입력하면 바로 반영됩니다.
 """
 
+    /// `SHADOWCUE_SUPPORT_DIR` 는 테스트가 **사용자의 진짜 대본 라이브러리를 건드리지 않게** 하는 훅이다.
+    ///
+    /// `SHADOWCUE_DEFAULTS_SUITE` 로 설정만 격리하면 부족했다: 격리된 도메인에는 `activeScriptID` 가
+    /// 없으니 `ensureActiveScript()` 가 매 실행마다 새 UUID 로 "기본 대본" 을 만들어 **공용 경로**에
+    /// 쌓았다. 실제로 검증 몇 번에 내용이 똑같은 "기본 대본" 이 다섯 개 생겼다(2026-08-02).
+    /// 격리는 설정과 문서 **양쪽**에 걸어야 한다.
     static var baseURL: URL {
+        if let override = ProcessInfo.processInfo.environment["SHADOWCUE_SUPPORT_DIR"],
+           !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return root.appendingPathComponent("ShadowCue", isDirectory: true)
     }
@@ -886,6 +896,12 @@ final class PrompterOverlayView: NSView {
     private let hudLabel = NSTextField(labelWithString: "")
     private let badgeLabel = NSTextField(labelWithString: "")
     private let toastLabel = NSTextField(labelWithString: "")
+    /// 치트시트 외형. 셀프테스트가 이 값들을 그대로 검사하므로 상수로 둔다.
+    static let cheatSheetFontSize: CGFloat = 15
+    static let cheatSheetPadding: CGFloat = 14
+    /// 뒤의 대본이 비치지 않을 만큼 불투명해야 한다.
+    static let cheatSheetBackgroundAlpha: CGFloat = 0.96
+
     private let cheatSheetLabel = NSTextField(labelWithString: "")
     private var toastHideWork: DispatchWorkItem?
     private var cheatSheetHideWork: DispatchWorkItem?
@@ -950,11 +966,14 @@ final class PrompterOverlayView: NSView {
         toastLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         toastLabel.alignment = .center
 
-        cheatSheetLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        // 배경이 반투명하면 뒤의 대본(32~72pt)이 그대로 비쳐 목록을 못 읽는다.
+        // 이건 잠깐 띄웠다 지우는 패널이라 불투명해도 대본을 가리는 손해가 없다.
+        cheatSheetLabel.font = NSFont.monospacedSystemFont(ofSize: Self.cheatSheetFontSize, weight: .regular)
         cheatSheetLabel.alignment = .left
         cheatSheetLabel.maximumNumberOfLines = 0
         cheatSheetLabel.wantsLayer = true
-        cheatSheetLabel.layer?.cornerRadius = 8
+        cheatSheetLabel.layer?.cornerRadius = 10
+        cheatSheetLabel.layer?.borderWidth = 1
         cheatSheetLabel.isHidden = true
         addSubview(cheatSheetLabel)
 
@@ -980,7 +999,8 @@ final class PrompterOverlayView: NSView {
         toastLabel.textColor = base
         toastLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
         cheatSheetLabel.textColor = base
-        cheatSheetLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.78).cgColor
+        cheatSheetLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(Self.cheatSheetBackgroundAlpha).cgColor
+        cheatSheetLabel.layer?.borderColor = base.withAlphaComponent(0.28).cgColor
     }
 
     /// 이 레이어는 절대 이벤트를 먹지 않는다.
@@ -1010,8 +1030,9 @@ final class PrompterOverlayView: NSView {
 
         if !cheatSheetLabel.isHidden {
             let size = cheatSheetLabel.attributedStringValue.size()
-            let boxWidth = min(width - 32, size.width + 28)
-            let boxHeight = min(height - 32, size.height + 20)
+            // size 에는 왼쪽 들여쓰기가 이미 포함되므로 오른쪽 몫만 더한다.
+            let boxWidth = min(width - 32, size.width + Self.cheatSheetPadding)
+            let boxHeight = min(height - 32, size.height + Self.cheatSheetPadding)
             cheatSheetLabel.frame = NSRect(x: (width - boxWidth) / 2,
                                            y: (height - boxHeight) / 2,
                                            width: boxWidth, height: boxHeight)
@@ -1028,7 +1049,18 @@ final class PrompterOverlayView: NSView {
         let body = lines
             .map { "\($0.0.padding(toLength: max(width, $0.0.count), withPad: " ", startingAt: 0))   \($0.1)" }
             .joined(separator: "\n")
-        cheatSheetLabel.stringValue = body
+
+        // NSTextField 는 내부 여백이 없어 글자가 패널 모서리에 붙는다. 들여쓰기로 여백을 만든다.
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        paragraph.firstLineHeadIndent = Self.cheatSheetPadding
+        paragraph.headIndent = Self.cheatSheetPadding
+        cheatSheetLabel.attributedStringValue = NSAttributedString(string: body, attributes: [
+            .font: cheatSheetLabel.font ?? NSFont.monospacedSystemFont(ofSize: Self.cheatSheetFontSize,
+                                                                       weight: .regular),
+            .foregroundColor: cheatSheetLabel.textColor ?? NSColor.white,
+            .paragraphStyle: paragraph,
+        ])
         cheatSheetLabel.isHidden = false
         needsLayout = true
 
@@ -1036,6 +1068,11 @@ final class PrompterOverlayView: NSView {
         let work = DispatchWorkItem { [weak self] in self?.hideCheatSheet() }
         cheatSheetHideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
+    }
+
+    /// 셀프테스트용 — 치트시트가 떠 있으면 그 프레임, 아니면 nil.
+    var cheatSheetFrameForTest: NSRect? {
+        cheatSheetLabel.isHidden ? nil : cheatSheetLabel.frame
     }
 
     func hideCheatSheet() {
@@ -1236,10 +1273,20 @@ class PrompterView: NSView {
 
     /// 레이어 transform 은 anchorPoint 기준으로 걸린다. AppKit 이 layer.frame 을 다시 쓰면
     /// transform 과 충돌하므로, 매번 bounds/position 을 직접 맞춘 뒤 transform 을 건다.
+    ///
+    /// **레이아웃 패스마다 다시 걸어야 한다.** AppKit 은 관리 대상 레이어의 지오메트리를
+    /// 뷰 기준으로 되돌리는데(실측: anchorPoint→(0,0), position→(0,0), transform→identity),
+    /// 그때 반전이 통째로 사라진다. 한 번 걸어두는 것으로는 유지되지 않아 `layout()` 에서 다시 건다.
     private func applyMirrorTransform() {
         guard let layer = flipContainer.layer else { return }
         let size = flipContainer.bounds.size
         guard size.width > 0, size.height > 0 else { return }
+
+        // 레이아웃 패스에서 불리므로 암묵적 애니메이션을 끈다(끄지 않으면 창을 움직일 때마다
+        // 대본이 0.25초씩 흐물거린다).
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
 
         layer.transform = CATransform3DIdentity
         layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
@@ -1249,6 +1296,24 @@ class PrompterView: NSView {
         guard mirrorHorizontal || mirrorVertical else { return }
         layer.transform = CATransform3DMakeScale(mirrorHorizontal ? -1 : 1,
                                                  mirrorVertical ? -1 : 1, 1)
+    }
+
+    /// 레이아웃 패스가 일어나지 않는 경로(대표적으로 창 이동)에서 반전을 다시 걸기 위한 진입점.
+    func reapplyMirror() { applyMirrorTransform() }
+
+    /// 셀프테스트용 — AppKit 이 레이어 지오메트리를 뷰 기준으로 되돌리는 상황을 재현한다.
+    ///
+    /// 실기기 계측(2026-08-02)에서 확인한 실제 값이다: AppKit 은 관리 대상 레이어의
+    /// `anchorPoint`·`position`·`transform` 을 통째로 초기화한다. `layer.frame` 만 되쓰는 게
+    /// 아니라서(frame 대입은 transform 을 보존한다) 그것만으로는 이 버그가 재현되지 않는다.
+    /// 미러가 이 되돌림 뒤에 스스로 복구되는지가 회귀 테스트의 핵심이다.
+    func simulateAppKitGeometrySync() {
+        guard let layer = flipContainer.layer else { return }
+        layer.transform = CATransform3DIdentity
+        layer.anchorPoint = CGPoint(x: 0, y: 0)
+        layer.position = .zero
+        layer.bounds = CGRect(origin: .zero, size: flipContainer.frame.size)
+        layout()   // AppKit 의 레이아웃 패스가 뒤따르는 지점
     }
 
     /// 스크롤 정책(맨 위로 갈지 읽던 자리를 지킬지)은 호출자가 정한다.
@@ -1784,6 +1849,20 @@ class PrompterView: NSView {
             context.duration = 0.3
             scroller.animator().alphaValue = 0
         }
+    }
+
+    /// 미러 transform 은 **여기서** 다시 건다.
+    ///
+    /// `setFrameSize` 에서만 걸었더니 저장된 미러 설정이 첫 실행에 적용되지 않았다(v1.2 버그):
+    /// 복원은 `applicationDidFinishLaunching` 의 `applyLoadedSettings` → `showWindow` 순서인데,
+    /// showWindow 는 크기를 바꾸지 않으므로 setFrameSize 가 안 불리고, 그 사이 AppKit 이
+    /// 레이어 지오메트리를 되돌려 transform 만 조용히 사라졌다.
+    /// (그래서 "창을 한 번 리사이즈하면 그제서야 반전되는" 증상이었다)
+    ///
+    /// 창 **이동**은 크기가 안 바뀌어 여기로 오지 않으므로 `windowDidMove` 에서 따로 다시 건다.
+    override func layout() {
+        super.layout()
+        applyMirrorTransform()
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -2548,10 +2627,16 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
 
         window.minSize = NSSize(width: 240, height: 140)
 
-        // 닫기 버튼을 숨긴다. 이 창은 캡처에 안 보이므로, 실수로 닫으면 사용자는
-        // "앱이 사라졌다"고 느낀다. 숨김(⌃⌥H)으로만 치우게 한다.
-        // (styleMask 의 .closable 을 빼면 타이틀바 레이아웃이 달라져 버튼만 감춘다)
-        window.standardWindowButton(.closeButton)?.isHidden = true
+        // 신호등 버튼 셋을 전부 숨긴다. 이 창은 캡처에 안 보이므로 어느 걸 눌러도
+        // 사용자에게는 "앱이 사라졌다"로 보인다. 치우는 건 숨김(⌃⌥H)으로만 한다.
+        //
+        // 최소화가 특히 나쁘다 — 이 앱은 `.accessory` 라 Dock 아이콘이 없어서, 최소화하면
+        // 되돌릴 표면이 아무 데도 없다(닫기보다 복구가 어렵다).
+        // 확대는 프롬프터를 화면 가득 채워 촬영 구도를 망친다.
+        // (styleMask 에서 .closable 을 빼면 타이틀바 레이아웃이 달라지므로 버튼만 감춘다)
+        for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(button)?.isHidden = true
+        }
         window.isReleasedWhenClosed = false
 
         self.init(window: window)
@@ -2991,6 +3076,10 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
     func windowDidMove(_ notification: Notification) {
         saveWindowFrame()
         scheduleEdgeSnap()
+        // 이동은 크기를 바꾸지 않아 레이아웃 패스가 일어나지 않는다 = `layout()` 의 미러 재적용도
+        // 안 걸린다. 그런데 이동 중에도 AppKit 이 레이어 지오메트리를 되돌릴 수 있어, 여기서
+        // 직접 다시 걸지 않으면 창을 한 번 옮긴 뒤 반전이 조용히 풀린다.
+        prompterView.reapplyMirror()
     }
 
     func windowDidResize(_ notification: Notification) { saveWindowFrame() }
@@ -3688,6 +3777,120 @@ func runMirrorSelfTest() -> Bool {
     return ok
 }
 
+/// 미러 반전이 **AppKit 의 레이어 지오메트리 되돌림 뒤에도 살아남는지** 검사한다.
+///
+/// 위 `runMirrorSelfTest` 는 프로퍼티를 세팅한 직후에만 확인해서 v1.2 의 실제 버그를 놓쳤다.
+/// 첫 실행 경로는 설정 복원 → showWindow → AppKit 첫 레이아웃 순인데, 마지막 단계가
+/// transform 을 지우고 setFrameSize 는 크기가 안 바뀌어 불리지 않아서, 저장된 미러 설정이
+/// 화면에 반영되지 않았다(창을 한 번 리사이즈해야 그제서야 반전됨).
+/// 실기기 캡처로 증상을, 레이어 상태 계측으로 원인을 확인하고 추가한 테스트다.
+func runMirrorPersistsLayoutSelfTest() -> Bool {
+    var allOK = true
+
+    for (h, v, label) in [(true, false, "좌우"), (false, true, "상하"), (true, true, "좌우+상하")] {
+        let view = PrompterView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        view.layoutSubtreeIfNeeded()
+        view.mirrorHorizontal = h
+        view.mirrorVertical = v
+
+        // AppKit 이 레이어 지오메트리를 되돌리는 지점 재현 — 여기서 반전이 사라졌다.
+        view.simulateAppKitGeometrySync()
+
+        guard let p = view.mirrorProbe() else {
+            print("FAIL 미러 레이아웃 생존(\(label)) — 프로브 없음")
+            allOK = false
+            continue
+        }
+        // 반전 축의 원점은 반대편 끝으로 가야 한다.
+        let expectedX = h ? p.size.width : 0
+        let expectedY = v ? p.size.height : 0
+        let ok = abs(p.topLeftMapsTo.x - expectedX) < 1 && abs(p.topLeftMapsTo.y - expectedY) < 1
+        print("\(ok ? "PASS" : "FAIL") 미러 레이아웃 생존(\(label)) "
+              + "(원점 → \(Int(p.topLeftMapsTo.x)),\(Int(p.topLeftMapsTo.y)) / "
+              + "기대 \(Int(expectedX)),\(Int(expectedY)))")
+        allOK = allOK && ok
+    }
+    return allOK
+}
+
+/// 신호등 버튼이 전부 감춰졌는지 검사한다.
+///
+/// 이 창은 캡처에 안 보이므로 어느 버튼을 눌러도 "앱이 사라졌다"로 보인다.
+/// 특히 최소화는 `.accessory` 앱이라 Dock 에 되돌릴 표면조차 없다.
+func runWindowButtonsSelfTest() -> Bool {
+    let controller = PrompterWindowController()
+    guard let window = controller.window else {
+        print("FAIL 신호등 버튼 — 창 없음")
+        return false
+    }
+    let checks: [(NSWindow.ButtonType, String)] = [
+        (.closeButton, "닫기"), (.miniaturizeButton, "최소화"), (.zoomButton, "확대"),
+    ]
+    var allOK = true
+    var visible: [String] = []
+    for (type, name) in checks {
+        // 버튼 자체가 없으면(스타일마스크에 없음) 그것도 "안 보임" 이므로 통과다.
+        if let button = window.standardWindowButton(type), !button.isHidden {
+            visible.append(name)
+            allOK = false
+        }
+    }
+    print("\(allOK ? "PASS" : "FAIL") 신호등 버튼 전부 숨김"
+          + (visible.isEmpty ? "" : " (노출: \(visible.joined(separator: ", ")))"))
+    return allOK
+}
+
+/// 치트시트가 **읽히는 상태로** 뜨는지 검사한다.
+///
+/// v1.2 에서는 배경이 0.78 이라 뒤의 대본(32~72pt)이 그대로 비쳐 목록을 읽기 어려웠다.
+/// 패널이 창 밖으로 넘치지 않는지도 함께 본다.
+func runCheatSheetSelfTest() -> Bool {
+    let overlay = PrompterOverlayView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
+    let lines = HotkeyAction.allCases.map { ($0.defaultDisplayString, $0.name) }
+    overlay.toggleCheatSheet(lines)
+    overlay.layoutSubtreeIfNeeded()
+    overlay.layout()
+
+    guard let frame = overlay.cheatSheetFrameForTest else {
+        print("FAIL 치트시트 — 표시되지 않음")
+        return false
+    }
+    let fits = frame.minX >= 0 && frame.minY >= 0
+        && frame.maxX <= overlay.bounds.width + 0.5
+        && frame.maxY <= overlay.bounds.height + 0.5
+    let opaque = PrompterOverlayView.cheatSheetBackgroundAlpha >= 0.9
+    let readable = PrompterOverlayView.cheatSheetFontSize >= 14
+
+    let ok = fits && opaque && readable
+    let box = "\(Int(frame.width))x\(Int(frame.height)) @\(Int(frame.minX)),\(Int(frame.minY))"
+    let alpha = PrompterOverlayView.cheatSheetBackgroundAlpha
+    let pt = Int(PrompterOverlayView.cheatSheetFontSize)
+    print("\(ok ? "PASS" : "FAIL") 치트시트 가독성 (\(box), 배경 \(alpha), \(pt)pt, 창 안=\(fits))")
+    return ok
+}
+
+/// 대본 저장 경로가 env 로 격리되는지 검사한다.
+/// 이게 없으면 테스트 실행마다 사용자의 진짜 라이브러리에 "기본 대본" 이 쌓인다.
+func runSupportDirIsolationSelfTest() -> Bool {
+    let override = ProcessInfo.processInfo.environment["SHADOWCUE_SUPPORT_DIR"]
+    let base = ScriptStore.baseURL.path
+    let home = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ShadowCue").path
+
+    let ok: Bool
+    let detail: String
+    if let override = override, !override.isEmpty {
+        ok = base == URL(fileURLWithPath: override, isDirectory: true).path && base != home
+        detail = "격리됨 → \(base)"
+    } else {
+        // 훅이 없으면 기본 경로여야 한다(= 훅 부재가 경로를 망가뜨리지 않는지 확인).
+        ok = base == home
+        detail = "훅 없음, 기본 경로 사용"
+    }
+    print("\(ok ? "PASS" : "FAIL") 대본 경로 격리 (\(detail))")
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -3700,7 +3903,12 @@ if CommandLine.arguments.contains("--selftest") {
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
     let mirrorOK = runMirrorSelfTest()
-    exit(persistenceOK && layoutOK && mirrorOK ? 0 : 1)
+    let mirrorLayoutOK = runMirrorPersistsLayoutSelfTest()
+    let buttonsOK = runWindowButtonsSelfTest()
+    let cheatOK = runCheatSheetSelfTest()
+    let supportDirOK = runSupportDirIsolationSelfTest()
+    exit(persistenceOK && layoutOK && mirrorOK && mirrorLayoutOK
+         && buttonsOK && cheatOK && supportDirOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
