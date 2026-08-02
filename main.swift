@@ -100,6 +100,11 @@ enum HotkeyAction: Int, CaseIterable {
         // 축을 갈랐다: **위아래는 지금 대본 안에서의 스크롤, 좌우는 대본 사이의 이동.**
         // 손이 화살표 위에 있으면 둘 다 눈을 안 보고 누를 수 있다.
         // (`[`/`]` 는 한 대본 안 섹션 점프라 이미 임자가 있다)
+        //
+        // ⌥ 를 빼면 안 된다 — macOS 는 `⌃←`/`⌃→`/`⌃⇧←`/`⌃⇧→` 를 스페이스 전환에
+        // **기본으로 켜 둔 채 출고**한다(symbolic hotkey 79~82, 실기기 확인 2026-08-03).
+        // ⌃⌥ 조합은 비어 있다. 재생키가 `⌃⌥Space` 에서 옮겨 온 것과 같은 종류의 함정이라,
+        // 기본값을 바꾸려면 반드시 `defaults read com.apple.symbolichotkeys` 로 먼저 확인할 것.
         case .nextInBoard: return UInt32(kVK_RightArrow)
         case .previousInBoard: return UInt32(kVK_LeftArrow)
         }
