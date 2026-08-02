@@ -32,14 +32,19 @@ enum HotkeyAction: Int, CaseIterable {
     case toggleClickThrough = 5
     case speedUp = 6
     case speedDown = 7
-    // ⚠️ 새 액션을 추가할 때는 rawValue 가 곧 hotkey ID 이므로 **4곳을 함께** 고쳐야 한다:
-    //    이 enum / HotkeyManager 의 콜백 프로퍼티 / 이벤트 핸들러 switch / AppDelegate 배선.
-    //    하나만 빠지면 등록은 되는데 아무 일도 안 일어나 원인을 찾기 어렵다.
+    // 새 액션을 추가할 때 고칠 곳: 이 enum / `name` / `defaultKeyCode` /
+    // HotkeyManager 의 콜백 프로퍼티 + `callback(for:)` / AppDelegate 배선.
+    //
+    // 앞의 넷은 **컴파일러가 강제한다**(전부 enum 위 exhaustive switch다).
+    // 예전에는 Carbon 콜백 안에서 UInt32 를 switch 해서 한 곳을 빠뜨려도 컴파일이 통과했고,
+    // 그러면 등록은 되는데 눌러도 아무 일이 없었다. 그 switch 를 없앴다.
+    // 컴파일러가 못 잡는 건 AppDelegate 배선 하나뿐이다 — 새 액션을 넣고 눌러 보라.
     case scrollToTop = 8
     case previousSection = 9
     case nextSection = 10
     case pasteClipboard = 11
     case cheatSheet = 12
+    case showLibrary = 13
 
     var name: String {
         switch self {
@@ -55,6 +60,7 @@ enum HotkeyAction: Int, CaseIterable {
         case .nextSection: return "다음 섹션"
         case .pasteClipboard: return "클립보드를 대본으로"
         case .cheatSheet: return "단축키 보기"
+        case .showLibrary: return "대본 라이브러리"
         }
     }
 
@@ -84,6 +90,9 @@ enum HotkeyAction: Int, CaseIterable {
         case .nextSection: return UInt32(kVK_ANSI_RightBracket)
         case .pasteClipboard: return UInt32(kVK_ANSI_V)
         case .cheatSheet: return UInt32(kVK_ANSI_Slash)
+        // L = Library. 남아 있는 글자 중 니모닉이 가장 분명하고, 한국어 macOS 의
+        // 공장 기본 단축키와도 겹치지 않는다.
+        case .showLibrary: return UInt32(kVK_ANSI_L)
         }
     }
 }
@@ -491,7 +500,8 @@ enum ScriptStore {
 2. \(HotkeyAction.toggleClickThrough.defaultDisplayString) - 클릭스루 모드
 3. \(HotkeyAction.toggleVisibility.defaultDisplayString) - 숨기기/보이기
 
-> 설정 창에서 원하는 텍스트를 입력하세요. 입력하면 바로 반영됩니다.
+> \(HotkeyAction.showLibrary.defaultDisplayString) 로 대본 라이브러리를 열어 편집하세요.
+> 입력하면 바로 반영됩니다.
 """
 
     /// `SHADOWCUE_SUPPORT_DIR` 는 테스트가 **사용자의 진짜 대본 라이브러리를 건드리지 않게** 하는 훅이다.
@@ -1175,9 +1185,34 @@ class HotkeyManager {
     var onNextSection: (() -> Void)?
     var onPasteClipboard: (() -> Void)?
     var onCheatSheet: (() -> Void)?
+    var onShowLibrary: (() -> Void)?
 
     /// 부팅 시 등록에 실패한 액션(다른 앱이 이미 그 조합을 잡고 있는 경우 등).
     private(set) var failedActions: Set<HotkeyAction> = []
+
+    /// 액션 → 콜백. **이 switch 는 enum 위에서 돌기 때문에 case 를 빠뜨리면 컴파일이 실패한다.**
+    ///
+    /// 예전에는 Carbon 콜백 안에서 `hotKeyID.id`(UInt32)를 switch 했다. 숫자 위 switch 라
+    /// `default: break` 가 있어야 하고, 그러면 **case 를 안 넣어도 컴파일이 통과한다** —
+    /// 단축키는 등록되는데 눌러도 아무 일이 없고 원인을 찾기 어렵다.
+    /// (enum 정의부 주석이 "4곳을 함께 고쳐야 한다" 고 경고하던 자리 중 하나다)
+    func callback(for action: HotkeyAction) -> (() -> Void)? {
+        switch action {
+        case .togglePlay: return onTogglePlay
+        case .scrollUp: return onScrollUp
+        case .scrollDown: return onScrollDown
+        case .toggleVisibility: return onToggleVisibility
+        case .toggleClickThrough: return onToggleClickThrough
+        case .speedUp: return onSpeedUp
+        case .speedDown: return onSpeedDown
+        case .scrollToTop: return onScrollToTop
+        case .previousSection: return onPreviousSection
+        case .nextSection: return onNextSection
+        case .pasteClipboard: return onPasteClipboard
+        case .cheatSheet: return onCheatSheet
+        case .showLibrary: return onShowLibrary
+        }
+    }
 
     init() {
         // Set default hotkey configurations
@@ -1220,21 +1255,10 @@ class HotkeyManager {
                 GetEventParameter(theEvent, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
 
                 DispatchQueue.main.async {
-                    switch hotKeyID.id {
-                    case 1: HotkeyManager.shared.onTogglePlay?()
-                    case 2: HotkeyManager.shared.onScrollUp?()
-                    case 3: HotkeyManager.shared.onScrollDown?()
-                    case 4: HotkeyManager.shared.onToggleVisibility?()
-                    case 5: HotkeyManager.shared.onToggleClickThrough?()
-                    case 6: HotkeyManager.shared.onSpeedUp?()
-                    case 7: HotkeyManager.shared.onSpeedDown?()
-                    case 8: HotkeyManager.shared.onScrollToTop?()
-                    case 9: HotkeyManager.shared.onPreviousSection?()
-                    case 10: HotkeyManager.shared.onNextSection?()
-                    case 11: HotkeyManager.shared.onPasteClipboard?()
-                    case 12: HotkeyManager.shared.onCheatSheet?()
-                    default: break
-                    }
+                    // 분기는 여기서 하지 않는다 — callback(for:) 하나만 두어야 액션을 추가할 때
+                    // 컴파일러가 누락을 잡아 준다(위 주석 참조).
+                    guard let action = HotkeyAction(rawValue: Int(hotKeyID.id)) else { return }
+                    HotkeyManager.shared.callback(for: action)?()
                 }
                 return noErr
             }
@@ -1840,6 +1864,7 @@ final class PrompterControlStrip: NSView {
     var onBigger: (() -> Void)?
     var onTop: (() -> Void)?
     var onSettings: (() -> Void)?
+    var onLibrary: (() -> Void)?
 
     private var playButton: NSButton?
     private var hideWork: DispatchWorkItem?
@@ -1859,6 +1884,9 @@ final class PrompterControlStrip: NSView {
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+        // 창이 좁으면 스트립이 fittingWidth 보다 작게 잘리는데, 그때 버튼이 둥근 배경 밖으로
+        // 삐져나가 대본 위에 떠다닌다. 버튼이 하나 늘 때마다 이 경계는 더 자주 걸린다.
+        layer?.masksToBounds = true
         alphaValue = 0
 
         playButton = addButton("▶︎") { [weak self] in self?.onTogglePlay?() }
@@ -1867,6 +1895,7 @@ final class PrompterControlStrip: NSView {
         _ = addButton("가")     { [weak self] in self?.onSmaller?() }
         _ = addButton("가+")    { [weak self] in self?.onBigger?() }
         _ = addButton("처음")   { [weak self] in self?.onTop?() }
+        _ = addButton("대본")   { [weak self] in self?.onLibrary?() }
         _ = addButton("설정")   { [weak self] in self?.onSettings?() }
     }
 
@@ -3864,6 +3893,7 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         strip.onBigger = { [weak self] in self?.adjustFontSize(by: 2) }
         strip.onTop = { [weak self] in self?.scrollToTop() }
         strip.onSettings = { [weak self] in self?.showSettings() }
+        strip.onLibrary = { [weak self] in self?.showLibrary() }
     }
 
     func adjustFontSize(by delta: CGFloat) {
@@ -4569,6 +4599,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.prompterController.toggleCheatSheet()
         }
 
+        hotkeyManager.onShowLibrary = { [weak self] in
+            self?.prompterController.showLibrary()
+        }
+
         hotkeyManager.registerHotkeys()
     }
 
@@ -4599,6 +4633,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         presetItem.submenu = presetMenu
         menu.addItem(presetItem)
         menu.addItem(NSMenuItem.separator())
+
+        // 대본 서브메뉴 안이 아니라 **최상위**에 둔다. 상태아이템 자체가 잘 안 보이는데
+        // (메뉴바가 꽉 찬 맥에서는 아예 가려진다) 어렵게 열었을 때 한 단계 더 들어가게 하면 안 된다.
+        menu.addItem(NSMenuItem(title: "대본 라이브러리...", action: #selector(showLibrary), keyEquivalent: "l"))
 
         scriptMenuItem = NSMenuItem(title: "대본", action: nil, keyEquivalent: "")
         scriptMenuItem?.submenu = NSMenu()
@@ -4812,6 +4850,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let windowMenu = NSMenu(title: "윈도우")
         windowMenu.addItem(NSMenuItem(title: "프롬프터 보이기", action: #selector(showPrompter), keyEquivalent: "1"))
         windowMenu.addItem(NSMenuItem(title: "설정 열기", action: #selector(showSettings), keyEquivalent: "2"))
+        windowMenu.addItem(NSMenuItem(title: "대본 라이브러리", action: #selector(showLibrary), keyEquivalent: "3"))
 
         let windowMenuItem = NSMenuItem()
         windowMenuItem.submenu = windowMenu
@@ -4842,6 +4881,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showSettings() {
         prompterController.showSettings()
+    }
+
+    @objc func showLibrary() {
+        prompterController.showLibrary()
     }
 
     @objc func showAbout() {
