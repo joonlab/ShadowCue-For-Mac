@@ -143,6 +143,14 @@ struct Settings: Codable, Equatable {
     /// 뱃지가 상시 표시되므로 복원해도 "왜 클릭이 안 되지" 상태에 빠지지 않는다.
     var isClickThrough: Bool = false
 
+    // 타이포그래피
+    var fontName: String?          // nil = 시스템 폰트
+    var kern: Double = 0           // 자간
+    var maxLineWidth: Double = 0   // 0 = 창 너비까지
+    // 읽기 보조
+    var showFocusBand: Bool = true
+    var countdownEnabled: Bool = false
+
     init() {}
 
     /// **전방호환 디코더 — 자동 합성에 맡기면 안 된다.**
@@ -168,6 +176,11 @@ struct Settings: Codable, Equatable {
         hotkeys           = value(.hotkeys, fallback.hotkeys)
         activeScriptID    = value(.activeScriptID, fallback.activeScriptID)
         isClickThrough    = value(.isClickThrough, fallback.isClickThrough)
+        fontName          = value(.fontName, fallback.fontName)
+        kern              = value(.kern, fallback.kern)
+        maxLineWidth      = value(.maxLineWidth, fallback.maxLineWidth)
+        showFocusBand     = value(.showFocusBand, fallback.showFocusBand)
+        countdownEnabled  = value(.countdownEnabled, fallback.countdownEnabled)
     }
 }
 
@@ -1178,6 +1191,62 @@ class PrompterView: NSView {
         }
     }
 
+    /// nil 이면 시스템 폰트. 한글 대본이 많아 커버리지가 있는 폰트만 노출한다.
+    var fontName: String? {
+        didSet {
+            guard fontName != oldValue else { return }
+            updateTextContent()
+            SettingsStore.shared.update { $0.fontName = fontName }
+        }
+    }
+
+    var kern: CGFloat = 0 {
+        didSet {
+            guard kern != oldValue else { return }
+            updateTextContent()
+            SettingsStore.shared.update { $0.kern = Double(kern) }
+        }
+    }
+
+    /// 한 줄의 최대 폭(pt). 0 이면 창 너비를 다 쓴다.
+    ///
+    /// 프롬프터에서 가장 치명적인 가독성 문제가 이것이다 — 창을 넓히면 한 줄이 수십 자로
+    /// 늘어져 줄 끝에서 다음 줄 머리를 못 찾는다. 폭을 제한하고 가운데로 모은다.
+    var maxLineWidth: CGFloat = 0 {
+        didSet {
+            guard maxLineWidth != oldValue else { return }
+            applyTextInsets()
+            updateTextContent()
+            SettingsStore.shared.update { $0.maxLineWidth = Double(maxLineWidth) }
+        }
+    }
+
+    /// 본문에 쓸 폰트를 만든다. 이름이 유효하지 않으면 시스템 폰트로 조용히 되돌아간다.
+    func bodyFont(size: CGFloat, weight: NSFont.Weight) -> NSFont {
+        guard let name = fontName, !name.isEmpty else {
+            return NSFont.systemFont(ofSize: size, weight: weight)
+        }
+        if let custom = NSFont(name: name, size: size) {
+            if weight == .bold || weight == .semibold {
+                let bolded = NSFontManager.shared.convert(custom, toHaveTrait: .boldFontMask)
+                return bolded
+            }
+            return custom
+        }
+        return NSFont.systemFont(ofSize: size, weight: weight)
+    }
+
+    /// 텍스트 컨테이너 폭과 좌우 여백을 maxLineWidth 에 맞춘다.
+    private func applyTextInsets() {
+        guard let textView = textView else { return }
+        let available = max(80, bounds.width - 40)
+        let target = maxLineWidth > 0 ? min(available, maxLineWidth) : available
+        let sideInset = max(20, (bounds.width - target) / 2)
+        textView.textContainerInset = NSSize(width: sideInset, height: 20)
+        textView.textContainer?.containerSize = NSSize(width: target,
+                                                       height: CGFloat.greatestFiniteMagnitude)
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         setupViews()
@@ -1278,7 +1347,7 @@ class PrompterView: NSView {
 
         for (index, line) in lines.enumerated() {
             var processedLine = line
-            var lineFont = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+            var lineFont = bodyFont(size: fontSize, weight: .medium)
             var lineColor = textColor
             var prefix = ""
             var isHeading = false
@@ -1286,27 +1355,27 @@ class PrompterView: NSView {
             // Headers: #, ##, ###, ####, #####, ######
             if line.hasPrefix("###### ") {
                 processedLine = String(line.dropFirst(7))
-                lineFont = NSFont.systemFont(ofSize: fontSize * 0.85, weight: .semibold)
+                lineFont = bodyFont(size: fontSize * 0.85, weight: .semibold)
                 isHeading = true
             } else if line.hasPrefix("##### ") {
                 processedLine = String(line.dropFirst(6))
-                lineFont = NSFont.systemFont(ofSize: fontSize * 0.9, weight: .semibold)
+                lineFont = bodyFont(size: fontSize * 0.9, weight: .semibold)
                 isHeading = true
             } else if line.hasPrefix("#### ") {
                 processedLine = String(line.dropFirst(5))
-                lineFont = NSFont.systemFont(ofSize: fontSize * 1.0, weight: .bold)
+                lineFont = bodyFont(size: fontSize * 1.0, weight: .bold)
                 isHeading = true
             } else if line.hasPrefix("### ") {
                 processedLine = String(line.dropFirst(4))
-                lineFont = NSFont.systemFont(ofSize: fontSize * 1.15, weight: .bold)
+                lineFont = bodyFont(size: fontSize * 1.15, weight: .bold)
                 isHeading = true
             } else if line.hasPrefix("## ") {
                 processedLine = String(line.dropFirst(3))
-                lineFont = NSFont.systemFont(ofSize: fontSize * 1.3, weight: .bold)
+                lineFont = bodyFont(size: fontSize * 1.3, weight: .bold)
                 isHeading = true
             } else if line.hasPrefix("# ") {
                 processedLine = String(line.dropFirst(2))
-                lineFont = NSFont.systemFont(ofSize: fontSize * 1.5, weight: .bold)
+                lineFont = bodyFont(size: fontSize * 1.5, weight: .bold)
                 isHeading = true
             }
             // Unordered list: - or *
@@ -1365,6 +1434,11 @@ class PrompterView: NSView {
                     .foregroundColor: lineColor
                 ]))
             }
+        }
+
+        // 자간은 줄별 처리와 무관하므로 마지막에 한 번에 건다.
+        if kern != 0, result.length > 0 {
+            result.addAttribute(.kern, value: kern, range: NSRange(location: 0, length: result.length))
         }
 
         sectionAnchors = anchors
@@ -1587,8 +1661,7 @@ class PrompterView: NSView {
         guard let textView = textView else { return }
         textView.frame.size.width = newSize.width
         if widthChanged {
-            textView.textContainer?.containerSize = NSSize(width: newSize.width - 40,
-                                                           height: CGFloat.greatestFiniteMagnitude)
+            applyTextInsets()
             updateTextContent(preserveScroll: true)
         }
     }
@@ -1644,6 +1717,10 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     var opacityValueLabel: NSTextField?
     var speedSlider: NSSlider?
     var speedValueLabel: NSTextField?
+    var lineHeightValueLabel: NSTextField?
+    var kernValueLabel: NSTextField?
+    var maxLineWidthValueLabel: NSTextField?
+    var targetMinutesField: NSTextField?
     var prompterTextView: FineUndoTextView?  // 텍스트 입력창 참조
     private var editKeyMonitor: Any?
     private var livePreviewWorkItem: DispatchWorkItem?
@@ -1831,7 +1908,114 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         bgColorWell.target = self
         bgColorWell.action = #selector(bgColorChanged(_:))
         contentView.addSubview(bgColorWell)
-        yOffset -= 55
+        yOffset -= 45
+
+        // 행간
+        let lineHeightLabel = NSTextField(labelWithString: "행간:")
+        lineHeightLabel.frame = NSRect(x: leftMargin, y: yOffset, width: labelWidth, height: 20)
+        contentView.addSubview(lineHeightLabel)
+
+        let lineHeightSlider = NSSlider(value: Double(prompterController.prompterView.lineHeight),
+                                        minValue: 1.0, maxValue: 2.5,
+                                        target: self, action: #selector(lineHeightChanged(_:)))
+        lineHeightSlider.frame = NSRect(x: controlX, y: yOffset, width: controlWidth - 60, height: 20)
+        contentView.addSubview(lineHeightSlider)
+
+        let lineHeightValue = NSTextField(labelWithString: String(format: "%.2f", prompterController.prompterView.lineHeight))
+        lineHeightValue.frame = NSRect(x: controlX + controlWidth - 55, y: yOffset, width: 50, height: 20)
+        contentView.addSubview(lineHeightValue)
+        self.lineHeightValueLabel = lineHeightValue
+        yOffset -= 30
+
+        // 자간
+        let kernLabel = NSTextField(labelWithString: "자간:")
+        kernLabel.frame = NSRect(x: leftMargin, y: yOffset, width: labelWidth, height: 20)
+        contentView.addSubview(kernLabel)
+
+        let kernSlider = NSSlider(value: Double(prompterController.prompterView.kern),
+                                  minValue: -1, maxValue: 4,
+                                  target: self, action: #selector(kernChanged(_:)))
+        kernSlider.frame = NSRect(x: controlX, y: yOffset, width: controlWidth - 60, height: 20)
+        contentView.addSubview(kernSlider)
+
+        let kernValue = NSTextField(labelWithString: String(format: "%.1f", prompterController.prompterView.kern))
+        kernValue.frame = NSRect(x: controlX + controlWidth - 55, y: yOffset, width: 50, height: 20)
+        contentView.addSubview(kernValue)
+        self.kernValueLabel = kernValue
+        yOffset -= 30
+
+        // 최대 줄 너비 — 프롬프터 가독성에서 가장 큰 변수
+        let widthLabel = NSTextField(labelWithString: "최대 줄 너비:")
+        widthLabel.frame = NSRect(x: leftMargin, y: yOffset, width: labelWidth, height: 20)
+        contentView.addSubview(widthLabel)
+
+        let widthSlider = NSSlider(value: Double(prompterController.prompterView.maxLineWidth),
+                                   minValue: 0, maxValue: 1400,
+                                   target: self, action: #selector(maxLineWidthChanged(_:)))
+        widthSlider.frame = NSRect(x: controlX, y: yOffset, width: controlWidth - 60, height: 20)
+        contentView.addSubview(widthSlider)
+
+        let widthValue = NSTextField(labelWithString: Self.lineWidthText(prompterController.prompterView.maxLineWidth))
+        widthValue.frame = NSRect(x: controlX + controlWidth - 60, y: yOffset, width: 60, height: 20)
+        contentView.addSubview(widthValue)
+        self.maxLineWidthValueLabel = widthValue
+        yOffset -= 30
+
+        // 폰트
+        let fontFamilyLabel = NSTextField(labelWithString: "폰트:")
+        fontFamilyLabel.frame = NSRect(x: leftMargin, y: yOffset, width: labelWidth, height: 20)
+        contentView.addSubview(fontFamilyLabel)
+
+        let fontPopup = NSPopUpButton(frame: NSRect(x: controlX, y: yOffset - 2, width: controlWidth - 5, height: 25))
+        fontPopup.addItem(withTitle: "시스템 기본")
+        fontPopup.item(at: 0)?.representedObject = ""
+        for family in Self.koreanCapableFontFamilies() {
+            fontPopup.addItem(withTitle: family)
+            fontPopup.lastItem?.representedObject = family
+        }
+        if let current = prompterController.prompterView.fontName,
+           let index = fontPopup.itemTitles.firstIndex(of: current) {
+            fontPopup.selectItem(at: index)
+        }
+        fontPopup.target = self
+        fontPopup.action = #selector(fontFamilyChanged(_:))
+        contentView.addSubview(fontPopup)
+        yOffset -= 35
+
+        // 읽기 보조 토글
+        let bandCheckbox = NSButton(checkboxWithTitle: "시선 밴드 표시", target: self,
+                                    action: #selector(focusBandToggled(_:)))
+        bandCheckbox.state = prompterController.prompterView.overlay.showsFocusBand ? .on : .off
+        bandCheckbox.frame = NSRect(x: leftMargin, y: yOffset, width: 150, height: 20)
+        contentView.addSubview(bandCheckbox)
+
+        let countdownCheckbox = NSButton(checkboxWithTitle: "재생 전 3초 카운트다운", target: self,
+                                         action: #selector(countdownToggled(_:)))
+        countdownCheckbox.state = prompterController.countdownEnabled ? .on : .off
+        countdownCheckbox.frame = NSRect(x: leftMargin + 160, y: yOffset, width: 220, height: 20)
+        contentView.addSubview(countdownCheckbox)
+        yOffset -= 35
+
+        // 목표 시간 -> 속도 역산
+        let targetLabel = NSTextField(labelWithString: "목표 시간:")
+        targetLabel.frame = NSRect(x: leftMargin, y: yOffset, width: labelWidth, height: 20)
+        contentView.addSubview(targetLabel)
+
+        let targetField = NSTextField(frame: NSRect(x: controlX, y: yOffset - 2, width: 60, height: 22))
+        targetField.placeholderString = "분"
+        targetField.alignment = .right
+        contentView.addSubview(targetField)
+        self.targetMinutesField = targetField
+
+        let targetUnit = NSTextField(labelWithString: "분에 맞추기")
+        targetUnit.frame = NSRect(x: controlX + 66, y: yOffset, width: 90, height: 20)
+        contentView.addSubview(targetUnit)
+
+        let targetButton = NSButton(title: "속도 계산", target: self, action: #selector(applyTargetDuration(_:)))
+        targetButton.frame = NSRect(x: controlX + 160, y: yOffset - 4, width: 90, height: 26)
+        targetButton.bezelStyle = .rounded
+        contentView.addSubview(targetButton)
+        yOffset -= 45
 
         // === Hotkey Section ===
         let hotkeyTitle = NSTextField(labelWithString: "단축키 설정")
@@ -1888,6 +2072,18 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
         resetButton.frame = NSRect(x: leftMargin, y: yOffset, width: 120, height: 24)
         resetButton.bezelStyle = .rounded
         contentView.addSubview(resetButton)
+
+        // 내용이 고정 높이를 넘으면 아래쪽 컨트롤이 잘려 나간다.
+        // (단축키 행이 7개에서 11개로 늘면서 실제로 넘쳤다)
+        // 부족한 만큼 컨테이너를 키우고 전체를 위로 밀어 항상 들어맞게 한다.
+        let bottomPadding: CGFloat = 20
+        if yOffset < bottomPadding {
+            let deficit = bottomPadding - yOffset
+            contentView.frame.size.height += deficit
+            for subview in contentView.subviews {
+                subview.frame.origin.y += deficit
+            }
+        }
 
         // Set content view
         scrollView.documentView = contentView
@@ -2017,6 +2213,79 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
     @objc func speedChanged(_ sender: NSSlider) {
         prompterController?.scrollSpeed = CGFloat(sender.doubleValue)
         speedValueLabel?.stringValue = "\(Int(sender.doubleValue))"
+    }
+
+    @objc func lineHeightChanged(_ sender: NSSlider) {
+        prompterController?.prompterView.lineHeight = CGFloat(sender.doubleValue)
+        lineHeightValueLabel?.stringValue = String(format: "%.2f", sender.doubleValue)
+    }
+
+    @objc func kernChanged(_ sender: NSSlider) {
+        prompterController?.prompterView.kern = CGFloat(sender.doubleValue)
+        kernValueLabel?.stringValue = String(format: "%.1f", sender.doubleValue)
+    }
+
+    @objc func maxLineWidthChanged(_ sender: NSSlider) {
+        // 400pt 미만은 너무 좁아 오히려 읽기 나쁘므로 그 구간은 '제한 없음'으로 뭉갠다.
+        let value = sender.doubleValue < 400 ? 0 : sender.doubleValue
+        prompterController?.prompterView.maxLineWidth = CGFloat(value)
+        maxLineWidthValueLabel?.stringValue = Self.lineWidthText(CGFloat(value))
+    }
+
+    static func lineWidthText(_ width: CGFloat) -> String {
+        width <= 0 ? "제한 없음" : "\(Int(width))pt"
+    }
+
+    @objc func fontFamilyChanged(_ sender: NSPopUpButton) {
+        let family = sender.selectedItem?.representedObject as? String
+        prompterController?.prompterView.fontName = (family?.isEmpty ?? true) ? nil : family
+    }
+
+    @objc func focusBandToggled(_ sender: NSButton) {
+        let on = sender.state == .on
+        prompterController?.prompterView.overlay.showsFocusBand = on
+        SettingsStore.shared.update { $0.showFocusBand = on }
+    }
+
+    @objc func countdownToggled(_ sender: NSButton) {
+        prompterController?.countdownEnabled = (sender.state == .on)
+    }
+
+    /// "이 대본을 N분에 읽는다"에서 스크롤 속도를 거꾸로 구한다.
+    /// 강의·영상은 분량이 정해져 있어서, 속도를 감으로 맞추는 것보다 이쪽이 훨씬 빠르다.
+    @objc func applyTargetDuration(_ sender: NSButton) {
+        guard let controller = prompterController else { return }
+        let minutes = targetMinutesField?.doubleValue ?? 0
+        guard minutes > 0 else {
+            controller.prompterView.overlay.showToast("목표 시간을 입력하세요")
+            return
+        }
+        let distance = Double(controller.prompterView.maxScrollOffset)
+        guard distance > 1 else {
+            controller.prompterView.overlay.showToast("대본이 화면보다 짧습니다")
+            return
+        }
+        let speed = distance / (minutes * 60)
+        let clamped = min(200, max(10, speed))
+        controller.scrollSpeed = CGFloat(clamped)
+        updateSpeedDisplay(CGFloat(clamped))
+
+        if abs(clamped - speed) > 0.5 {
+            let actual = distance / clamped / 60
+            controller.prompterView.overlay.showToast(String(format: "속도 한계 — 약 %.1f분", actual))
+        } else {
+            controller.prompterView.overlay.showToast("속도 \(Int(clamped)) (\(Int(minutes))분)")
+        }
+    }
+
+    /// 한글이 깨지지 않는 폰트만 고른다(라틴 전용 폰트를 고르면 대본이 네모로 보인다).
+    static func koreanCapableFontFamilies() -> [String] {
+        let probe = "한글"
+        return NSFontManager.shared.availableFontFamilies.filter { family in
+            guard let font = NSFont(name: family, size: 12) else { return false }
+            let set = font.coveredCharacterSet
+            return probe.unicodeScalars.allSatisfy { set.contains($0) }
+        }.sorted()
     }
 
     @objc func textColorChanged(_ sender: NSColorWell) {
@@ -2172,10 +2441,15 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         backgroundOpacity = CGFloat(settings.backgroundOpacity)
         applyWindowChrome()
 
+        prompterView.fontName = settings.fontName
+        prompterView.kern = CGFloat(settings.kern)
+        prompterView.maxLineWidth = CGFloat(settings.maxLineWidth)
         prompterView.fontSize = CGFloat(settings.fontSize)
         prompterView.lineHeight = CGFloat(settings.lineHeight)
         prompterView.textColor = settings.textColor.nsColor
+        prompterView.overlay.showsFocusBand = settings.showFocusBand
         scrollSpeed = CGFloat(settings.scrollSpeed)
+        countdownEnabled = settings.countdownEnabled
 
         isClickThrough = settings.isClickThrough
         applyClickThroughState()
@@ -2367,12 +2641,51 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         prompterView.maxScrollOffset
     }
 
+    /// 재생 전 3-2-1 카운트다운. 카메라 앞에서 자세를 잡을 시간이 필요할 때.
+    var countdownEnabled = false {
+        didSet {
+            guard countdownEnabled != oldValue else { return }
+            SettingsStore.shared.update { $0.countdownEnabled = countdownEnabled }
+        }
+    }
+    private var countdownWork: [DispatchWorkItem] = []
+
+    private func cancelCountdown() {
+        countdownWork.forEach { $0.cancel() }
+        countdownWork.removeAll()
+    }
+
+    private func runCountdownThenStart() {
+        cancelCountdown()
+        for step in [3, 2, 1] {
+            let delay = Double(3 - step)
+            let work = DispatchWorkItem { [weak self] in
+                self?.prompterView.overlay.showToast("\(step)")
+            }
+            countdownWork.append(work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+        let go = DispatchWorkItem { [weak self] in
+            guard let self = self, self.isPlaying else { return }
+            self.startScrolling()
+            self.prompterView.overlay.showToast("▶︎ 시작")
+        }
+        countdownWork.append(go)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: go)
+    }
+
     func togglePlay() {
         isPlaying.toggle()
         if isPlaying {
+            if countdownEnabled {
+                prompterView.controlStrip.setPlaying(true)
+                runCountdownThenStart()
+                return
+            }
             startScrolling()
             prompterView.overlay.showToast("▶︎ 재생")
         } else {
+            cancelCountdown()
             stopScrolling()
             prompterView.overlay.remainingSeconds = nil
             prompterView.overlay.showToast("⏸ 일시정지")
@@ -3055,16 +3368,37 @@ func runPersistenceSelfTest() -> Bool {
     return pass
 }
 
+/// 설정 창이 모든 컨트롤을 담고 있는지(잘리지 않는지) 검사한다.
+/// 단축키 행이 7개에서 11개로 늘면서 고정 높이(850)를 넘겨 아래쪽이 잘렸었다.
+func runSettingsLayoutSelfTest() -> Bool {
+    let controller = PrompterWindowController()
+    let settings = SettingsWindowController(prompterController: controller)
+    guard let scrollView = settings.window?.contentView as? NSScrollView,
+          let document = scrollView.documentView else {
+        print("FAIL 설정 창 구성")
+        return false
+    }
+    let lowest = document.subviews.map { $0.frame.minY }.min() ?? 0
+    let highest = document.subviews.map { $0.frame.maxY }.max() ?? 0
+    let ok = lowest >= 0 && highest <= document.frame.height + 0.5
+    print("\(ok ? "PASS" : "FAIL") 설정 창 레이아웃 "
+          + "(높이 \(Int(document.frame.height)), 컨트롤 \(document.subviews.count)개, "
+          + "최하단 y=\(Int(lowest)), 최상단 y=\(Int(highest)))")
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
+    _ = NSApplication.shared   // AppKit 뷰 생성에 필요
     runInlineMarkdownSelfTest()
     print("")
     for action in HotkeyAction.allCases {
         print("HOTKEY \(action.name): \(action.defaultDisplayString)")
     }
     print("")
-    let ok = runPersistenceSelfTest()
-    exit(ok ? 0 : 1)
+    let persistenceOK = runPersistenceSelfTest()
+    let layoutOK = runSettingsLayoutSelfTest()
+    exit(persistenceOK && layoutOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
