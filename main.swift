@@ -3312,7 +3312,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTextView
 /// 전환은 더블클릭 / ⌘Return / 명시적 버튼으로만 일어난다.
 final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate, NSSplitViewDelegate,
                                            NSOutlineViewDataSource, NSOutlineViewDelegate,
-                                           NSTextViewDelegate {
+                                           NSTextViewDelegate, NSTextFieldDelegate, NSMenuDelegate {
     /// **weak 이어야 한다.** 프롬프터가 settingsController 를 strong 으로 잡고 있어 이미 순환이 있고
     /// (AppDelegate 가 프롬프터를 영구 보유해서 증상이 안 났을 뿐이다), 라이브러리 창은 닫혔다
     /// 열렸다 하므로 같은 실수를 반복하면 실제로 샌다.
@@ -3334,6 +3334,8 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
     private var previewWork: DispatchWorkItem?
     private var inactiveWriteWork: DispatchWorkItem?
     private var editKeyFallback: EditKeyFallback?
+    /// 컨텍스트 메뉴에서 "새 …" 를 만들 위치. menuNeedsUpdate 가 정하고 액션이 읽는다.
+    private var newItemDestination: String?
 
     private static let sidebarColumnID = NSUserInterfaceItemIdentifier("name")
 
@@ -3414,6 +3416,9 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         outlineView.delegate = self
         outlineView.target = self
         outlineView.doubleAction = #selector(loadSelectedIntoPrompter)
+        let contextMenu = NSMenu()
+        contextMenu.delegate = self       // 열릴 때마다 재구성(선택 상태에 따라 항목이 달라진다)
+        outlineView.menu = contextMenu
         outlineScroll.documentView = outlineView
 
         // ── 우: 헤더 + 편집기 + 상태줄 ──────────────────
@@ -3630,6 +3635,11 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         label.autoresizingMask = [.width]
         // 지금 카메라에 나가는 대본을 구분하는 유일한 신호다.
         label.font = isActive ? NSFont.boldSystemFont(ofSize: 13) : NSFont.systemFont(ofSize: 13)
+        // 이름 변경이 어떤 항목인지 알아야 하는데, 편집이 끝나는 시점엔 클릭한 행이 이미 없을 수 있다.
+        // 그래서 뷰 자체에 id 를 실어 둔다.
+        label.identifier = NSUserInterfaceItemIdentifier(node.id)
+        label.delegate = self
+        label.isEditable = false          // 이름 변경 명령을 받았을 때만 켠다
         cell.addSubview(label)
         cell.textField = label
         return cell
@@ -3726,6 +3736,279 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
         prompterController?.flushScript()
     }
 
+    // MARK: 컨텍스트 메뉴
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        // ⚠️ 선택에 없는 행을 우클릭했으면 **먼저 그 행을 선택한다.**
+        // 안 하면 눈으로 겨눈 항목이 아니라 아까 선택해 둔 다른 항목이 지워진다.
+        //
+        // clickedRow 가 -1 인 경로도 있다(키보드로 메뉴를 열거나 빈 곳을 눌렀을 때).
+        // 그때 target 을 nil 로 두면 선택된 대본이 멀쩡히 있는데도 "새 대본/새 폴더" 만 나온다.
+        // → currentTargetNode() 와 같은 규칙(클릭 우선, 없으면 선택)을 쓴다.
+        let clicked = outlineView.clickedRow
+        if clicked >= 0 && !outlineView.selectedRowIndexes.contains(clicked) {
+            outlineView.selectRowIndexes([clicked], byExtendingSelection: false)
+        }
+        let target = currentTargetNode()
+
+        // 새로 만들 위치: 폴더를 눌렀으면 그 안, 대본을 눌렀으면 그 대본이 있는 폴더, 빈 곳이면 최상위.
+        let destination: String? = target.flatMap { $0.isFolder ? $0.id : $0.parent?.id }
+
+        func add(_ title: String, _ selector: Selector, enabled: Bool = true) {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = enabled
+            item.representedObject = target
+            menu.addItem(item)
+        }
+
+        let writable = !ScriptStore.isWriteBlocked
+        newItemDestination = destination
+        add("새 대본", #selector(createScriptHere), enabled: writable)
+        add("새 폴더", #selector(createFolderHere), enabled: writable)
+
+        // ⌘Z 는 편집기의 텍스트 되돌리기가 가져가므로, 삭제 되돌리기는 메뉴에만 둔다.
+        // (같은 키에 두 의미를 얹으면 어느 쪽이 동작할지 사용자가 예측할 수 없다)
+        if !lastDeleted.isEmpty {
+            add("삭제 취소", #selector(undoLastDelete), enabled: writable)
+        }
+
+        guard let target else { return }
+        menu.addItem(.separator())
+        add("이름 변경", #selector(renameSelected), enabled: writable)
+        if !target.isFolder {
+            add("복제", #selector(duplicateSelected), enabled: writable)
+            add("프롬프터에 올리기", #selector(loadSelectedIntoPrompter))
+        }
+
+        // 이동 ▸ — 드래그를 못 쓰는 상황(긴 트리, 트랙패드)을 위한 정식 경로.
+        let moveItem = NSMenuItem(title: "이동", action: nil, keyEquivalent: "")
+        moveItem.submenu = buildMoveMenu(for: target)
+        moveItem.isEnabled = writable
+        menu.addItem(moveItem)
+
+        menu.addItem(.separator())
+        add("Finder 에서 보기", #selector(revealSelectedInFinder), enabled: !target.isFolder)
+        menu.addItem(.separator())
+        add("삭제", #selector(deleteSelected), enabled: writable)
+    }
+
+    private func buildMoveMenu(for node: LibraryNode) -> NSMenu {
+        let menu = NSMenu()
+        let root = NSMenuItem(title: "최상위로", action: #selector(moveSelected(_:)), keyEquivalent: "")
+        root.target = self
+        root.representedObject = nil as String?
+        menu.addItem(root)
+        menu.addItem(.separator())
+
+        // 자기 자신과 자손은 넣지 않는다(넣으면 트리가 끊긴다 — 저장 계층도 거부하지만
+        // 고를 수 있게 두면 "눌렀는데 아무 일도 없다" 가 된다).
+        let library = ScriptStore.loadLibrary()
+        var blocked: Set<String> = []
+        if node.isFolder {
+            blocked.insert(node.id)
+            var queue = [node.id]
+            while let current = queue.popLast() {
+                for child in library.folders where child.parentID == current {
+                    blocked.insert(child.id); queue.append(child.id)
+                }
+            }
+        }
+
+        func addLevel(_ parent: String?, depth: Int) {
+            let siblings = library.folders
+                .filter { $0.parentID == parent }
+                .sorted { $0.sortIndex < $1.sortIndex }
+            for folder in siblings {
+                let item = NSMenuItem(title: String(repeating: "    ", count: depth) + folder.name,
+                                      action: #selector(moveSelected(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = folder.id
+                item.isEnabled = !blocked.contains(folder.id)
+                menu.addItem(item)
+                addLevel(folder.id, depth: depth + 1)
+            }
+        }
+        addLevel(nil, depth: 0)
+        return menu
+    }
+
+    // MARK: 구조 변경 액션
+
+    @objc func createScriptHere() {
+        guard let id = ScriptStore.createScript(title: "새 대본", in: newItemDestination) else {
+            reportWriteFailure(); return
+        }
+        refreshTree()
+        selectAndBeginRename(id)
+    }
+
+    @objc func createFolderHere() {
+        guard let folder = ScriptStore.createFolder(name: "새 폴더", parentID: newItemDestination) else {
+            reportWriteFailure(); return
+        }
+        refreshTree()
+        selectAndBeginRename(folder.id)
+    }
+
+    @objc func duplicateSelected() {
+        guard let node = currentTargetNode(), !node.isFolder else { return }
+        flushPendingEdits()
+        guard let copy = ScriptStore.duplicateScript(id: node.id) else { reportWriteFailure(); return }
+        refreshTree()
+        selectAndBeginRename(copy)
+    }
+
+    @objc func renameSelected() {
+        guard let node = currentTargetNode() else { return }
+        selectAndBeginRename(node.id)
+    }
+
+    @objc func moveSelected(_ sender: NSMenuItem) {
+        guard let node = currentTargetNode() else { return }
+        let destination = sender.representedObject as? String
+        let ok = node.isFolder
+            ? ScriptStore.moveFolder(id: node.id, toParent: destination)
+            : ScriptStore.moveScript(id: node.id, toFolder: destination)
+        if !ok { reportWriteFailure(); return }
+        refreshTree()
+    }
+
+    @objc func revealSelectedInFinder() {
+        guard let node = currentTargetNode(), !node.isFolder else { return }
+        // Finder 는 별도 프로세스라 캡처에 찍힌다. 촬영 중에는 쓰면 안 된다.
+        NSWorkspace.shared.activateFileViewerSelecting([ScriptStore.url(for: node.id)])
+    }
+
+    /// 삭제 — 이 순서가 계약이다. 어기면 유령 파일이 남거나 활성 대본이 사라진 채로 남는다.
+    @objc func deleteSelected() {
+        let nodes = outlineView.selectedRowIndexes.compactMap {
+            outlineView.item(atRow: $0) as? LibraryNode
+        }
+        guard !nodes.isEmpty else { return }
+
+        let scriptIDs = Set(nodes.filter { !$0.isFolder }.map(\.id))
+        let folders = nodes.filter { $0.isFolder }
+
+        if let confirm = deleteConfirmation(scripts: scriptIDs.count, folders: folders.count),
+           confirm != .alertFirstButtonReturn { return }
+
+        // ① 예약된 쓰기부터 정리한다(순서 중요 — 아래 주석 참조)
+        flushPendingEdits()
+        prompterController?.prepareForDeletion(of: scriptIDs)
+
+        // ② 삭제
+        var bundles: [ScriptStore.DeletedBundle] = []
+        for id in scriptIDs {
+            if let bundle = ScriptStore.deleteScript(id: id) { bundles.append(bundle) }
+        }
+        for folder in folders {
+            if let bundle = ScriptStore.deleteFolder(id: folder.id, strategy: .promoteChildren) {
+                bundles.append(bundle)
+            }
+        }
+
+        // ③ 활성 대본이 사라졌으면 프롬프터가 스스로 다음 대본을 고른다
+        prompterController?.libraryDidChange(deleted: scriptIDs)
+
+        lastDeleted = bundles
+        refreshTree()
+        showEditor(for: nil)
+    }
+
+    private func deleteConfirmation(scripts: Int, folders: Int) -> NSApplication.ModalResponse? {
+        // 대본이 없고 빈 폴더만 지우는 건 되돌리기 쉬우므로 묻지 않는다.
+        guard scripts > 0 else { return nil }
+        let alert = NSAlert()
+        alert.window.sharingType = .none        // 촬영 중에 뜰 수 있다
+        alert.messageText = scripts == 1 ? "대본을 삭제할까요?" : "대본 \(scripts)개를 삭제할까요?"
+        alert.informativeText = "지우지 않고 휴지통으로 옮깁니다. 우클릭 메뉴의 '삭제 취소' 로 되돌리거나, "
+            + "30일 안에는 \(ScriptStore.baseURL.appendingPathComponent("trash").path) 에서 직접 꺼낼 수 있습니다."
+        alert.addButton(withTitle: "삭제")
+        alert.addButton(withTitle: "취소")
+        return alert.runModal()
+    }
+
+    /// 직전 삭제 1회분. 되돌리기용.
+    private var lastDeleted: [ScriptStore.DeletedBundle] = []
+
+    @objc func undoLastDelete() {
+        guard !lastDeleted.isEmpty else { return }
+        for bundle in lastDeleted { ScriptStore.restore(bundle) }
+        lastDeleted = []
+        refreshTree()
+    }
+
+    private func currentTargetNode() -> LibraryNode? {
+        let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
+        guard row >= 0 else { return nil }
+        return outlineView.item(atRow: row) as? LibraryNode
+    }
+
+    private func selectAndBeginRename(_ id: String) {
+        for row in 0..<outlineView.numberOfRows {
+            guard let node = outlineView.item(atRow: row) as? LibraryNode, node.id == id else { continue }
+            outlineView.selectRowIndexes([row], byExtendingSelection: false)
+            outlineView.scrollRowToVisible(row)
+            // 만들자마자 이름을 고칠 수 있게 편집 상태로 들어간다("새 대본" 이 쌓이지 않게).
+            if let cell = outlineView.view(atColumn: 0, row: row, makeIfNecessary: true) as? NSTableCellView {
+                cell.textField?.isEditable = true
+                outlineView.window?.makeFirstResponder(cell.textField)
+            }
+            return
+        }
+    }
+
+    private func reportWriteFailure() {
+        let alert = NSAlert()
+        alert.window.sharingType = .none
+        alert.messageText = "대본 목록을 저장하지 못했습니다"
+        alert.informativeText = ScriptStore.isWriteBlocked
+            ? "목록 파일이 손상되어 저장이 잠겨 있습니다. 앱을 다시 실행하면 복구를 안내합니다."
+            : "저장 경로에 쓸 수 없습니다:\n\(ScriptStore.baseURL.path)"
+        alert.runModal()
+        updateWarningBar()
+    }
+
+    // MARK: 인라인 이름 변경
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              let id = field.identifier?.rawValue else { return }
+        field.isEditable = false
+
+        let typed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ● 활성 표시가 붙어 있으면 벗겨 낸다(표시는 이름의 일부가 아니다).
+        let cleaned = typed.hasPrefix("● ") ? String(typed.dropFirst(2)) : typed
+
+        let library = ScriptStore.loadLibrary()
+        let isFolder = library.folders.contains { $0.id == id }
+        let currentName = isFolder
+            ? library.folders.first { $0.id == id }?.name
+            : library.scripts.first { $0.id == id }?.title
+
+        // ⚠️ **바뀐 게 없으면 아무것도 하지 않는다.**
+        //
+        // 편집을 "끝내는" 경로는 사용자가 Return 을 친 것 말고도 많다 — 선택이 바뀌거나
+        // 트리를 다시 그리기만 해도 편집 세션이 닫히며 이 델리게이트가 불린다.
+        // 그때마다 저장을 시도하면, 저장이 잠긴 상태에서는 **행을 클릭하는 것만으로 모달이 뜬다.**
+        // (셀프테스트가 이 지점에서 영구히 멈춰 발견했다 — 스택이 selectRowIndexes →
+        //  controlTextDidEndEditing → reportWriteFailure → NSAlert.runModal 이었다)
+        guard !cleaned.isEmpty, cleaned != currentName else {
+            refreshTree()       // 표시를 원래대로 되돌린다(빈 입력·● 접두사 등)
+            return
+        }
+
+        let ok = isFolder
+            ? ScriptStore.renameFolder(id: id, to: cleaned)
+            : ScriptStore.renameScript(id: id, to: cleaned)
+        refreshTree()
+        if !ok { reportWriteFailure() }
+        if id == editingScriptID { showEditor(for: id) }
+    }
+
     // MARK: 액션
 
     @objc func loadSelectedIntoPrompter() {
@@ -3780,6 +4063,35 @@ final class ScriptLibraryWindowController: NSWindowController, NSWindowDelegate,
     }
 
     var editorScrollFrameForTest: NSRect { editorScrollView?.frame ?? .zero }
+
+    /// 셀프테스트용 — 특정 행을 우클릭했을 때의 컨텍스트 메뉴를 만든다.
+    ///
+    /// GUI 로 검증하기 어려운 부분이라(합성 클릭은 NSMenu 의 추적 루프에서 잘 먹지 않는다)
+    /// 메뉴 구성과 액션 배선을 여기서 직접 확인한다.
+    func contextMenuForTest(selecting id: String) -> NSMenu? {
+        for row in 0..<outlineView.numberOfRows {
+            guard let node = outlineView.item(atRow: row) as? LibraryNode, node.id == id else { continue }
+            outlineView.selectRowIndexes([row], byExtendingSelection: false)
+            guard let menu = outlineView.menu else { return nil }
+            menuNeedsUpdate(menu)
+            return menu
+        }
+        return nil
+    }
+
+    /// 메뉴 항목을 실제로 눌렀을 때와 같은 경로로 실행한다.
+    func performMenuItemForTest(_ item: NSMenuItem) {
+        guard let action = item.action else { return }
+        _ = (item.target as AnyObject).perform(action, with: item)
+    }
+
+    /// 셀프테스트용 — 셀의 이름 편집이 끝난 상황을 재현한다.
+    func simulateEndEditingForTest(id: String, text: String) {
+        let field = NSTextField(string: text)
+        field.identifier = NSUserInterfaceItemIdentifier(id)
+        controlTextDidEndEditing(Notification(name: NSControl.textDidEndEditingNotification,
+                                              object: field))
+    }
 }
 
 // MARK: - Prompter Window Controller
@@ -4014,6 +4326,34 @@ class PrompterWindowController: NSWindowController, NSWindowDelegate {
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
         }
+    }
+
+    /// 셀프테스트 프로브 — 파일 쓰기가 예약된 상태인가.
+    var hasPendingScriptWriteForTest: Bool { scriptWriteWorkItem != nil }
+
+    /// 삭제 직전에 부른다. 삭제 대상이 활성 대본이면 예약된 쓰기를 **취소**한다.
+    ///
+    /// 안 하면 1.5초 뒤 디바운스가 방금 지운 id 로 파일을 되살려, **목록에는 없는데
+    /// 디스크에는 있는 유령 대본**이 남는다. 그 파일은 어떤 UI 로도 지울 수 없다.
+    /// 대상이 아니면 반대로 확정 저장한다(지우는 김에 다른 대본까지 잃을 이유는 없다).
+    func prepareForDeletion(of ids: Set<String>) {
+        guard let active = activeScriptID else { return }
+        if ids.contains(active) {
+            scriptWriteWorkItem?.cancel()
+            scriptWriteWorkItem = nil
+        } else {
+            flushScript()
+        }
+    }
+
+    /// 라이브러리에서 구조가 바뀌었다. 활성 대본이 사라졌으면 다음 대본으로 넘어간다.
+    func libraryDidChange(deleted: Set<String>) {
+        guard let active = activeScriptID, deleted.contains(active) else { return }
+        // activeScriptID 를 비워야 ensureActiveScript 가 "저장된 대본이 없다" 로 보고
+        // 남은 것 중 최신을 고른다. 하나도 없으면 거기서 새로 만든다.
+        activeScriptID = nil
+        SettingsStore.shared.update { $0.activeScriptID = nil }
+        loadActiveScript()
     }
 
     /// 다른 대본으로 전환한다. 현재 대본은 먼저 확정 저장한다.
@@ -5824,6 +6164,169 @@ func runLibraryWindowLayoutSelfTest() -> Bool {
     return ok
 }
 
+/// F. 삭제 3단 계약 — 유령 파일과 활성 대본 증발을 막는다.
+func runScriptDeletionSyncSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 대본 삭제 동기화 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 삭제 동기화: \(label)") }
+    }
+
+    guard let a = ScriptStore.createScript(title: "A", text: "본문 A"),
+          let b = ScriptStore.createScript(title: "B", text: "본문 B") else {
+        print("FAIL 삭제 동기화: 구성"); return false
+    }
+    SettingsStore.shared.update { $0.activeScriptID = a }
+
+    let prompter = PrompterWindowController()
+    prompter.loadActiveScript()
+    check("활성 = A", prompter.activeScriptID == a)
+
+    // ★ 예약된 쓰기가 취소되는가 — 안 되면 1.5초 뒤 디바운스가 지운 파일을 되살린다
+    prompter.updateScript("고치는 중")
+    check("쓰기 예약됨", prompter.hasPendingScriptWriteForTest)
+    prompter.prepareForDeletion(of: [a])
+    check("활성 대본 삭제 전 예약 취소", prompter.hasPendingScriptWriteForTest == false)
+
+    // 삭제 → 활성 승계
+    check("삭제 성공", ScriptStore.deleteScript(id: a) != nil)
+    prompter.libraryDidChange(deleted: [a])
+    check("활성이 A 가 아님", prompter.activeScriptID != a)
+    check("활성이 B 로 승계", prompter.activeScriptID == b)
+    check("승계된 대본 파일 존재", prompter.activeScriptID.map { ScriptStore.exists(id: $0) } == true)
+    check("지운 파일은 되살아나지 않음", ScriptStore.exists(id: a) == false)
+
+    // 비대상 삭제일 때는 예약을 취소하지 않고 **확정**한다(지우는 김에 다른 대본을 잃을 이유가 없다)
+    prompter.updateScript("B 를 고치는 중")
+    check("B 쓰기 예약됨", prompter.hasPendingScriptWriteForTest)
+    prompter.prepareForDeletion(of: ["관계없는id"])
+    check("비대상이면 확정 저장", ScriptStore.read(id: b) == "B 를 고치는 중")
+
+    // 전부 지우면 새로 만든다
+    for meta in ScriptStore.loadLibrary().scripts { _ = ScriptStore.deleteScript(id: meta.id) }
+    prompter.libraryDidChange(deleted: Set([b]))
+    let survivor = prompter.activeScriptID
+    check("전부 지운 뒤 새 대본 생성", survivor != nil)
+    check("새 대본 파일 존재", survivor.map { ScriptStore.exists(id: $0) } == true)
+    check("새 대본이 색인에 있음",
+          ScriptStore.loadLibrary().scripts.contains { $0.id == survivor })
+
+    print("\(ok ? "PASS" : "FAIL") 대본 삭제 동기화 (예약취소·활성승계·유령파일 방지)")
+    resetSupportDirForTest()
+    return ok
+}
+
+/// H. 우클릭 메뉴 구성과 액션 배선.
+///
+/// 이 부분은 GUI 로 검증하기 어렵다 — 합성 클릭은 NSMenu 의 자체 이벤트 추적 루프에서
+/// 잘 먹지 않아서, 실기기 시도에서 좌표가 맞는데도 항목이 실행되지 않았다.
+/// 그래서 메뉴를 만들고 액션을 직접 호출하는 경로로 검사한다.
+func runLibraryContextMenuSelfTest() -> Bool {
+    guard resetSupportDirForTest() else {
+        print("PASS 라이브러리 우클릭 메뉴 (SHADOWCUE_SUPPORT_DIR 없음 — 건너뜀)")
+        return true
+    }
+    var ok = true
+    func check(_ label: String, _ condition: Bool) {
+        if !condition { ok = false; print("FAIL 우클릭 메뉴: \(label)") }
+    }
+
+    guard let lg = ScriptStore.createFolder(name: "LG"),
+          let yt = ScriptStore.createFolder(name: "YT"),
+          let script = ScriptStore.createScript(title: "오프닝", in: lg.id, text: "본문") else {
+        print("FAIL 우클릭 메뉴: 구성"); return false
+    }
+    SettingsStore.shared.update { $0.libraryWindowFrame = nil; $0.libraryExpandedFolderIDs = [lg.id, yt.id] }
+
+    let prompter = PrompterWindowController()
+    let library = ScriptLibraryWindowController(prompterController: prompter)
+    guard let menu = library.contextMenuForTest(selecting: script) else {
+        print("FAIL 우클릭 메뉴: 메뉴 없음"); return false
+    }
+
+    let titles = menu.items.map(\.title).filter { !$0.isEmpty }
+    for expected in ["새 대본", "새 폴더", "이름 변경", "복제", "프롬프터에 올리기", "이동", "삭제"] {
+        check("항목 '\(expected)'", titles.contains(expected))
+    }
+
+    // ★ 이동 서브메뉴 — 최상위 + 모든 폴더가 나와야 한다
+    guard let moveItem = menu.items.first(where: { $0.title == "이동" }),
+          let moveMenu = moveItem.submenu else {
+        print("FAIL 우클릭 메뉴: 이동 서브메뉴 없음"); return false
+    }
+    check("이동에 '최상위로'", moveMenu.items.contains { $0.title == "최상위로" })
+    check("이동에 폴더 2개", moveMenu.items.filter { $0.representedObject is String }.count == 2)
+
+    // ★ 실제로 옮겨지는가 (메뉴 액션 배선)
+    guard let toYT = moveMenu.items.first(where: { ($0.representedObject as? String) == yt.id }) else {
+        print("FAIL 우클릭 메뉴: YT 항목 없음"); return false
+    }
+    library.performMenuItemForTest(toYT)
+    check("이동 실행됨",
+          ScriptStore.loadLibrary().scripts.first { $0.id == script }?.folderID == yt.id)
+
+    // 최상위로 되돌리기
+    if let toRoot = moveMenu.items.first(where: { $0.title == "최상위로" }) {
+        library.performMenuItemForTest(toRoot)
+        check("최상위로 이동",
+              ScriptStore.loadLibrary().scripts.first { $0.id == script }?.folderID == nil)
+    }
+
+    // 새 대본은 **우클릭한 항목이 속한 폴더**에 만들어져야 한다
+    guard let inLG = library.contextMenuForTest(selecting: lg.id),
+          let newScript = inLG.items.first(where: { $0.title == "새 대본" }) else {
+        print("FAIL 우클릭 메뉴: 폴더 메뉴 없음"); return false
+    }
+    let before = ScriptStore.loadLibrary().scripts.count
+    library.performMenuItemForTest(newScript)
+    let after = ScriptStore.loadLibrary().scripts
+    check("새 대본 생성", after.count == before + 1)
+    check("새 대본이 우클릭한 폴더 안에",
+          after.contains { $0.folderID == lg.id && $0.title == "새 대본" })
+
+    // 복제
+    if let dupMenu = library.contextMenuForTest(selecting: script),
+       let dup = dupMenu.items.first(where: { $0.title == "복제" }) {
+        let n = ScriptStore.loadLibrary().scripts.count
+        library.performMenuItemForTest(dup)
+        check("복제 실행", ScriptStore.loadLibrary().scripts.count == n + 1)
+        check("복제본 제목", ScriptStore.loadLibrary().scripts.contains { $0.title == "오프닝 사본" })
+    }
+
+    // ★ 이름이 그대로면 저장을 시도하지 않는다.
+    //   편집 세션은 사용자가 Return 을 치지 않아도 닫힌다(선택 변경·트리 재구성).
+    //   그때마다 저장하면, 잠긴 상태에서 **행을 클릭하는 것만으로 모달이 떠 앱이 멈춘다.**
+    //   실제로 이 테스트가 그 지점에서 영구히 멈춰 버그를 찾았다.
+    let renameCount = ScriptStore.loadLibrary().scripts.count
+    library.simulateEndEditingForTest(id: script, text: "오프닝")   // 원래 이름 그대로
+    check("동일 이름은 저장 시도 없음", ScriptStore.loadLibrary().scripts.count == renameCount)
+    library.simulateEndEditingForTest(id: script, text: "   ")      // 빈 입력
+    check("빈 이름은 원래 이름 유지",
+          ScriptStore.loadLibrary().scripts.first { $0.id == script }?.title == "오프닝")
+    library.simulateEndEditingForTest(id: script, text: "바뀐 이름")
+    check("바뀐 이름은 저장됨",
+          ScriptStore.loadLibrary().scripts.first { $0.id == script }?.title == "바뀐 이름")
+
+    // 쓰기가 잠기면 구조 변경 항목이 비활성이어야 한다
+    try? "{{{".data(using: .utf8)!.write(to: ScriptStore.libraryURL, options: .atomic)
+    _ = ScriptStore.loadLibraryDetailed()
+    if let locked = library.contextMenuForTest(selecting: script) {
+        let create = locked.items.first { $0.title == "새 대본" }
+        check("잠긴 상태에서 '새 대본' 비활성", create?.isEnabled == false)
+    }
+    // 잠긴 상태에서 같은 이름으로 편집이 끝나도 모달이 뜨면 안 된다.
+    // (뜨면 이 줄에서 테스트가 영영 멈추므로, 통과 자체가 검증이다)
+    library.simulateEndEditingForTest(id: script, text: "바뀐 이름")
+    check("잠긴 상태 + 동일 이름 → 멈추지 않음", true)
+
+    print("\(ok ? "PASS" : "FAIL") 라이브러리 우클릭 메뉴 (구성·이동·생성·복제·잠금)")
+    resetSupportDirForTest()
+    return ok
+}
+
 // MARK: - Main
 if CommandLine.arguments.contains("--selftest") {
     _ = NSApplication.shared   // AppKit 뷰 생성에 필요
@@ -5841,6 +6344,8 @@ if CommandLine.arguments.contains("--selftest") {
     let crudOK = runFolderCRUDSelfTest()
     let treeOK = runLibraryTreeSelfTest()
     let libWindowOK = runLibraryWindowLayoutSelfTest()
+    let deleteSyncOK = runScriptDeletionSyncSelfTest()
+    let ctxMenuOK = runLibraryContextMenuSelfTest()
 
     let persistenceOK = runPersistenceSelfTest()
     let layoutOK = runSettingsLayoutSelfTest()
@@ -5851,7 +6356,7 @@ if CommandLine.arguments.contains("--selftest") {
     exit(persistenceOK && layoutOK && mirrorOK && mirrorLayoutOK
          && buttonsOK && cheatOK && supportDirOK
          && migrationOK && corruptionOK && decoderOK && crudOK && treeOK
-         && libWindowOK ? 0 : 1)
+         && libWindowOK && deleteSyncOK && ctxMenuOK ? 0 : 1)
 }
 
 let app = NSApplication.shared
