@@ -737,9 +737,22 @@ enum ScriptStore {
                 }
             }
         }
+        // 보드는 부모가 없다(항상 최상위 한 줄). 그래도 형제끼리 0..n-1 로 맞춰야
+        // 드래그 순서 변경이 폴더·대본과 같은 규약 위에서 돈다.
+        func renumberBoards() {
+            let ids = library.boards
+                .sorted { $0.sortIndex < $1.sortIndex }
+                .map(\.id)
+            for (order, id) in ids.enumerated() {
+                if let i = library.boards.firstIndex(where: { $0.id == id }) {
+                    library.boards[i].sortIndex = order
+                }
+            }
+        }
         var parents: [String?] = [nil]
         parents.append(contentsOf: library.folders.map { Optional($0.id) })
         for parent in parents { renumberFolders(parent: parent); renumberScripts(folder: parent) }
+        renumberBoards()
     }
 
     /// 같은 부모 안에서 뒤쪽으로 옮길 때의 인덱스 보정.
@@ -1003,6 +1016,9 @@ enum ScriptStore {
         guard !bundle.scripts.contains(where: { entry in
             library.scripts.contains { $0.id == entry.meta.id }
         }) else { return false }
+        guard !bundle.boards.contains(where: { board in
+            library.boards.contains { $0.id == board.id }
+        }) else { return false }
 
         for (_, url) in bundle.scripts { restoreFromTrash(url) }
         return mutate { lib in
@@ -1012,14 +1028,20 @@ enum ScriptStore {
             for (meta, _) in bundle.scripts where !lib.scripts.contains(where: { $0.id == meta.id }) {
                 lib.scripts.append(meta)
             }
+            for board in bundle.boards where !lib.boards.contains(where: { $0.id == board.id }) {
+                lib.boards.append(board)
+            }
             return true
         }
     }
 
     /// 되돌리기 스냅샷. 본문을 메모리에 들고 있지 않고 **휴지통 파일 URL 만** 들고 있는다.
+    ///
+    /// 보드는 파일이 없다(색인 안에만 있다). 그래서 값을 통째로 들고 있으면 그게 곧 복원본이다.
     struct DeletedBundle {
         var folders: [ScriptFolder]
         var scripts: [(meta: ScriptMeta, trashedFile: URL?)]
+        var boards: [ScriptBoard] = []
         var deletedAt: Date
     }
 
@@ -1066,6 +1088,163 @@ enum ScriptStore {
         let cutoff = Date().addingTimeInterval(-Double(keepDays) * 86_400)
         for (index, entry) in dated.enumerated() where index >= keepCount || entry.1 < cutoff {
             try? fm.removeItem(at: entry.0)
+        }
+    }
+
+    // ── 보드 ────────────────────────────────────────────────────────
+    //
+    // 폴더가 **분류**라면 보드는 **순서**다. 한 자리에서 대본 여러 개를 정해진 차례로
+    // 연달아 읽는 촬영을 위해 있다. 그래서 대본을 소유하지 않고 **참조**만 한다 —
+    // 같은 대본이 여러 보드에 들어갈 수 있고, 보드를 지워도 대본은 그대로다.
+
+    /// 보드가 가리키는 대본 중 **지금 살아 있는 것만** 순서대로.
+    ///
+    /// ⚠️ **표시와 탐색은 반드시 이 함수를 거친다.** 보드는 지워진 대본의 id 를 배열에서
+    /// 빼지 않는다 — 트리 빌더가 고아 대본을 버리지 않고 승격시키는 것과 같은 원칙이고,
+    /// 덕분에 우클릭 '삭제 취소' 가 보드 안의 자리까지 공짜로 되살린다.
+    /// 대신 화면과 단축키 이동은 죽은 항목을 건너뛰어야 한다.
+    static func resolvedScriptIDs(of boardID: String, in library: ScriptLibrary) -> [String] {
+        guard let board = library.boards.first(where: { $0.id == boardID }) else { return [] }
+        let live = Set(library.scripts.map(\.id))
+        return board.scriptIDs.filter { live.contains($0) }
+    }
+
+    static func resolvedScriptIDs(of boardID: String) -> [String] {
+        resolvedScriptIDs(of: boardID, in: loadLibrary())
+    }
+
+    /// **표시 목록 기준 삽입 지점을 실제 배열 인덱스로 옮긴다.**
+    ///
+    /// 죽은 항목이 배열에 남아 있으므로 화면의 "두 번째와 세 번째 사이" 는 배열의 2번이
+    /// 아니다. 이 변환을 빠뜨리면 지워진 대본 개수만큼 순서가 어긋나고, 사용자 눈에는
+    /// "드래그하면 엉뚱한 자리에 꽂힌다" 로 보인다.
+    private static func rawIndex(displayed: Int, in ids: [String], live: Set<String>) -> Int {
+        guard displayed > 0 else { return 0 }
+        var counted = 0
+        for (position, id) in ids.enumerated() where live.contains(id) {
+            counted += 1
+            if counted == displayed { return position + 1 }
+        }
+        return ids.count
+    }
+
+    @discardableResult
+    static func createBoard(name: String) -> ScriptBoard? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var created: ScriptBoard?
+        let ok = mutate { library in
+            let now = Date()
+            let board = ScriptBoard(id: UUID().uuidString, name: trimmed,
+                                    sortIndex: library.boards.count, createdAt: now, updatedAt: now)
+            library.boards.append(board)
+            created = board
+            return true
+        }
+        return ok ? created : nil
+    }
+
+    @discardableResult
+    static func renameBoard(id: String, to name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return mutate { library in
+            guard let i = library.boards.firstIndex(where: { $0.id == id }) else { return false }
+            library.boards[i].name = trimmed
+            library.boards[i].updatedAt = Date()
+            return true
+        }
+    }
+
+    /// 보드끼리의 순서. 보드는 부모가 없으므로 항상 최상위 한 줄 안에서만 움직인다.
+    /// `at` 규약은 폴더·대본과 같다(원래 목록 기준 삽입 지점, `adjustedIndex` 주석 참조).
+    @discardableResult
+    static func moveBoard(id: String, at index: Int? = nil) -> Bool {
+        mutate { library in
+            let order = library.boards.sorted { $0.sortIndex < $1.sortIndex }.map(\.id)
+            guard let old = order.firstIndex(of: id) else { return false }
+            var next = order
+            next.remove(at: old)
+            let target = min(max(0, adjustedIndex(index ?? next.count, movingFrom: old,
+                                                  sameParent: true)), next.count)
+            next.insert(id, at: target)
+            for (position, boardID) in next.enumerated() {
+                if let j = library.boards.firstIndex(where: { $0.id == boardID }) {
+                    library.boards[j].sortIndex = position
+                }
+            }
+            return true
+        }
+    }
+
+    /// **대본은 하나도 건드리지 않는다.** 참조만 끊는다.
+    @discardableResult
+    static func deleteBoard(id: String) -> DeletedBundle? {
+        var removed: ScriptBoard?
+        let ok = mutate { library in
+            guard let target = library.boards.first(where: { $0.id == id }) else { return false }
+            library.boards.removeAll { $0.id == id }
+            removed = target
+            return true
+        }
+        guard ok, let board = removed else { return nil }
+        return DeletedBundle(folders: [], scripts: [], boards: [board], deletedAt: Date())
+    }
+
+    /// `at` 은 **표시 목록**(죽은 항목 제외) 기준. nil 이면 맨 끝.
+    ///
+    /// 같은 보드 안 중복은 거부한다 — 허용하면 "지금 보드의 몇 번째인가" 가 모호해져
+    /// `3/7` 표시와 다음/이전 이동이 함께 무너진다.
+    @discardableResult
+    static func addScript(_ scriptID: String, toBoard boardID: String, at index: Int? = nil) -> Bool {
+        mutate { library in
+            guard library.scripts.contains(where: { $0.id == scriptID }) else { return false }
+            guard let i = library.boards.firstIndex(where: { $0.id == boardID }) else { return false }
+            guard !library.boards[i].scriptIDs.contains(scriptID) else { return false }
+
+            let live = Set(library.scripts.map(\.id))
+            let ids = library.boards[i].scriptIDs
+            let visible = ids.filter { live.contains($0) }.count
+            let wanted = min(max(0, index ?? visible), visible)
+            library.boards[i].scriptIDs.insert(scriptID, at: rawIndex(displayed: wanted, in: ids, live: live))
+            library.boards[i].updatedAt = Date()
+            return true
+        }
+    }
+
+    /// 보드에서만 뺀다. **대본 파일도 색인도 그대로다** — 삭제와 다른 행동이다.
+    @discardableResult
+    static func removeScript(_ scriptID: String, fromBoard boardID: String) -> Bool {
+        mutate { library in
+            guard let i = library.boards.firstIndex(where: { $0.id == boardID }) else { return false }
+            guard library.boards[i].scriptIDs.contains(scriptID) else { return false }
+            library.boards[i].scriptIDs.removeAll { $0 == scriptID }
+            library.boards[i].updatedAt = Date()
+            return true
+        }
+    }
+
+    /// 보드 안에서 순서를 바꾼다. `at` 은 **표시 목록** 기준 삽입 지점이며,
+    /// 오프바이원 보정은 폴더·대본과 같은 `adjustedIndex` 를 쓴다.
+    @discardableResult
+    static func moveScriptInBoard(_ scriptID: String, boardID: String, at index: Int? = nil) -> Bool {
+        mutate { library in
+            guard let i = library.boards.firstIndex(where: { $0.id == boardID }) else { return false }
+            var ids = library.boards[i].scriptIDs
+            guard let old = ids.firstIndex(of: scriptID) else { return false }
+
+            let live = Set(library.scripts.map(\.id))
+            // 보정은 **표시 좌표계**에서 해야 한다 — 사용자가 본 목록이 그것이므로.
+            let displayedOld = ids[..<old].filter { live.contains($0) }.count
+            ids.remove(at: old)
+            let visible = ids.filter { live.contains($0) }.count
+            let wanted = min(max(0, adjustedIndex(index ?? visible, movingFrom: displayedOld,
+                                                  sameParent: true)), visible)
+            ids.insert(scriptID, at: rawIndex(displayed: wanted, in: ids, live: live))
+
+            library.boards[i].scriptIDs = ids
+            library.boards[i].updatedAt = Date()
+            return true
         }
     }
 
