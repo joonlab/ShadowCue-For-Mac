@@ -26,3 +26,8 @@ __pycache__/
 
 # Build output
 build/
+
+# 배포용 zip 은 레포가 아니라 GitHub Releases 에 둔다.
+# (v1.1 zip 이 레포에 커밋돼 있어서, Releases 를 안 보고 clone 한 사람이
+#  서명 깨진 옛 번들을 받아 가는 경로가 있었다 — 2026-08-04 제거)
+ShadowCue-v*.zip
